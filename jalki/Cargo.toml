@@ -1,0 +1,34 @@
+[package]
+name = "jalki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Programmable fentry/fexit framework for Linux kernel observability"
+
+[[bin]]
+name = "jalki"
+path = "src/main.rs"
+
+[lib]
+name = "jalki"
+path = "src/lib.rs"
+
+[dependencies]
+jalki-common = { workspace = true }
+false-protocol = { workspace = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+prometheus-client = { workspace = true }
+clap = { workspace = true }
+tonic = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+ulid = { workspace = true }
+hostname = { workspace = true }
