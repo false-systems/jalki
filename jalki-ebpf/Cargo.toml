@@ -1,0 +1,27 @@
+[package]
+name = "jalki-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "eBPF fentry/fexit probes for jalki kernel observability"
+
+# Not a workspace member — targets bpfel-unknown-none.
+[workspace]
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+jalki-common = { path = "../jalki-common", default-features = false }
+
+[[bin]]
+name = "jalki-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+debug = false
+overflow-checks = false
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = "abort"

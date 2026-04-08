@@ -1,0 +1,13 @@
+[package]
+name = "jalki-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types between jalki eBPF programs and userspace daemon"
+
+[features]
+default = []
+userspace = ["aya"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }
