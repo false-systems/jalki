@@ -1,5 +1,6 @@
 pub mod emitter;
 pub mod filter;
+pub mod knowledge;
 pub mod loader;
 pub mod metrics;
 pub mod probe;
@@ -19,5 +20,6 @@ pub mod probes {
 }
 
 pub use emitter::Emitter;
+pub use knowledge::KnowledgeBase;
 pub use probe::{Attachment, Probe};
 pub use runtime::run;

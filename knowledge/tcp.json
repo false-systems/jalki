@@ -1,0 +1,259 @@
+{
+  "version": "1.0",
+  "layer": "tcp",
+  "description": "TCP kernel functions for network observability",
+  "probes": [
+    {
+      "function": "tcp_connect",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.connect",
+      "layer": "tcp",
+      "answers": [
+        "why is this service failing to connect to a backend",
+        "which connections are being refused",
+        "which connections are timing out",
+        "how long does it take to establish a connection",
+        "is a specific backend unreachable"
+      ],
+      "keywords": ["connect", "connection", "refused", "timeout", "econnrefused", "etimedout", "backend", "unreachable"],
+      "fields": [
+        { "name": "src_ip",      "type": "ipv4",   "meaning": "source IP address",                          "important": true },
+        { "name": "dst_ip",      "type": "ipv4",   "meaning": "destination IP address",                     "important": true },
+        { "name": "src_port",    "type": "u16",    "meaning": "source port",                                 "important": false },
+        { "name": "dst_port",    "type": "u16",    "meaning": "destination port — identifies the service",   "important": true },
+        { "name": "pid",         "type": "u32",    "meaning": "process ID making the connection",            "important": true },
+        { "name": "command",     "type": "string", "meaning": "process name (comm)",                         "important": true },
+        { "name": "ret",         "type": "i32",    "meaning": "return value — 0 success, negative = errno",  "important": true }
+      ],
+      "use_when": "you need to know which connections are being attempted, which are failing, and what errno the kernel returned. fexit gives you the return value so you know immediately if the connect succeeded or failed.",
+      "not_when": "you only care about established connections — use tcp_close for lifetime, tcp_retransmit_skb for reliability.",
+      "combine_with": ["tcp_retransmit_skb", "tcp_close"],
+      "interpretations": [
+        {
+          "pattern": "ret == 0",
+          "conclusion": "connection succeeded",
+          "severity": "info",
+          "action": "normal — correlate with tcp_close to get connection lifetime"
+        },
+        {
+          "pattern": "ret == -111",
+          "errno": "ECONNREFUSED",
+          "conclusion": "nothing is listening on dst_ip:dst_port — process crashed, wrong port, or misconfigured",
+          "severity": "error",
+          "action": "check if the target process is running on dst_ip. check port configuration."
+        },
+        {
+          "pattern": "ret == -110",
+          "errno": "ETIMEDOUT",
+          "conclusion": "host exists but is not responding — overloaded, hung, or network path is broken",
+          "severity": "error",
+          "action": "check network path between src and dst. check if dst host is overloaded."
+        },
+        {
+          "pattern": "ret == -113",
+          "errno": "EHOSTUNREACH",
+          "conclusion": "no route to host — routing problem or host is down",
+          "severity": "error",
+          "action": "check routing table. check if dst host is up."
+        },
+        {
+          "pattern": "ret == -101",
+          "errno": "ENETUNREACH",
+          "conclusion": "network is unreachable — interface down or routing misconfiguration",
+          "severity": "error",
+          "action": "check network interfaces and routing configuration on src host."
+        },
+        {
+          "pattern": "high rate of ret != 0 to same dst_ip:dst_port",
+          "conclusion": "persistent failure to a specific backend — not transient",
+          "severity": "error",
+          "action": "correlate with RAUTA HTTP errors on same 4-tuple in AHTI. this is a backend health issue."
+        }
+      ]
+    },
+    {
+      "function": "tcp_close",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.close",
+      "layer": "tcp",
+      "answers": [
+        "how long do connections to this backend last",
+        "which connections are being closed",
+        "which process owns a connection",
+        "is a backend cycling connections too quickly"
+      ],
+      "keywords": ["close", "teardown", "connection lifetime", "short-lived", "connection cycling"],
+      "fields": [
+        { "name": "src_ip",      "type": "ipv4",   "meaning": "source IP address",                         "important": true },
+        { "name": "dst_ip",      "type": "ipv4",   "meaning": "destination IP address",                    "important": true },
+        { "name": "src_port",    "type": "u16",    "meaning": "source port — identifies the specific connection", "important": true },
+        { "name": "dst_port",    "type": "u16",    "meaning": "destination port — identifies the service",  "important": true },
+        { "name": "pid",         "type": "u32",    "meaning": "process ID that owned the connection",       "important": true },
+        { "name": "command",     "type": "string", "meaning": "process name",                               "important": true }
+      ],
+      "use_when": "you want to track connection lifetime or understand connection churn. combine with tcp_connect on the same 4-tuple to calculate duration.",
+      "not_when": "you need failure reasons — tcp_connect gives you errno. you need reliability signals — use tcp_retransmit_skb.",
+      "combine_with": ["tcp_connect", "tcp_retransmit_skb"],
+      "interpretations": [
+        {
+          "pattern": "tcp_close fires immediately after tcp_connect on same 4-tuple",
+          "conclusion": "connection was opened and immediately closed — likely a health check or failed handshake",
+          "severity": "info",
+          "action": "normal for health check patterns. investigate if unexpected."
+        },
+        {
+          "pattern": "high rate of tcp_close to same dst_ip:dst_port",
+          "conclusion": "connection churn — connections being opened and closed rapidly",
+          "severity": "warning",
+          "action": "check if connection pooling is misconfigured. high churn wastes TCP handshake overhead."
+        }
+      ]
+    },
+    {
+      "function": "tcp_retransmit_skb",
+      "attachment": "fentry",
+      "event_type": "kernel.tcp.retransmit",
+      "layer": "tcp",
+      "answers": [
+        "is the network dropping packets",
+        "why is this connection slow",
+        "which backend has network problems",
+        "is this a network problem or an application problem",
+        "which specific connection is experiencing packet loss"
+      ],
+      "keywords": ["retransmit", "packet loss", "slow", "network", "congestion", "latency", "reliability"],
+      "fields": [
+        { "name": "src_ip",    "type": "ipv4",  "meaning": "source IP",                                          "important": true },
+        { "name": "dst_ip",    "type": "ipv4",  "meaning": "destination IP",                                     "important": true },
+        { "name": "src_port",  "type": "u16",   "meaning": "source port",                                        "important": true },
+        { "name": "dst_port",  "type": "u16",   "meaning": "destination port",                                   "important": true },
+        { "name": "tcp_state", "type": "u8",    "meaning": "TCP state when retransmit fired — critical for diagnosis", "important": true },
+        { "name": "pid",       "type": "u32",   "meaning": "process that owns the socket",                       "important": true },
+        { "name": "command",   "type": "string","meaning": "process name",                                        "important": true }
+      ],
+      "use_when": "you suspect network-layer problems. retransmits are the kernel's signal that packets are being lost. the tcp_state field tells you exactly what kind of problem it is.",
+      "not_when": "you want to know if a connection succeeded or failed — use tcp_connect. retransmits mean the connection exists but packets are being lost.",
+      "combine_with": ["tcp_connect", "tcp_close"],
+      "tcp_states": {
+        "1":  "ESTABLISHED — connection is up, packets being lost mid-stream",
+        "2":  "SYN_SENT — initial handshake failing, remote may be unreachable",
+        "3":  "SYN_RECV — server side handshake issue",
+        "4":  "FIN_WAIT1 — connection teardown, usually not critical",
+        "7":  "CLOSE_WAIT — remote closed but local hasn't, application may be hung",
+        "8":  "LAST_ACK — final teardown, usually not critical",
+        "11": "CLOSING — simultaneous close, unusual"
+      },
+      "interpretations": [
+        {
+          "pattern": "tcp_state == SYN_SENT (2)",
+          "conclusion": "initial handshake is failing — remote is unreachable, firewall dropping SYN packets, or host is down",
+          "severity": "error",
+          "action": "check connectivity to dst_ip from this node. this is NOT an application problem — the connection never established."
+        },
+        {
+          "pattern": "tcp_state == ESTABLISHED (1)",
+          "conclusion": "packets are being lost on an active connection — network congestion, switch issue, or physical layer problem between nodes",
+          "severity": "warning",
+          "action": "check network path between src and dst nodes. this is a network problem, not application. correlate with RAUTA HTTP latency spikes on same 4-tuple."
+        },
+        {
+          "pattern": "tcp_state == CLOSE_WAIT (7)",
+          "conclusion": "remote closed the connection but local application has not read/closed — possible application hang or slow consumer",
+          "severity": "warning",
+          "action": "check application on src — it may be hung or not reading from the socket."
+        },
+        {
+          "pattern": "3+ retransmits in 10s on same 4-tuple, tcp_state == ESTABLISHED",
+          "conclusion": "persistent packet loss to a specific backend — network path is degraded",
+          "severity": "error",
+          "action": "this is the kernel telling you the network between these two IPs is broken. escalate to network team. not an application bug."
+        },
+        {
+          "pattern": "retransmits on multiple 4-tuples to same dst_ip",
+          "conclusion": "all connections to this host are experiencing packet loss — host-level network issue",
+          "severity": "error",
+          "action": "the problem is at dst_ip or the network path to it, not a specific connection. check node network interface and switch port."
+        },
+        {
+          "pattern": "retransmits on multiple 4-tuples to multiple dst_ips",
+          "conclusion": "widespread packet loss — local node network interface issue or upstream switch",
+          "severity": "critical",
+          "action": "check local node network interface. check upstream switch. this affects all traffic from this node."
+        }
+      ]
+    },
+    {
+      "function": "tcp_sendmsg",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.send",
+      "layer": "tcp",
+      "answers": [
+        "how much data is a process sending",
+        "which process is a heavy network sender",
+        "is this connection saturated"
+      ],
+      "keywords": ["send", "bandwidth", "throughput", "bytes", "traffic"],
+      "fields": [
+        { "name": "src_ip",   "type": "ipv4",  "meaning": "source IP",           "important": true },
+        { "name": "dst_ip",   "type": "ipv4",  "meaning": "destination IP",      "important": true },
+        { "name": "dst_port", "type": "u16",   "meaning": "destination port",    "important": true },
+        { "name": "pid",      "type": "u32",   "meaning": "sending process",     "important": true },
+        { "name": "command",  "type": "string","meaning": "process name",         "important": true },
+        { "name": "bytes",    "type": "i32",   "meaning": "bytes sent this call", "important": true }
+      ],
+      "use_when": "you need per-connection, per-process send throughput. high frequency — consider sampling (sample_rate: 0.1) for busy nodes.",
+      "not_when": "you just need to know if a connection exists — use tcp_connect. tcp_sendmsg fires on every send call, which can be thousands per second.",
+      "combine_with": ["tcp_connect", "tcp_retransmit_skb"],
+      "interpretations": [
+        {
+          "pattern": "high bytes per call, low retransmits",
+          "conclusion": "healthy high-throughput connection",
+          "severity": "info",
+          "action": "normal. monitor for retransmits if latency increases."
+        },
+        {
+          "pattern": "high bytes per call, high retransmits on same 4-tuple",
+          "conclusion": "connection is saturating and experiencing loss — possible congestion",
+          "severity": "warning",
+          "action": "correlate with tcp_retransmit_skb. network path may be congested."
+        }
+      ]
+    },
+    {
+      "function": "inet_csk_accept",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.accept",
+      "layer": "tcp",
+      "answers": [
+        "how fast is a server accepting connections",
+        "is the accept backlog filling up",
+        "which process is accepting connections on a port"
+      ],
+      "keywords": ["accept", "server", "backlog", "listening", "incoming connections"],
+      "fields": [
+        { "name": "src_ip",   "type": "ipv4",  "meaning": "client IP",             "important": true },
+        { "name": "dst_port", "type": "u16",   "meaning": "listening port",        "important": true },
+        { "name": "pid",      "type": "u32",   "meaning": "accepting process",     "important": true },
+        { "name": "command",  "type": "string","meaning": "process name",           "important": true },
+        { "name": "ret",      "type": "i32",   "meaning": "0 success, negative errno", "important": true }
+      ],
+      "use_when": "you want to observe incoming connection acceptance from the server side. pairs with tcp_connect on the client side for full picture.",
+      "not_when": "you only care about outbound connections — use tcp_connect.",
+      "combine_with": ["tcp_connect", "tcp_retransmit_skb"],
+      "interpretations": [
+        {
+          "pattern": "ret == -11 (EAGAIN) at high rate",
+          "conclusion": "accept backlog is full — server cannot keep up with incoming connections",
+          "severity": "error",
+          "action": "increase listen backlog. check if server is overloaded. connections are being dropped."
+        },
+        {
+          "pattern": "accept rate drops suddenly",
+          "conclusion": "server stopped accepting — process may be hung or overloaded",
+          "severity": "warning",
+          "action": "check server process health. correlate with RAUTA HTTP latency."
+        }
+      ]
+    }
+  ]
+}

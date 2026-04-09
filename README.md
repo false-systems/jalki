@@ -1,10 +1,10 @@
 # Jälki
 
-**Your kernel knows what TCP actually did. Jälki turns that into structured events an AI can reason about.**
+**Programmable fentry/fexit framework for Linux. One trait, one kernel function, structured events out.**
 
-Applications lie. A service reports "healthy" while its TCP layer is retransmitting every third packet. A load balancer says "all backends up" while connections to one backend time out silently. HTTP metrics say "200 OK" but can't tell you the connect took 800ms because of three SYN retransmits.
+You define a probe in Rust. Jälki handles BTF loading, fentry/fexit attachment, ring buffer management, self-filtering, and emission. You get [FALSE Protocol](https://github.com/false-systems) Occurrences — structured, machine-readable events that an AI can reason about.
 
-Jälki attaches to kernel functions — `tcp_connect`, `tcp_close`, `tcp_retransmit_skb` — and emits a structured event every time they fire. No sampling. No aggregation. Every connection attempt, every teardown, every retransmit. The output is machine-readable [FALSE Protocol](https://github.com/false-systems) Occurrences that flow into AHTI for causal correlation.
+The three built-in TCP probes are the batteries-included default. They are not what Jälki *is*. Jälki is the framework that makes writing any fentry/fexit probe a matter of implementing one trait.
 
 One binary. No runtime dependencies. No kernel headers. Deploy per node, point at an output, done.
 
@@ -12,11 +12,9 @@ One binary. No runtime dependencies. No kernel headers. Deploy per node, point a
 
 ---
 
-## Why This Exists
+## What You Get
 
-Prometheus tells you `tcp_retransmits_total` went up. It doesn't tell you *which* connection, *to where*, *from which process*, *in what TCP state*. You're left correlating timestamps across dashboards.
-
-Jälki gives you the event itself:
+Every kernel function you care about becomes a stream of structured events:
 
 ```json
 {
@@ -24,11 +22,13 @@ Jälki gives you the event itself:
   "type": "kernel.tcp.retransmit",
   "severity": "warning",
   "outcome": "failure",
+  "correlation_keys": ["10.42.1.15:48210->10.42.2.8:5432"],
   "network_data": {
     "src_ip": "10.42.1.15",
     "dst_ip": "10.42.2.8",
     "src_port": 48210,
-    "dst_port": 5432
+    "dst_port": 5432,
+    "protocol": "tcp"
   },
   "process_data": {
     "pid": 1847,
@@ -40,13 +40,13 @@ Jälki gives you the event itself:
 }
 ```
 
-Your API server is retransmitting to Postgres on an established connection. That's a network-layer problem, not an application bug. No dashboard can show you this — only the kernel knows.
+Your API server is retransmitting to Postgres on an established connection. The kernel knows this. Now you know it too.
 
 ---
 
-## Built for AI Correlation
+## Built for AI
 
-Jälki doesn't exist in isolation. It's the kernel layer in a three-layer observability stack designed for AI-driven root cause analysis:
+Jälki is the kernel layer in a stack designed for AI-driven root cause analysis:
 
 ```
  ┌─────────────────────────────────────────────────────────────┐
@@ -71,16 +71,69 @@ Jälki doesn't exist in isolation. It's the kernel layer in a three-layer observ
       └──────────────┘  └──────────────┘  └────────────┘
 ```
 
-AHTI joins events across all three layers on the 4-tuple (`src_ip:src_port → dst_ip:dst_port`). Jälki's `correlation_keys` field is designed for this join. When RAUTA sees a slow HTTP request and Jälki sees retransmits on the same connection, AHTI concludes "network problem" — not "application problem."
+AHTI joins events across all three layers on the 4-tuple (`src_ip:src_port → dst_ip:dst_port`). Jälki's `correlation_keys` field is designed for this join.
 
-An AI reading Jälki events can distinguish what no application-level telemetry can:
+An AI reading Jälki events can distinguish:
 
-- **Retransmit in SYN_SENT** → the remote isn't reachable (firewall, host down)
-- **Retransmit in ESTABLISHED** → the network is losing packets (switch, congestion)
-- **ECONNREFUSED** → the port isn't listening (crashed process, wrong config)
-- **ETIMEDOUT** → the host exists but isn't responding (overloaded, hung)
+- **Retransmit in SYN_SENT** → remote isn't reachable (firewall, host down)
+- **Retransmit in ESTABLISHED** → network is losing packets (switch, congestion)
+- **ECONNREFUSED** → port isn't listening (crashed process, wrong config)
+- **ETIMEDOUT** → host exists but isn't responding (overloaded, hung)
 
-These are different problems with different fixes. The kernel knows which one it is. Jälki makes that knowledge available.
+Different problems, different fixes. The kernel knows which one it is. Jälki makes that knowledge available as structured events.
+
+---
+
+## The Framework
+
+```
+your probe (Rust)
+    ↓
+jälki framework
+    ↓
+FALSE Protocol Occurrence JSON
+    ↓
+stdout / file / gRPC (POLKU)
+```
+
+### Probe Trait
+
+```rust
+pub trait Probe: Send + Sync + 'static {
+    fn name(&self) -> &str;
+    fn program_name(&self) -> &str;
+    fn attachments(&self) -> &[Attachment];
+    fn ring_buffer_map(&self) -> &str;
+    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError>;
+    fn sample_rate(&self) -> f64 { 1.0 }
+}
+```
+
+Implement this trait. Jälki handles eBPF loading, BTF attachment, ring buffer management, self-filtering, sampling, batching, and emission. You never touch the BPF verifier.
+
+### Emitter Trait
+
+```rust
+#[async_trait]
+pub trait Emitter: Send + Sync {
+    fn name(&self) -> &str;
+    async fn emit(&self, occurrences: &[Occurrence]) -> Result<(), EmitError>;
+    async fn health(&self) -> HealthStatus;
+}
+```
+
+Send events anywhere. Built-in: stdout (ndjson), file (ndjson), gRPC (POLKU, v0.2).
+
+### Runtime API
+
+```rust
+jalki::run(|rt| {
+    rt.attach(TcpConnect::new())
+      .attach(TcpClose::new())
+      .attach(TcpRetransmit::new())
+      .emit_to(StdoutEmitter::new())
+}).await
+```
 
 ---
 
@@ -102,28 +155,26 @@ These are different problems with different fixes. The kernel knows which one it
  ┌─────────────────────────────────▼───────────────────────────┐
  │                    jälki daemon (userspace)                  │
  │                                                             │
- │  reader ──► drain ring buffers (one thread per probe)       │
- │  probe  ──► convert raw bytes → FALSE Protocol Occurrence   │
+ │  loader  ──► reads Probe metadata, attaches via BTF         │
+ │  reader  ──► drain ring buffers (one thread per probe)      │
+ │  probe   ──► convert raw bytes → FALSE Protocol Occurrence  │
  │  emitter ──► send to stdout / file / gRPC                   │
  │  metrics ──► Prometheus on :9090                            │
  │                                                             │
  └─────────────────────────────────────────────────────────────┘
-                              │
-            ┌─────────────────┼──────────────┐
-            ▼                 ▼              ▼
-         stdout            file           gRPC
-        (ndjson)         (ndjson)        (POLKU)
 ```
 
-**fentry/fexit** — not kprobes. BPF trampolines patch a NOP at the function entry. Near-zero overhead when idle. No breakpoint trap, no `int3`, no context switch penalty. Safe to run 24/7 on production nodes.
+**fentry/fexit** — BPF trampolines, not kprobes. Near-zero overhead when idle. Safe to run 24/7 on production nodes.
 
-**Self-filter** — Jälki's own PID is inserted into a BPF HashMap before any probes attach. Every probe checks this map first, in kernel space. If Jälki emits to a gRPC endpoint, those `tcp_connect` calls never generate events. Zero userspace overhead for self-filtering.
+**Self-filter** — Jälki's own PID is excluded in kernel space. If Jälki emits to a gRPC endpoint, those `tcp_connect` calls never generate events.
 
-**CO-RE** — Compile Once, Run Everywhere. Built with aya + BTF. One binary runs on any kernel 5.5+ with BTF enabled. No C toolchain, no LLVM, no kernel headers at runtime.
+**CO-RE** — Compile Once, Run Everywhere. aya + BTF. One binary, any kernel 5.5+ with BTF enabled.
+
+**Probe-driven loader** — the loader reads probe metadata (`program_name()`, `attachments()`), no hardcoded program names. Add a probe, implement the trait, it gets attached automatically.
 
 ---
 
-## Three Probes
+## Built-in Probes
 
 | Probe | Attachment | Event Type | What It Gives You |
 |-------|-----------|-----------|-------------------|
@@ -147,20 +198,20 @@ These three, joined on the 4-tuple, answer: *which backends are being connected 
 ### Build
 
 ```bash
-# Userspace daemon
-cargo build --release -p jalki
-
 # eBPF programs (requires nightly Rust)
 cargo run -p xtask -- build-ebpf --release
+
+# Userspace daemon
+cargo build --release -p jalki
 ```
 
 ### Run
 
 ```bash
-# Emit to stdout (development)
+# Emit to stdout
 sudo jalki --emit stdout
 
-# Emit to file (production)
+# Emit to file
 sudo jalki --emit /var/log/jalki/events.ndjson --cluster prod-east-1
 
 # Custom eBPF object path
@@ -205,9 +256,9 @@ spec:
 
 ---
 
-## Observability About Itself
+## Self-Observability
 
-Jälki exposes Prometheus metrics on `:9090/metrics`:
+Prometheus metrics on `:9090/metrics`:
 
 ```
 jalki_events_total{probe="tcp_connect"}      48201
@@ -217,7 +268,7 @@ jalki_ring_buffer_drops{probe="tcp_connect"} 0
 jalki_emit_errors{emitter="stdout"}          0
 ```
 
-A probe that silently drops events is worse than no probe. Drops are always visible.
+Ring buffer drops are also emitted as `jalki.probe.events_dropped` Occurrences through the same pipeline — so AHTI can distinguish "no events happened" from "events happened but were dropped."
 
 ---
 
@@ -229,7 +280,7 @@ A probe that silently drops events is worse than no probe. Drops are always visi
  │                     #[repr(C)] event structs, size-locked with tests
  │
  ├── jalki-ebpf/       eBPF programs (bpfel-unknown-none, nightly)
- │                     3 probes, 4 BPF maps, self-filter
+ │                     probes + BPF maps + self-filter
  │                     NOT a workspace member (independent toolchain)
  │
  └── jalki/            userspace daemon + library
@@ -238,44 +289,71 @@ A probe that silently drops events is worse than no probe. Drops are always visi
 
 | Crate | What it is |
 |-------|------------|
-| `jalki-common` | `#[repr(C)]` event structs shared between kernel and userspace. `no_std`. Feature `userspace` enables `aya::Pod` impls. |
-| `jalki-ebpf` | Three eBPF programs + BPF maps. Separate build targeting `bpfel-unknown-none`. |
+| `jalki-common` | `#[repr(C)]` event structs shared between kernel and userspace. `no_std`. |
+| `jalki-ebpf` | eBPF programs + BPF maps. Separate build targeting `bpfel-unknown-none`. |
 | `jalki` | Daemon binary + library. `Probe` and `Emitter` traits for extensibility. |
 
-The `Probe` trait converts raw ring buffer bytes to FALSE Protocol Occurrences. The `Emitter` trait sends them somewhere. Both are public — write your own probes, write your own emitters.
+---
+
+## The Vision
+
+Writing an fentry probe today requires knowing BTF, aya, ring buffers, CO-RE, the BPF verifier, and kernel struct offsets. Maybe a few hundred people in the world can do this comfortably.
+
+Jälki makes it one trait. The framework handles everything else.
+
+This matters most for AI agents. An agent that needs to debug a network problem can identify the kernel function to hook, write the probe definition, deploy it via Jälki, consume the structured events, and reason about root cause. No human eBPF expertise in the loop.
+
+```
+v0.1  Rust trait (current)
+v0.2  Rust macro — simpler ergonomics
+v0.3  Python SDK — 8 lines to observe a kernel function
+v0.4  Go SDK
+```
+
+The target:
+
+```python
+@jalki.probe(fexit="tcp_connect")
+def on_connect(src_ip, dst_ip, src_port, dst_port, pid, comm, ret):
+    return jalki.occurrence(
+        type="kernel.tcp.connect",
+        severity="warning" if ret < 0 else "info",
+        network_data={"src_ip": src_ip, "dst_ip": dst_ip},
+        process_data={"pid": pid, "command": comm},
+    )
+```
+
+An agent writes 8 lines of Python and gets kernel-level visibility. No C. No BTF knowledge. No verifier.
 
 ---
 
 ## Limitations
 
-**Hardcoded offsets.** `__sk_common` field offsets are verified on kernel 6.19 via pahole. Other kernels may need different offsets. No self-test validation yet (planned — same pattern as Syva/Rauha).
-
-**IPv4 only.** IPv6 support is planned for v0.2.
-
-**No bytes/duration on tcp_close.** `bytes_sent`/`bytes_received` require reading `tcp_sock` fields whose offsets vary per kernel. Connection duration requires stashing a timestamp at `tcp_connect` in a BPF map. Both emit 0 in v0.1.
-
-**No netns enrichment.** Network namespace inode is emitted as 0. Container-aware enrichment (netns → pod name) is planned for v0.2.
-
-**gRPC emitter is a stub.** Returns an error on every emit. Use stdout or file for v0.1. Full POLKU integration requires the POLKU proto definitions.
-
-**No probe hot-reload.** Adding or removing probes requires a restart.
-
-**Privileged required.** BPF program loading needs `CAP_BPF` + `CAP_PERFMON` at minimum. Same constraint as Cilium, Tetragon, and the Datadog agent.
+- **Hardcoded offsets** — `__sk_common` field offsets verified on kernel 6.19. No self-test validation yet.
+- **IPv4 only** — IPv6 in v0.2.
+- **No bytes/duration on tcp_close** — emit 0 in v0.1, requires `tcp_sock` offset walking.
+- **No netns enrichment** — emitted as 0. Container-aware enrichment in v0.2.
+- **gRPC emitter is a stub** — returns error on emit. Use stdout or file for v0.1.
+- **No probe hot-reload** — adding probes requires restart.
+- **Privileged required** — BPF program loading needs `CAP_BPF` + `CAP_PERFMON` at minimum.
 
 ---
 
-## What Jälki Is Not
+## Part of False Systems
 
-**Not a security tool.** Jälki observes. It does not block, enforce, or deny. That's Syva and Rauha.
+```
+jälki     kernel observation (fentry/fexit framework)
+TAPIO     k8s observation
+RAUTA     L7 gateway
+POLKU     event transport
+AHTI      causality correlation
+syva      enforcement
+rauha     container runtime
+```
 
-**Not a storage layer.** Events flow out. AHTI stores and correlates.
-
-**Not a replacement for metrics.** Jälki gives you per-event causality data. If you want `tcp_retransmits/minute`, scrape Prometheus. If you want *which specific connection retransmitted and in what TCP state*, use Jälki.
-
-**Not coupled to POLKU.** POLKU is the default transport. Jälki emits to any `Emitter`. Stdout is a valid production destination.
+Jälki is the deepest layer. It sees what the kernel sees.
 
 ---
 
-## License
-
-Apache-2.0
+*false systems, berlin, 2026*
+*apache 2.0*
