@@ -249,6 +249,19 @@ Every probe emits a FALSE Protocol Occurrence. The schema:
 - Not a replacement for metrics — use Prometheus for rates, jälki for per-event causality
 - Not coupled to POLKU — stdout is a valid production destination
 
+## Oracle (`eval/oracle/`)
+
+Standalone ground-truth test binary. Validates jälki's public contract — knowledge base schema, semantic correctness, interpretation accuracy, MCP tool inventory, FALSE Protocol compliance. 34 numbered cases.
+
+**The oracle MUST NOT depend on any jalki crate.** It reads knowledge base JSON files from disk and makes assertions. It never imports jalki code. If you need a jalki type to write a test, you're testing code, not contract. The oracle tests requirements, not implementation.
+
+The oracle must not be modified as a side effect of modifying the system. When an oracle case fails, fix the system or the data — not the test.
+
+```bash
+cargo test --manifest-path eval/oracle/Cargo.toml           # all cases
+cargo test --manifest-path eval/oracle/Cargo.toml -- case_014  # one case
+```
+
 ## Conventions
 
 - No `.unwrap()` in userspace code — use `?` or handle errors

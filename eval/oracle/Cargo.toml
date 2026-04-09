@@ -1,0 +1,20 @@
+[package]
+name = "jalki-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone — NOT in workspace. The oracle must not be modified as a side
+# effect of modifying the system. It has its own workspace.
+#
+# RULE: The oracle MUST NOT depend on any jalki crate. It tests the public
+# contract (knowledge base JSON files, MCP protocol, FALSE Protocol schema)
+# by reading files and making assertions. It never imports jalki code.
+# If you need a jalki type to write a test, you're testing code, not contract.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+chrono = { version = "0.4", features = ["serde"] }

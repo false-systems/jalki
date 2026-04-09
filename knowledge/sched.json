@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "layer": "sched",
+  "description": "Scheduler kernel functions for CPU and latency observability",
+  "probes": [
+    {
+      "function": "finish_task_switch",
+      "attachment": "fentry",
+      "event_type": "kernel.sched.switch",
+      "layer": "sched",
+      "answers": [
+        "which process is being scheduled on/off CPU",
+        "is a process being preempted",
+        "CPU scheduling latency"
+      ],
+      "keywords": ["schedule", "context switch", "cpu", "preempt", "runqueue", "latency"],
+      "fields": [
+        { "name": "prev_pid",     "type": "u32",   "meaning": "PID being switched off CPU",    "important": true },
+        { "name": "prev_command", "type": "string", "meaning": "process name switched off",     "important": true },
+        { "name": "next_pid",     "type": "u32",   "meaning": "PID being switched on CPU",     "important": true },
+        { "name": "next_command", "type": "string", "meaning": "process name switched on",      "important": true }
+      ],
+      "use_when": "you suspect CPU scheduling issues — a process spending too long in the runqueue, or being preempted too frequently. very high frequency — always sample.",
+      "not_when": "you need overall CPU utilization — use /proc/stat or cgroup metrics for that.",
+      "combine_with": [],
+      "interpretations": [
+        {
+          "pattern": "frequent switches between same two processes",
+          "conclusion": "CPU contention between two processes — they're fighting for the same core",
+          "severity": "warning",
+          "action": "check CPU affinity and cgroup CPU limits. consider spreading workloads across cores."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: jalki
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules: []
+# jalki does not need Kubernetes API access.
+# All observation happens at the kernel level via eBPF.

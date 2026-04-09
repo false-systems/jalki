@@ -59,9 +59,21 @@ impl KnowledgeBase {
         let tcp: Layer =
             serde_json::from_str(include_str!("../../knowledge/tcp.json"))
                 .expect("knowledge/tcp.json is malformed — fix it before shipping");
+        let memory: Layer =
+            serde_json::from_str(include_str!("../../knowledge/memory.json"))
+                .expect("knowledge/memory.json is malformed — fix it before shipping");
+        let fs: Layer =
+            serde_json::from_str(include_str!("../../knowledge/fs.json"))
+                .expect("knowledge/fs.json is malformed — fix it before shipping");
+        let sched: Layer =
+            serde_json::from_str(include_str!("../../knowledge/sched.json"))
+                .expect("knowledge/sched.json is malformed — fix it before shipping");
+        let process: Layer =
+            serde_json::from_str(include_str!("../../knowledge/process.json"))
+                .expect("knowledge/process.json is malformed — fix it before shipping");
 
         Self {
-            layers: vec![tcp],
+            layers: vec![tcp, memory, fs, sched, process],
         }
     }
 

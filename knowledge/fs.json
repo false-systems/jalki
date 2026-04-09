@@ -1,0 +1,72 @@
+{
+  "version": "1.0",
+  "layer": "fs",
+  "description": "Filesystem kernel functions for I/O observability",
+  "probes": [
+    {
+      "function": "vfs_open",
+      "attachment": "fexit",
+      "event_type": "kernel.fs.open",
+      "layer": "fs",
+      "answers": [
+        "which files is a process opening",
+        "are file opens failing",
+        "what is accessing this path"
+      ],
+      "keywords": ["open", "file", "access", "path", "permission denied", "no such file"],
+      "fields": [
+        { "name": "pid",      "type": "u32",   "meaning": "process opening the file",            "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name",                        "important": true },
+        { "name": "filename", "type": "string", "meaning": "path being opened",                   "important": true },
+        { "name": "ret",      "type": "i32",   "meaning": "0 success, negative errno",            "important": true }
+      ],
+      "use_when": "you need to see which files a process is touching. fexit gives you the return value — ENOENT means file not found, EACCES means permission denied.",
+      "not_when": "you need I/O throughput — use vfs_read/vfs_write for bytes transferred.",
+      "combine_with": ["vfs_write"],
+      "interpretations": [
+        {
+          "pattern": "ret == -2 (ENOENT)",
+          "errno": "ENOENT",
+          "conclusion": "file not found — the path does not exist",
+          "severity": "warning",
+          "action": "check if the expected file exists. may be a missing configmap mount or wrong path."
+        },
+        {
+          "pattern": "ret == -13 (EACCES)",
+          "errno": "EACCES",
+          "conclusion": "permission denied — the process does not have access to this file",
+          "severity": "error",
+          "action": "check file permissions and securityContext. the container may need a different UID or fsGroup."
+        }
+      ]
+    },
+    {
+      "function": "vfs_write",
+      "attachment": "fexit",
+      "event_type": "kernel.fs.write",
+      "layer": "fs",
+      "answers": [
+        "which process is writing to disk",
+        "write throughput per process",
+        "is a process writing too much"
+      ],
+      "keywords": ["write", "disk", "io", "throughput", "bytes written"],
+      "fields": [
+        { "name": "pid",      "type": "u32",   "meaning": "process writing",            "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name",               "important": true },
+        { "name": "ret",      "type": "i64",   "meaning": "bytes written or errno",      "important": true }
+      ],
+      "use_when": "you need per-process write throughput. high frequency — use sampling.",
+      "not_when": "you just need to know if a file was accessed — use vfs_open.",
+      "combine_with": ["vfs_open"],
+      "interpretations": [
+        {
+          "pattern": "high bytes per call from one process",
+          "conclusion": "heavy writer — this process is generating significant disk I/O",
+          "severity": "info",
+          "action": "normal for databases and log writers. investigate if unexpected."
+        }
+      ]
+    }
+  ]
+}

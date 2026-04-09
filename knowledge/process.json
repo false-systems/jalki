@@ -1,0 +1,69 @@
+{
+  "version": "1.0",
+  "layer": "process",
+  "description": "Process lifecycle kernel functions",
+  "probes": [
+    {
+      "function": "do_execve",
+      "attachment": "fentry",
+      "event_type": "kernel.process.exec",
+      "layer": "process",
+      "answers": [
+        "what programs is a container executing",
+        "is something running unexpected binaries",
+        "process execution audit"
+      ],
+      "keywords": ["exec", "execute", "binary", "process", "spawn", "run"],
+      "fields": [
+        { "name": "pid",      "type": "u32",   "meaning": "PID of the executing process",  "important": true },
+        { "name": "command",  "type": "string", "meaning": "current process name",           "important": true },
+        { "name": "filename", "type": "string", "meaning": "binary being executed",           "important": true }
+      ],
+      "use_when": "you need to audit what binaries are being executed in a container. critical for security observability — an AI agent container should not be running unexpected binaries.",
+      "not_when": "you need process resource usage — use cgroup metrics.",
+      "combine_with": [],
+      "interpretations": [
+        {
+          "pattern": "unexpected binary execution in a container",
+          "conclusion": "a process is executing a binary that was not part of the container image",
+          "severity": "warning",
+          "action": "investigate the source of the binary. may indicate compromise or misconfiguration."
+        }
+      ]
+    },
+    {
+      "function": "do_exit",
+      "attachment": "fentry",
+      "event_type": "kernel.process.exit",
+      "layer": "process",
+      "answers": [
+        "which processes are exiting",
+        "what exit code did a process return",
+        "is a process crashing repeatedly"
+      ],
+      "keywords": ["exit", "crash", "terminate", "exit code", "signal", "killed"],
+      "fields": [
+        { "name": "pid",       "type": "u32", "meaning": "PID of the exiting process",  "important": true },
+        { "name": "command",   "type": "string", "meaning": "process name",              "important": true },
+        { "name": "exit_code", "type": "i32", "meaning": "exit code — 0 normal, signal-based if killed", "important": true }
+      ],
+      "use_when": "you want to observe process termination. exit codes above 128 indicate the process was killed by a signal (exit_code - 128 = signal number).",
+      "not_when": "you need to know why the process exited — correlate with other probes or application logs.",
+      "combine_with": ["do_execve", "oom_kill_process"],
+      "interpretations": [
+        {
+          "pattern": "exit_code == 137 (128 + SIGKILL)",
+          "conclusion": "process was killed by SIGKILL — likely OOM killed or manually terminated",
+          "severity": "warning",
+          "action": "correlate with oom_kill_process. if OOM kill, increase memory limits."
+        },
+        {
+          "pattern": "exit_code != 0 and repeated for same command",
+          "conclusion": "process is crashing repeatedly",
+          "severity": "error",
+          "action": "check application logs. correlate with container restart events in TAPIO."
+        }
+      ]
+    }
+  ]
+}
