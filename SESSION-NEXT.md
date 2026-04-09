@@ -1,104 +1,79 @@
-# jälki — Next Session Prompt
+# jälki — Session 4
 
-You are working on jälki, a programmable fentry/fexit framework for Linux. Read CLAUDE.md fully before touching any code.
+Read CLAUDE.md fully before touching any code. Understand the codebase before changing it.
 
-## Context
+## State
 
-jälki is to kernel functions what POLKU is to gRPC. You define a probe, jälki handles everything else. The skeleton is working — real kernel events are flowing from `tcp_connect`, `tcp_close`, and `tcp_retransmit_skb` to stdout as FALSE Protocol Occurrences. The foundation is solid. Now we build the framework that makes jälki a revolution.
+The skeleton works. 81 tests green. Real kernel events flowing on Fedora 43 / kernel 6.19.9. The framework is built. The MCP server has the right interface. The knowledge base is compiled in.
 
-## What Exists
+**Nothing talks to anything yet.** The MCP tools are stubs. The EventStore exists but nobody pushes to it. The ProbeRegistry exists but isn't wired into the Runtime. Hot-reload doesn't work end to end.
 
-- `jalki-common/` — no_std shared event structs, size-locked, aya::Pod impls
-- `jalki-ebpf/` — three working eBPF programs, ring buffers, PID_FILTER self-filter
-- `jalki/` — Probe trait, Emitter trait, Loader, Reader, Runtime builder, StdoutEmitter, FileEmitter, GrpcEmitter stub, Prometheus metrics on :9090, EventStore (in-memory), ProbeRegistry (runtime attach/detach), ProbeDescriptor (wire format), KnowledgeBase (5 layers, 11 functions)
-- `jalki-mcp/` — MCP server with 6 tools (find_probe, deploy_probe, get_events, explain_event, probe_status, deploy_descriptor) — tools have correct interfaces but MCP↔daemon IPC is stubbed
-- `knowledge/` — tcp.json, memory.json, fs.json, sched.json, process.json
-- `helm/jalki/` — DaemonSet + MCP Service on :7777
-- `eval/oracle/` — 34 blackbox test cases, zero jalki dependencies
-- 81 total tests, all green
+This session makes it real. One goal: `jalki ask "why is postgres slow"` returns a real interpretation from a real kernel.
 
-## What's Missing — Build In Order
+Everything else is secondary to that goal.
 
-### 1. Wire MCP ↔ Daemon IPC
+---
 
-The critical path. EventStore, ProbeRegistry, and KnowledgeBase exist but jalki-mcp returns stubs. Wire them together via shared state or Unix socket so deploy_probe, get_events, and probe_status return real data.
+## Critical Path — Do These In Order
 
-### 2. Wire EventStore into Pipeline
+Do not skip steps. Do not work on anything not on this list until the list is done.
 
-Reader needs to push events into Arc<EventStore> before emitting. Runtime needs to hold the store and pass it to readers.
+---
 
-### 3. Wire ProbeRegistry into Runtime
+### Step 1 — Wire EventStore into pipeline
 
-Runtime needs to hold Ebpf + Btf + ProbeRegistry and expose an API for runtime attachment. Hot-reload must actually work.
+The EventStore exists. The Reader discards events after emitting. Fix this.
 
-### 4. CLI — `jalki watch`, `jalki ask`, `jalki stream`
+In the reader, after converting raw bytes to an Occurrence, push to EventStore before emitting. The Runtime must hold an Arc<EventStore> and pass it to the Reader.
+
+### Step 2 — Wire ProbeRegistry into Runtime
+
+The ProbeRegistry exists. The Runtime doesn't expose it for runtime attachment.
+
+The Runtime must hold the loaded Ebpf object, BTF, and ProbeRegistry. When deploy_probe is called: look up the function, attach via BTF, register, start a new Reader task, return probe_id.
+
+### Step 3 — Unix socket IPC
+
+The daemon needs to expose an internal API. Unix socket at /run/jalki/jalki.sock.
+
+Protocol: newline-delimited JSON. Request → Response.
+
+Methods: deploy_probe, detach_probe, get_events, get_all_events, probe_status, find_probe, explain_event.
+
+### Step 4 — Wire MCP server to Unix socket
+
+jalki-mcp connects to the daemon socket. Each MCP tool call translates to a socket request. Clear error if daemon not running.
+
+### Step 5 — CLI: `jalki ask` and `jalki watch`
+
+`jalki ask` is the killer feature. Knowledge base search → auto-attach → collect → interpret → one answer.
+
+`jalki watch` — one-shot collection. `jalki stream` — live ndjson. `jalki list` — discovery. `jalki status` — what's running.
+
+Standalone mode: if no daemon socket, watch/stream attach probes directly.
+
+### Step 6 — Dockerfile
+
+Two-stage build. Distroless runtime. Under 20MB. Both jalki and jalki-mcp binaries.
+
+---
+
+## Definition of Done
 
 ```bash
-jalki watch tcp_connect --seconds 10
-jalki ask "why is my postgres connection slow" --seconds 30
-jalki stream tcp_retransmit --filter dst_port=5432
-jalki list probes --layer tcp
-jalki status
+# terminal 1
+sudo jalki --emit stdout --cluster dev
+
+# terminal 2
+jalki ask "why is k3s connecting to things slowly"
 ```
 
-The `ask` command is the killer feature — knowledge base search → auto-attach → collect → interpret → one answer.
+Real interpretation from real kernel events.
 
-CLI talks to daemon via Unix socket if running, falls back to standalone mode (attaches probes directly).
+## What Not To Touch
 
-### 5. Standalone Emitters
-
-```bash
-jalki --emit datadog --dd-api-key $DD_API_KEY
-jalki --emit loki://loki:3100
-jalki --emit webhook://https://my-collector.example.com/events
-jalki --emit otlp://otel-collector:4317
-```
-
-DatadogEmitter, LokiEmitter, WebhookEmitter, OtelEmitter. Works without False Systems stack.
-
-### 6. Dockerfile
-
-Single binary, distroless, under 20MB. eBPF object as separate file.
-
-### 7. Enhanced Helm Chart
-
-Add configmap for knowledge base override, emit type selection (stdout/grpc/datadog/loki/webhook/otlp), default probe list, resource limits.
-
-### 8. Python SDK Stub
-
-Interface defined, methods raise NotImplementedError. The decorator example:
-
-```python
-@client.probe(fexit="tcp_connect")
-def on_connect(event):
-    if event.ret < 0:
-        return jalki.occurrence(type="kernel.tcp.connect", severity="warning")
-```
-
-### 9. Knowledge Base Expansion
-
-Add more functions to reach ~30: tcp_recvmsg, vfs_read, do_sys_openat2, try_to_wake_up, schedule, copy_process, mm_page_alloc, vm_mmap, do_mmap.
-
-### 10. Codegen Stub (v0.3 prep)
-
-Design the ProbeCodegen interface. BTF → BPF bytecode. Don't implement — stub it so nothing blocks it later.
-
-## Constraints
-
-- No `.unwrap()` in userspace — use `?` or handle errors explicitly
-- No `println!` in library code — use `tracing`
-- eBPF code is unsafe by necessity — document every unsafe block
-- Size tests in jalki-common are mandatory and must not be broken
-- The knowledge base JSON must compile — Rust types are the schema
-- Self-filter must always be active — jälki never observes itself
-- The MCP server follows the same stdio JSON-RPC pattern as luotain-mcp
-- Single binary — no runtime deps, no LLVM, no kernel headers (until codegen)
-- Oracle must not depend on any jalki crate
-
-## Do Not
-
-- Do not add dependencies without a clear reason
-- Do not break the existing working probes
-- Do not write the Python SDK implementation — stub only
-- Do not implement full codegen — design the interface, stub
-- Do not add a database — EventStore is in-memory only
+- Do not break the 81 passing tests
+- Do not implement Python SDK
+- Do not implement codegen
+- Do not add knowledge base entries until steps 1-5 are done
+- Do not refactor what works
