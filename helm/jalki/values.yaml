@@ -1,0 +1,31 @@
+image:
+  repository: ghcr.io/false-systems/jalki
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+cluster: ""
+
+emit: "stdout"
+
+# MCP server configuration
+mcp:
+  enabled: true
+  port: 7777
+
+# Resource limits
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# Node selector for targeting specific nodes
+nodeSelector: {}
+
+tolerations:
+  - operator: Exists
+
+# Additional environment variables
+env: []

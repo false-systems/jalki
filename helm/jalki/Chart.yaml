@@ -1,0 +1,8 @@
+apiVersion: v2
+name: jalki
+description: Programmable fentry/fexit framework for Linux kernel observability
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: False Systems

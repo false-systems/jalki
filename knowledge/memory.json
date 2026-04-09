@@ -1,0 +1,41 @@
+{
+  "version": "1.0",
+  "layer": "memory",
+  "description": "Memory management kernel functions for resource observability",
+  "probes": [
+    {
+      "function": "oom_kill_process",
+      "attachment": "fentry",
+      "event_type": "kernel.memory.oom_kill",
+      "layer": "memory",
+      "answers": [
+        "which process got OOM killed",
+        "why is my container being killed",
+        "is memory pressure causing restarts"
+      ],
+      "keywords": ["oom", "out of memory", "killed", "memory pressure", "cgroup", "restart"],
+      "fields": [
+        { "name": "pid",      "type": "u32",   "meaning": "PID of the victim process",          "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name of the victim",         "important": true },
+        { "name": "total_vm", "type": "u64",   "meaning": "total virtual memory of the victim",  "important": true }
+      ],
+      "use_when": "containers are being killed unexpectedly. OOM kills are the kernel's last resort when memory is exhausted — the cgroup limit was hit or the node ran out of memory.",
+      "not_when": "you're looking for gradual memory growth — this only fires when the kernel kills a process. Use memory metrics for trending.",
+      "combine_with": [],
+      "interpretations": [
+        {
+          "pattern": "oom_kill fires for a specific container repeatedly",
+          "conclusion": "container memory limit is too low, or the application has a memory leak",
+          "severity": "critical",
+          "action": "check container memory limits. if the limit is reasonable, investigate the application for memory leaks."
+        },
+        {
+          "pattern": "oom_kill fires for multiple different processes",
+          "conclusion": "node-level memory exhaustion — not a single container's fault",
+          "severity": "critical",
+          "action": "check node memory pressure. too many pods scheduled on this node."
+        }
+      ]
+    }
+  ]
+}

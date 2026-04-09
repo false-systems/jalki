@@ -1,0 +1,21 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: jalki
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mcp
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.mcp.port }}
+      targetPort: mcp
+      protocol: TCP
+      name: mcp
+  selector:
+    app.kubernetes.io/name: jalki
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

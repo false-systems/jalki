@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "jalki-common",
     "jalki",
+    "jalki-mcp",
     "xtask",
 ]
 
