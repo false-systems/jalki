@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::probe::Probe;
+use crate::store::EventStore;
 
 /// Per-probe drop counter, exposed for metrics.
 pub struct ProbeStats {
@@ -39,6 +40,7 @@ pub fn spawn_reader(
     cluster: String,
     tx: mpsc::Sender<Occurrence>,
     stats: Arc<ProbeStats>,
+    store: Arc<EventStore>,
 ) -> Result<()> {
     let map_name = probe.ring_buffer_map().to_string();
 
@@ -52,7 +54,7 @@ pub fn spawn_reader(
     let probe_name = probe.name().to_string();
 
     tokio::task::spawn_blocking(move || {
-        drain_loop(ring_buf, probe, &cluster, tx, stats, &probe_name);
+        drain_loop(ring_buf, probe, &cluster, tx, stats, &probe_name, store);
     });
 
     Ok(())
@@ -65,6 +67,7 @@ fn drain_loop(
     tx: mpsc::Sender<Occurrence>,
     stats: Arc<ProbeStats>,
     probe_name: &str,
+    store: Arc<EventStore>,
 ) {
     let sample_rate = probe.sample_rate();
     let do_sampling = sample_rate < 1.0;
@@ -92,6 +95,7 @@ fn drain_loop(
 
             match probe.to_occurrence(raw, cluster) {
                 Ok(occ) => {
+                    store.push(probe_name, occ.clone());
                     if tx.blocking_send(occ).is_err() {
                         debug!(probe = probe_name, "emit channel closed, stopping reader");
                         return;

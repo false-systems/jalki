@@ -1,19 +1,17 @@
 use serde_json::{json, Value};
 
+use jalki::ipc;
 use jalki::knowledge::{EventFields, KnowledgeBase};
-use jalki::store::{EventFilter, EventStore};
 
 /// Shared state for the MCP server.
 pub struct JalkiState {
     kb: KnowledgeBase,
-    store: EventStore,
 }
 
 impl JalkiState {
     pub fn new() -> Self {
         Self {
             kb: KnowledgeBase::load(),
-            store: EventStore::new(10_000),
         }
     }
 
@@ -21,7 +19,7 @@ impl JalkiState {
         match method {
             "initialize" => self.handle_initialize(),
             "tools/list" => self.handle_tools_list(),
-            "tools/call" => self.handle_tools_call(params),
+            "tools/call" => self.handle_tools_call(params).await,
             _ => Err(format!("unknown method: {method}")),
         }
     }
@@ -179,7 +177,7 @@ impl JalkiState {
         }))
     }
 
-    fn handle_tools_call(&self, params: Option<Value>) -> Result<Value, String> {
+    async fn handle_tools_call(&self, params: Option<Value>) -> Result<Value, String> {
         let params = params.ok_or("missing params")?;
         let tool_name = params
             .get("name")
@@ -189,11 +187,11 @@ impl JalkiState {
 
         let result = match tool_name {
             "jalki_find_probe" => self.tool_find_probe(args),
-            "jalki_deploy_probe" => self.tool_deploy_probe(args),
-            "jalki_get_events" => self.tool_get_events(args),
+            "jalki_deploy_probe" => self.tool_deploy_probe(args).await,
+            "jalki_get_events" => self.tool_get_events(args).await,
             "jalki_explain_event" => self.tool_explain_event(args),
-            "jalki_probe_status" => self.tool_probe_status(args),
-            "jalki_deploy_descriptor" => self.tool_deploy_descriptor(args),
+            "jalki_probe_status" => self.tool_probe_status(args).await,
+            "jalki_deploy_descriptor" => self.tool_deploy_descriptor(args).await,
             _ => Err(format!("unknown tool: {tool_name}")),
         };
 
@@ -210,6 +208,7 @@ impl JalkiState {
 
     // === Tool Implementations ===
 
+    /// find_probe runs locally — the knowledge base is compiled into the MCP binary too.
     fn tool_find_probe(&self, args: Value) -> Result<Value, String> {
         let question = args
             .get("question")
@@ -246,70 +245,7 @@ impl JalkiState {
         Ok(json!({ "matches": results }))
     }
 
-    fn tool_deploy_probe(&self, args: Value) -> Result<Value, String> {
-        let function = args
-            .get("function")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'function' argument")?;
-
-        let _sample_rate = args
-            .get("sample_rate")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
-
-        // Check if the function is in the knowledge base.
-        let probe_info = self.kb.get_probe(function);
-        if probe_info.is_none() {
-            return Err(format!(
-                "unknown function '{}'. Use jalki_find_probe to search the knowledge base.",
-                function
-            ));
-        }
-
-        // TODO: Wire to ProbeRegistry when daemon IPC is implemented.
-        // For now, return a stub response indicating the probe would be deployed.
-        Ok(json!({
-            "probe_id": format!("probe_{}", function.replace("_", "")),
-            "function": function,
-            "status": "pending",
-            "note": "Probe deployment requires connection to the jalki daemon. Start the daemon with: sudo jalki --emit stdout"
-        }))
-    }
-
-    fn tool_get_events(&self, args: Value) -> Result<Value, String> {
-        let probe_id = args
-            .get("probe_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'probe_id' argument")?;
-
-        let last_seconds = args
-            .get("last_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
-
-        let filter_obj = args.get("filter").cloned().unwrap_or(json!({}));
-
-        let filter = EventFilter {
-            last_seconds: Some(last_seconds),
-            src_ip: filter_obj.get("src_ip").and_then(|v| v.as_str()).map(String::from),
-            dst_ip: filter_obj.get("dst_ip").and_then(|v| v.as_str()).map(String::from),
-            src_port: filter_obj.get("src_port").and_then(|v| v.as_u64()).map(|v| v as u16),
-            dst_port: filter_obj.get("dst_port").and_then(|v| v.as_u64()).map(|v| v as u16),
-            pid: filter_obj.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32),
-            command: filter_obj.get("command").and_then(|v| v.as_str()).map(String::from),
-            limit: Some(100),
-        };
-
-        // Query the in-memory store.
-        let events = self.store.query(probe_id, &filter);
-
-        Ok(json!({
-            "events": events.iter().map(|e| serde_json::to_value(e).unwrap_or_default()).collect::<Vec<_>>(),
-            "total": events.len(),
-            "probe_id": probe_id,
-        }))
-    }
-
+    /// explain_event runs locally — pure knowledge base lookup, no daemon needed.
     fn tool_explain_event(&self, args: Value) -> Result<Value, String> {
         let function = args
             .get("function")
@@ -324,7 +260,6 @@ impl JalkiState {
         let interpretations = self.kb.explain(function, &fields);
 
         if interpretations.is_empty() {
-            // Still provide the probe info if we have it.
             if let Some(probe) = self.kb.get_probe(function) {
                 return Ok(json!({
                     "function": function,
@@ -349,15 +284,68 @@ impl JalkiState {
         }))
     }
 
-    fn tool_probe_status(&self, _args: Value) -> Result<Value, String> {
-        // TODO: Wire to ProbeRegistry when daemon IPC is implemented.
-        Ok(json!({
-            "probes": [],
-            "note": "Probe status requires connection to the jalki daemon."
-        }))
+    /// deploy_probe forwards to the daemon via IPC.
+    async fn tool_deploy_probe(&self, args: Value) -> Result<Value, String> {
+        let function = args
+            .get("function")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'function' argument")?;
+
+        let sample_rate = args
+            .get("sample_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        // Validate locally first.
+        if self.kb.get_probe(function).is_none() {
+            return Err(format!(
+                "unknown function '{}'. Use jalki_find_probe to search the knowledge base.",
+                function
+            ));
+        }
+
+        let resp = ipc::call(
+            "deploy_probe",
+            json!({ "function": function, "sample_rate": sample_rate }),
+        )
+        .await
+        .map_err(|e| format!("daemon connection failed: {e}"))?;
+
+        if resp.ok {
+            Ok(resp.result.unwrap_or(json!(null)))
+        } else {
+            Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+        }
     }
 
-    fn tool_deploy_descriptor(&self, args: Value) -> Result<Value, String> {
+    /// get_events forwards to the daemon via IPC.
+    async fn tool_get_events(&self, args: Value) -> Result<Value, String> {
+        let resp = ipc::call("get_events", args)
+            .await
+            .map_err(|e| format!("daemon connection failed: {e}"))?;
+
+        if resp.ok {
+            Ok(resp.result.unwrap_or(json!(null)))
+        } else {
+            Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+        }
+    }
+
+    /// probe_status forwards to the daemon via IPC.
+    async fn tool_probe_status(&self, _args: Value) -> Result<Value, String> {
+        let resp = ipc::call("probe_status", json!({}))
+            .await
+            .map_err(|e| format!("daemon connection failed: {e}"))?;
+
+        if resp.ok {
+            Ok(resp.result.unwrap_or(json!(null)))
+        } else {
+            Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+        }
+    }
+
+    /// deploy_descriptor forwards to the daemon via IPC as a deploy_probe call.
+    async fn tool_deploy_descriptor(&self, args: Value) -> Result<Value, String> {
         let function = args
             .get("function")
             .and_then(|v| v.as_str())
@@ -367,11 +355,6 @@ impl JalkiState {
             .get("attachment")
             .and_then(|v| v.as_str())
             .ok_or("missing 'attachment'")?;
-
-        let event_type = args
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .ok_or("missing 'event_type'")?;
 
         // Validate the descriptor against the knowledge base.
         if let Some(probe) = self.kb.get_probe(function) {
@@ -383,14 +366,31 @@ impl JalkiState {
             }
         }
 
-        // TODO: Wire to ProbeRegistry + ProbeDescriptor when daemon IPC is implemented.
-        Ok(json!({
-            "probe_id": format!("probe_{}", function.replace("_", "")),
-            "function": function,
-            "attachment": attachment,
-            "event_type": event_type,
-            "status": "pending",
-            "note": "Descriptor deployment requires connection to the jalki daemon."
-        }))
+        let sample_rate = args
+            .get("sample_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let resp = ipc::call(
+            "deploy_probe",
+            json!({ "function": function, "sample_rate": sample_rate }),
+        )
+        .await
+        .map_err(|e| format!("daemon connection failed: {e}"))?;
+
+        if resp.ok {
+            // Augment with descriptor metadata.
+            let mut result = resp.result.unwrap_or(json!({}));
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("attachment".into(), json!(attachment));
+                obj.insert(
+                    "event_type".into(),
+                    args.get("event_type").cloned().unwrap_or(json!(null)),
+                );
+            }
+            Ok(result)
+        } else {
+            Err(resp.error.unwrap_or_else(|| "unknown error".into()))
+        }
     }
 }

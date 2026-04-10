@@ -74,7 +74,7 @@ impl ProbeRegistry {
         btf: &Btf,
         cluster: &str,
         tx: mpsc::Sender<Occurrence>,
-        _store: &Arc<EventStore>,
+        store: &Arc<EventStore>,
     ) -> Result<ProbeId> {
         let function = probe.attachments().first()
             .map(|a| match a {
@@ -127,6 +127,7 @@ impl ProbeRegistry {
             cluster.to_string(),
             tx,
             stats.clone(),
+            store.clone(),
         )?;
 
         let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);

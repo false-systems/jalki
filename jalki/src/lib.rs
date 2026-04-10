@@ -1,6 +1,7 @@
 pub mod descriptor;
 pub mod emitter;
 pub mod filter;
+pub mod ipc;
 pub mod knowledge;
 pub mod loader;
 pub mod metrics;
@@ -27,5 +28,5 @@ pub use emitter::Emitter;
 pub use knowledge::KnowledgeBase;
 pub use probe::{Attachment, Probe};
 pub use registry::ProbeRegistry;
-pub use runtime::run;
+pub use runtime::{run, DaemonHandle};
 pub use store::EventStore;

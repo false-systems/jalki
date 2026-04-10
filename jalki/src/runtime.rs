@@ -2,16 +2,21 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::emitter::Emitter;
+use crate::knowledge::KnowledgeBase;
 use crate::loader;
 use crate::metrics::{EmitterLabel, Metrics};
 use crate::probe::Probe;
+use crate::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
 use crate::reader::{self, ProbeStats};
+use crate::registry::ProbeRegistry;
+use crate::store::EventStore;
 
 /// Builder for configuring and running jälki.
 pub struct Runtime {
@@ -50,8 +55,14 @@ impl Runtime {
     }
 
     /// Run the jälki daemon: load eBPF, attach probes, drain events, emit.
+    ///
+    /// Returns a `DaemonHandle` for runtime operations (IPC, CLI).
+    /// The daemon runs until the returned future completes.
     pub async fn run(self) -> Result<()> {
         let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(EventStore::new(10_000));
+        let registry = Arc::new(ProbeRegistry::new());
+        let kb = Arc::new(KnowledgeBase::load());
 
         info!(
             probes = self.probes.len(),
@@ -63,10 +74,13 @@ impl Runtime {
         // Load and attach eBPF programs — driven by probe metadata.
         let mut ebpf = loader::load_and_attach(Path::new(&self.ebpf_path), &self.probes)?;
 
+        // Load BTF for runtime probe attachment.
+        let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
+
         // Channel: readers → emit loop.
         let (tx, mut rx) = mpsc::channel::<Occurrence>(8192);
 
-        // Spawn a reader for each probe.
+        // Spawn a reader for each probe, register in the registry.
         let mut stats_map: Vec<(String, Arc<ProbeStats>)> = Vec::new();
         for probe in &self.probes {
             let stats = Arc::new(ProbeStats::new());
@@ -76,9 +90,22 @@ impl Runtime {
                 self.cluster.clone(),
                 tx.clone(),
                 stats.clone(),
+                store.clone(),
             )?;
+            registry.register_startup_probe(probe.clone(), stats.clone());
             stats_map.push((probe.name().to_string(), stats));
         }
+
+        // Build the daemon handle for IPC and CLI.
+        let handle = Arc::new(DaemonHandle {
+            ebpf: Mutex::new(ebpf),
+            btf,
+            registry: registry.clone(),
+            store: store.clone(),
+            kb: kb.clone(),
+            tx: tx.clone(),
+            cluster: self.cluster.clone(),
+        });
 
         // Spawn self-observability: periodically emit drops/errors as Occurrences.
         let stats_tx = tx.clone();
@@ -86,6 +113,14 @@ impl Runtime {
         let stats_for_task = stats_map.clone();
         tokio::spawn(async move {
             emit_self_observability(stats_for_task, stats_tx, &stats_cluster).await;
+        });
+
+        // Spawn IPC server.
+        let ipc_handle = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::ipc::serve(ipc_handle).await {
+                error!(error = %e, "IPC server failed");
+            }
         });
 
         // Drop the original sender so the channel closes when all readers stop.
@@ -141,6 +176,56 @@ impl Runtime {
 
         emit_handle.await?;
         Ok(())
+    }
+}
+
+/// Handle for runtime operations against a running jälki daemon.
+///
+/// Shared across IPC server, MCP, and CLI. All methods are safe to call
+/// concurrently — the Ebpf object is protected by a Mutex.
+pub struct DaemonHandle {
+    ebpf: Mutex<Ebpf>,
+    btf: Btf,
+    pub registry: Arc<ProbeRegistry>,
+    pub store: Arc<EventStore>,
+    pub kb: Arc<KnowledgeBase>,
+    tx: mpsc::Sender<Occurrence>,
+    pub cluster: String,
+}
+
+impl DaemonHandle {
+    /// Deploy a probe by kernel function name at runtime.
+    ///
+    /// Looks up the function in the knowledge base to determine attachment type,
+    /// instantiates the right built-in probe, attaches the eBPF program, and
+    /// starts draining events.
+    pub async fn deploy_probe(
+        &self,
+        function: &str,
+        _sample_rate: f64,
+    ) -> Result<String> {
+        // Resolve function → built-in probe.
+        let probe: Arc<dyn Probe> = match function {
+            "tcp_connect" => Arc::new(TcpConnect::new()),
+            "tcp_close" => Arc::new(TcpClose::new()),
+            "tcp_retransmit_skb" => Arc::new(TcpRetransmit::new()),
+            other => anyhow::bail!(
+                "no pre-compiled probe for '{}'. Known: tcp_connect, tcp_close, tcp_retransmit_skb",
+                other
+            ),
+        };
+
+        let mut ebpf = self.ebpf.lock().await;
+        let probe_id = self.registry.attach(
+            probe,
+            &mut ebpf,
+            &self.btf,
+            &self.cluster,
+            self.tx.clone(),
+            &self.store,
+        )?;
+
+        Ok(probe_id.to_string())
     }
 }
 

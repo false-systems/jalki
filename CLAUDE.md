@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with jälki.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What is jälki
 
@@ -25,9 +25,16 @@ stdout / file / gRPC (POLKU)
 ```
 jalki/
 ├── jalki-common/     # no_std shared types — kernel + userspace
-├── jalki-ebpf/       # eBPF programs — NOT a workspace member
-└── jalki/            # userspace daemon + library
+├── jalki-ebpf/       # eBPF programs — NOT a workspace member (separate build target)
+├── jalki/            # userspace daemon + library
+├── jalki-mcp/        # MCP server (JSON-RPC 2.0 over stdin/stdout)
+├── xtask/            # build orchestration (eBPF compilation)
+└── eval/oracle/      # standalone contract test suite — NOT in workspace
 ```
+
+Workspace members: `jalki-common`, `jalki`, `jalki-mcp`, `xtask`. The eBPF crate and oracle are built separately.
+
+External dependency: `false-protocol` is a path dependency from `../ahti/false-protocol`.
 
 ### jalki-common
 
@@ -55,9 +62,18 @@ jalki/
   - `Runtime` — builder API: `.attach(probe).emit_to(emitter).run().await`
   - `Loader` — loads eBPF object, populates self-filter, attaches probes via BTF
   - `Reader` — spawns blocking tasks to drain ring buffers
+  - `KnowledgeBase` — embeds `knowledge/*.json` via `include_str!()`, searchable by question/keywords
+  - `ProbeRegistry` — runtime attach/detach, tracks probe status
+  - `EventStore` — in-memory ring buffer of recent Occurrences per probe
   - `Metrics` — Prometheus on :9090
 - Built-in emitters: `StdoutEmitter`, `FileEmitter`, `GrpcEmitter` (stub in v0.1)
 - Built-in probes: `TcpConnect`, `TcpClose`, `TcpRetransmit`
+
+### jalki-mcp
+
+- MCP server: JSON-RPC 2.0 over stdin/stdout
+- Tools: `jalki_find_probe`, `jalki_deploy_probe`, `jalki_get_events`, `jalki_explain_event`, `jalki_probe_status`, `jalki_deploy_descriptor`
+- Holds `JalkiState` with `KnowledgeBase` + `EventStore`
 
 ## Build & Run
 
@@ -77,6 +93,24 @@ sudo RUST_LOG=jalki=debug ./target/debug/jalki \
 cargo run -p xtask -- build-ebpf --release
 cargo build --release -p jalki
 ```
+
+## Tests & Checks
+
+```bash
+# Quick validation (no eBPF hardware needed)
+cargo check --workspace
+cargo test --workspace                          # all workspace tests
+
+# Single crate
+cargo test -p jalki-common                      # event struct size tests
+cargo test -p jalki                             # userspace tests
+
+# Oracle — standalone contract tests (NOT in workspace)
+cargo test --manifest-path eval/oracle/Cargo.toml           # all cases
+cargo test --manifest-path eval/oracle/Cargo.toml -- case_014  # single case
+```
+
+The oracle validates the public contract (knowledge base JSON, FALSE Protocol schema, MCP tool inventory). It must never import jalki crates. When an oracle case fails, fix the system or the data — not the test.
 
 ## Adding a New Probe
 
@@ -251,16 +285,11 @@ Every probe emits a FALSE Protocol Occurrence. The schema:
 
 ## Oracle (`eval/oracle/`)
 
-Standalone ground-truth test binary. Validates jälki's public contract — knowledge base schema, semantic correctness, interpretation accuracy, MCP tool inventory, FALSE Protocol compliance. 34 numbered cases.
+Standalone ground-truth test binary. Validates jälki's public contract — knowledge base schema, semantic correctness, interpretation accuracy, MCP tool inventory, FALSE Protocol compliance.
 
 **The oracle MUST NOT depend on any jalki crate.** It reads knowledge base JSON files from disk and makes assertions. It never imports jalki code. If you need a jalki type to write a test, you're testing code, not contract. The oracle tests requirements, not implementation.
 
 The oracle must not be modified as a side effect of modifying the system. When an oracle case fails, fix the system or the data — not the test.
-
-```bash
-cargo test --manifest-path eval/oracle/Cargo.toml           # all cases
-cargo test --manifest-path eval/oracle/Cargo.toml -- case_014  # one case
-```
 
 ## Conventions
 
