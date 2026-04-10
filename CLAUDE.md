@@ -56,15 +56,19 @@ External dependency: `false-protocol` is a path dependency from `../ahti/false-p
 ### jalki (userspace)
 
 - Library + binary in one crate
+- **Daemon mode** (no subcommand): loads eBPF, attaches probes, drains events, emits, serves IPC
+- **CLI subcommands**: `ask`, `watch`, `stream`, `list`, `status` — talk to daemon via IPC
 - Key types:
   - `Probe` trait — converts raw ring buffer bytes to `Occurrence`
   - `Emitter` trait — sends `Occurrence` somewhere
   - `Runtime` — builder API: `.attach(probe).emit_to(emitter).run().await`
+  - `DaemonHandle` — holds `Mutex<Ebpf>`, `Btf`, `ProbeRegistry`, `EventStore`, `KnowledgeBase`, emit channel. Shared across IPC server and runtime. Enables runtime probe deployment.
   - `Loader` — loads eBPF object, populates self-filter, attaches probes via BTF
-  - `Reader` — spawns blocking tasks to drain ring buffers
+  - `Reader` — spawns blocking tasks to drain ring buffers, pushes to EventStore before emitting
   - `KnowledgeBase` — embeds `knowledge/*.json` via `include_str!()`, searchable by question/keywords
   - `ProbeRegistry` — runtime attach/detach, tracks probe status
   - `EventStore` — in-memory ring buffer of recent Occurrences per probe
+  - `ipc` module — Unix socket server at `/run/jalki/jalki.sock`, ndjson protocol. Also provides `ipc::call()` client for CLI/MCP.
   - `Metrics` — Prometheus on :9090
 - Built-in emitters: `StdoutEmitter`, `FileEmitter`, `GrpcEmitter` (stub in v0.1)
 - Built-in probes: `TcpConnect`, `TcpClose`, `TcpRetransmit`
@@ -73,7 +77,8 @@ External dependency: `false-protocol` is a path dependency from `../ahti/false-p
 
 - MCP server: JSON-RPC 2.0 over stdin/stdout
 - Tools: `jalki_find_probe`, `jalki_deploy_probe`, `jalki_get_events`, `jalki_explain_event`, `jalki_probe_status`, `jalki_deploy_descriptor`
-- Holds `JalkiState` with `KnowledgeBase` + `EventStore`
+- `find_probe` and `explain_event` run locally (KB is compiled in)
+- `deploy_probe`, `get_events`, `probe_status`, `deploy_descriptor` forward to daemon via `jalki::ipc::call()`
 
 ## Build & Run
 
@@ -84,7 +89,7 @@ cargo run -p xtask -- build-ebpf
 # Build userspace daemon
 cargo build -p jalki
 
-# Run (requires root or CAP_BPF + CAP_PERFMON)
+# Run daemon (requires root or CAP_BPF + CAP_PERFMON)
 sudo RUST_LOG=jalki=debug ./target/debug/jalki \
     --ebpf-path jalki-ebpf/target/bpfel-unknown-none/debug/jalki-ebpf \
     --emit stdout
@@ -93,6 +98,32 @@ sudo RUST_LOG=jalki=debug ./target/debug/jalki \
 cargo run -p xtask -- build-ebpf --release
 cargo build --release -p jalki
 ```
+
+## CLI
+
+The `jalki` binary is both daemon and CLI. No subcommand = daemon mode. Subcommands talk to the daemon via IPC at `/run/jalki/jalki.sock`.
+
+```bash
+# Daemon (terminal 1 — needs root)
+sudo jalki --emit stdout --cluster dev
+
+# CLI (terminal 2 — no root needed)
+jalki ask "why is k3s connecting to things slowly"   # KB search → deploy → collect → interpret
+jalki watch tcp_connect --seconds 10 --dst-port 5432 # one-shot collection
+jalki stream tcp_retransmit_skb                      # live ndjson
+jalki list --layer tcp                               # browse knowledge base (no daemon needed)
+jalki status                                         # show attached probes
+```
+
+`jalki ask` falls back to KB-only analysis when no daemon is running. `jalki list` always works locally.
+
+## IPC Protocol
+
+Unix socket at `/run/jalki/jalki.sock`. Newline-delimited JSON request/response.
+
+Methods: `deploy_probe`, `get_events`, `get_all_events`, `probe_status`, `find_probe`, `explain_event`.
+
+Client: `jalki::ipc::call("method", params_json)` — used by both CLI and MCP server.
 
 ## Tests & Checks
 
@@ -204,11 +235,12 @@ That's it. jälki handles everything else.
 
 ```rust
 pub trait Probe: Send + Sync + 'static {
-    fn name(&self) -> &str;
     fn attachments(&self) -> &[Attachment];
+    fn name(&self) -> &str;
+    fn program_name(&self) -> &str;         // must match #[fentry]/#[fexit] fn name in jalki-ebpf
     fn ring_buffer_map(&self) -> &str;
-    fn to_occurrence(&self, raw: &[u8]) -> Result<Occurrence, ProbeError>;
-    fn sample_rate(&self) -> f64 { 1.0 }  // default: all events
+    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError>;
+    fn sample_rate(&self) -> f64 { 1.0 }
 }
 
 pub enum Attachment {
@@ -273,7 +305,7 @@ Every probe emits a FALSE Protocol Occurrence. The schema:
 - **IPv4 only** — IPv6 in v0.2
 - **bytes_sent/bytes_received** — emit 0 in v0.1, requires `tcp_sock` offset validation
 - **gRPC emitter** — stub in v0.1, returns error on emit. Use stdout or file.
-- **No hot-reload** — adding probes requires restart
+- **Runtime attach only** — pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb) can be attached at runtime via IPC. Custom probes still require restart.
 - **Self-filter** — jälki's own PID is always excluded. This is correct behavior, not a bug.
 
 ## What jälki Is Not
