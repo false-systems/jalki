@@ -32,6 +32,10 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
 
     // Read 4-tuple from __sk_common.
     // offset 0: skc_daddr, offset 4: skc_rcv_saddr
+    //
+    // Known issue: skc_num (src_port, offset 14) is cleared by the kernel
+    // before tcp_close returns, so fexit always reads 0. This is correct
+    // kernel behavior. Use tcp_connect event's src_port to correlate.
     let dst_addr: u32 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(0) as *const u32) }.map_err(|e| e as i64)?;
     let src_addr: u32 =
