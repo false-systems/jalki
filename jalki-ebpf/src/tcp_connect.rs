@@ -40,6 +40,10 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     //   offset 14: skc_num (__u16) — source port (host order)
     //   offset 18: skc_state (u8) — TCP state
     // Verified via pahole on kernel 6.19.9.
+    //
+    // Known issue: skc_daddr reads 0 for connections rewritten by Cilium
+    // transparent proxy or other eBPF-based CNIs. The real destination is
+    // stored in CNI-specific metadata, not in __sk_common.
     let dst_addr: u32 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(0) as *const u32) }.map_err(|e| e as i64)?;
     let src_addr: u32 =

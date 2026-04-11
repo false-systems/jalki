@@ -245,6 +245,17 @@ helm install jalki helm/jalki/ --set cluster=prod-east-1 --set emit=stdout
 
 ---
 
+## Known limitations
+
+- **dst_ip 0.0.0.0 on Cilium-proxied connections** — connections rewritten by Cilium transparent proxy (or other eBPF-based CNIs) may show `dst_ip: 0.0.0.0`. The kernel's `skc_daddr` is 0 at fexit because the CNI has intercepted the connection before the socket's destination field is populated. The real destination is stored in CNI-specific metadata that jälki doesn't read. Affects Chrome, curl, and any process whose connections are transparently proxied.
+- **src_port 0 on tcp_close events** — the kernel clears `skc_num` before `tcp_close` returns, so fexit sees 0. This is correct kernel behavior. Use the `tcp_connect` event's `src_port` and correlate by 4-tuple to get the full picture.
+- **IPv4 only** — IPv6 in v0.2.
+- **bytes_sent/bytes_received emit 0** — requires `tcp_sock` offset walking not yet implemented.
+- **gRPC emitter is a stub** — use stdout or file.
+- **Privileged required** — `CAP_BPF` + `CAP_PERFMON` at minimum.
+
+---
+
 ## Part of False Systems
 
 ```
