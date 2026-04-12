@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rmpv::Value;
 
-use jalki::ipc::{self, vs, METHOD_DEPLOY};
+use jalki::ipc::{self, msgpack_str, METHOD_DEPLOY, METHOD_GET_EVENTS};
 
 /// `jalki stream [function]`
 ///
@@ -9,8 +9,8 @@ use jalki::ipc::{self, vs, METHOD_DEPLOY};
 pub async fn run(function: Option<&str>) -> Result<()> {
     if let Some(func) = function {
         let params = Value::Map(vec![
-            (vs("function"), vs(func)),
-            (vs("sample_rate"), Value::F64(1.0)),
+            (msgpack_str("function"), msgpack_str(func)),
+            (msgpack_str("sample_rate"), Value::F64(1.0)),
         ]);
 
         let resp = ipc::call_native(METHOD_DEPLOY, params).await;
@@ -40,9 +40,11 @@ pub async fn run(function: Option<&str>) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(500);
 
     loop {
-        let resp = ipc::call(
-            "get_all_events",
-            serde_json::json!({ "last_seconds": 2 }),
+        let resp = ipc::call_native(
+            METHOD_GET_EVENTS,
+            Value::Map(vec![
+                (msgpack_str("last_seconds"), Value::Integer(2.into())),
+            ]),
         )
         .await?;
 

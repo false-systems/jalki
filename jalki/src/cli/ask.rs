@@ -1,8 +1,7 @@
 use anyhow::Result;
 use rmpv::Value;
-use serde_json::json;
 
-use jalki::ipc::{self, vs, METHOD_DEPLOY};
+use jalki::ipc::{self, msgpack_str, METHOD_ASK, METHOD_DEPLOY};
 use jalki::knowledge::KnowledgeBase;
 
 /// `jalki ask "why is postgres slow"`
@@ -48,8 +47,8 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
     let mut deployed = Vec::new();
     for probe in &selected {
         let params = Value::Map(vec![
-            (vs("function"), vs(&probe.function)),
-            (vs("sample_rate"), Value::F64(1.0)),
+            (msgpack_str("function"), msgpack_str(&probe.function)),
+            (msgpack_str("sample_rate"), Value::F64(1.0)),
         ]);
         let resp = ipc::call_native(METHOD_DEPLOY, params).await;
 
@@ -80,20 +79,19 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
         return print_kb_answer(question, &selected, &kb);
     }
 
-    // 3. Collect events.
+    // 3. Use server-side ask for collection + interpretation.
     eprintln!("Collecting events for {}s...", collect_seconds);
-    tokio::time::sleep(std::time::Duration::from_secs(collect_seconds)).await;
 
-    // 4. Retrieve and interpret events.
-    let resp = ipc::call(
-        "get_all_events",
-        json!({ "last_seconds": collect_seconds + 1 }),
-    )
-    .await?;
+    let ask_params = Value::Map(vec![
+        (msgpack_str("question"), msgpack_str(question)),
+        (msgpack_str("collect_seconds"), Value::Integer(collect_seconds.into())),
+        (msgpack_str("max_events"), Value::Integer(100.into())),
+    ]);
+    let resp = ipc::call_native(METHOD_ASK, ask_params).await?;
 
     if !resp.ok {
         eprintln!(
-            "Failed to get events: {}",
+            "Failed: {}",
             resp.error.unwrap_or_default()
         );
         return Ok(());

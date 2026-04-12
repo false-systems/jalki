@@ -9,7 +9,7 @@ pub async fn run() -> Result<()> {
 
     match resp {
         Ok(r) if r.ok => {
-            let probes = r.as_array().cloned().unwrap_or_default();
+            let probes = r.as_array().map(|s| s.to_vec()).unwrap_or_default();
 
             if probes.is_empty() {
                 println!("No probes attached.");
