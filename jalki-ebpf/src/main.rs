@@ -55,6 +55,40 @@ pub fn is_self_filtered() -> bool {
     unsafe { PID_FILTER.get(&pid).is_some() }
 }
 
+/// Read network namespace inode from a sock pointer.
+///
+/// Chain: sk.__sk_common.skc_net (offset 48) → struct net *
+///        net->ns (offset 152) → struct ns_common
+///        ns_common.inum (offset 24) → u32
+///
+/// Offsets verified via BTF on kernel 6.19.9 (Fedora 43).
+#[inline(always)]
+pub fn read_netns(sk: u64) -> u32 {
+    // Read skc_net pointer.
+    let net_ptr: u64 = match unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(
+            (sk as *const u8).add(48) as *const u64,
+        )
+    } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    if net_ptr == 0 {
+        return 0;
+    }
+
+    // Read ns.inum: net + 152 (ns offset) + 24 (inum offset) = net + 176.
+    match unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel(
+            (net_ptr as *const u8).add(176) as *const u32,
+        )
+    } {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

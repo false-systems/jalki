@@ -53,9 +53,7 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     let src_port: u16 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }.map_err(|e| e as i64)?;
 
-    // Network namespace inode: sk.__sk_common.skc_net (pointer to net) → ns.inum
-    // For v0.1, set to 0 — proper netns reading requires BTF-aware offset walking.
-    let netns: u32 = 0;
+    let netns: u32 = crate::read_netns(sk);
 
     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
 

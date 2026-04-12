@@ -45,20 +45,26 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     let src_port: u16 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }.map_err(|e| e as i64)?;
 
-    // v0.1: bytes_sent/received require reading tcp_sock fields whose offsets
-    // vary across kernel versions. Proper implementation needs BTF-based CO-RE
-    // field access (aya doesn't support this for struct fields yet) or a
-    // runtime offset lookup via pahole/BTF. Emitting 0 is honest — don't
-    // pretend to have data we can't reliably read.
-    let bytes_sent: u64 = 0;
-    let bytes_received: u64 = 0;
+    // Read bytes_sent/received from tcp_sock.
+    // struct sock *sk can be cast to struct tcp_sock * — tcp_sock embeds sock.
+    // Offsets verified via BTF on kernel 6.19.9 (Fedora 43):
+    //   tcp_sock.bytes_sent:    offset 1608
+    //   tcp_sock.bytes_received: offset 1808
+    // These offsets WILL differ on other kernel versions.
+    // TODO: pass offsets via BPF map populated at load time from BTF.
+    let bytes_sent: u64 =
+        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1608) as *const u64) }
+            .unwrap_or(0);
+    let bytes_received: u64 =
+        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1808) as *const u64) }
+            .unwrap_or(0);
 
     // v0.1: duration requires stashing the connection start timestamp in a
     // BPF hashmap keyed by socket pointer at fentry/tcp_connect, then reading
     // it here at fexit/tcp_close. Not implemented yet.
     let duration_ns: u64 = 0;
 
-    let netns: u32 = 0;
+    let netns: u32 = crate::read_netns(sk);
 
     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
 
