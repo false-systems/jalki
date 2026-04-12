@@ -302,7 +302,7 @@ cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
 
 ## Known limitations
 
-- **dst_ip 0.0.0.0 on Cilium-proxied connections** — connections rewritten by Cilium transparent proxy (or other eBPF-based CNIs) may show `dst_ip: 0.0.0.0`. The kernel's `skc_daddr` is 0 at fexit because the CNI has intercepted the connection before the socket's destination field is populated. The real destination is stored in CNI-specific metadata that jälki doesn't read. Affects Chrome, curl, and any process whose connections are transparently proxied.
+- **dst_ip 0.0.0.0 on Cilium-managed connections** — `skc_daddr` reads 0 when Cilium drops the packet before destination resolution (policy denial), when the conntrack table has no entry for the connection, or during loopback SNAT where the address is temporarily 0.0.0.0. Not fixable from jälki — requires Cilium debug monitor logs (`cilium monitor --type drop`) to diagnose the specific cause.
 - **src_port 0 on tcp_close events** — the kernel clears `skc_num` before `tcp_close` returns, so fexit sees 0. This is correct kernel behavior. Use the `tcp_connect` event's `src_port` and correlate by 4-tuple to get the full picture.
 - **IPv4 only** — IPv6 in v0.2.
 - **bytes_sent/bytes_received emit 0** — requires `tcp_sock` offset walking not yet implemented.
