@@ -5,6 +5,7 @@ members = [
     "jalki",
     "jalki-codegen",
     "jalki-mcp",
+    "jalki-sdk-meta",
     "xtask",
 ]
 

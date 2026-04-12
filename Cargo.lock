@@ -762,6 +762,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jalki-sdk-meta"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.94"
 source = "registry+https://github.com/rust-lang/crates.io-index"
