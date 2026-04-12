@@ -304,10 +304,8 @@ Every probe emits a FALSE Protocol Occurrence. The schema:
 - **Struct offsets** — `__sk_common` offsets are verified on kernel 6.x via pahole. Other kernels may differ. Always check with `pahole -C tcp_sock /sys/kernel/btf/vmlinux` before assuming offsets.
 - **dst_ip 0.0.0.0 on Cilium-proxied connections** — `skc_daddr` is 0 at fexit for connections rewritten by Cilium transparent proxy or other eBPF-based CNIs. The real destination lives in CNI-specific metadata. Not fixable without reading CNI state.
 - **src_port 0 on tcp_close** — kernel clears `skc_num` before `tcp_close` returns, so fexit reads 0. Use `tcp_connect` event's src_port and correlate by 4-tuple.
-- **IPv4 only** — IPv6 in v0.2
-- **bytes_sent/bytes_received** — emit 0 in v0.1, requires `tcp_sock` offset validation
-- **gRPC emitter** — stub in v0.1, returns error on emit. Use stdout or file.
-- **Runtime attach only** — pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb) can be attached at runtime via IPC. Custom probes still require restart.
+- **tcp_sock offsets hardcoded** — bytes_sent (1608) and bytes_received (1808) offsets verified on kernel 6.19.9. Other kernels may differ. TODO: pass via BPF map from BTF.
+- **Runtime codegen** — any kernel function in BTF can be probed via codegen. Pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb) use the fast path.
 - **Self-filter** — jälki's own PID is always excluded. This is correct behavior, not a bug.
 
 ## What jälki Is Not
