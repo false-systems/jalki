@@ -53,6 +53,7 @@ tonic = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 hostname = "0.4"
+rmpv = "1"
 
 # Internal
 jalki-common = { path = "jalki-common", features = ["userspace"] }

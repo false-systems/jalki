@@ -34,3 +34,4 @@ chrono = { workspace = true }
 ulid = { workspace = true }
 hostname = { workspace = true }
 bytes = "1"
+rmpv = { workspace = true }

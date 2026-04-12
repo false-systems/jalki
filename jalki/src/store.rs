@@ -102,6 +102,32 @@ impl EventStore {
         results
     }
 
+    /// Query events newer than last_seen_id (by ULID lexicographic ordering).
+    /// ULIDs are sortable by time, so string comparison gives chronological order.
+    pub fn query_since(
+        &self,
+        probe_name: &str,
+        last_seen_id: Option<&str>,
+        filter: &EventFilter,
+    ) -> Vec<Occurrence> {
+        let buffers = self.buffers.read().unwrap();
+        let buffer = match buffers.get(probe_name) {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+
+        let filtered = buffer.iter().filter(|occ| {
+            if let Some(last) = last_seen_id {
+                if occ.id.to_string().as_str() <= last {
+                    return false;
+                }
+            }
+            true
+        });
+
+        filter_events(filtered, filter)
+    }
+
     /// List probe names that have events.
     pub fn probe_names(&self) -> Vec<String> {
         let buffers = self.buffers.read().unwrap();
