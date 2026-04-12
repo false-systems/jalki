@@ -37,6 +37,7 @@ pub const METHOD_SUBSCRIBE: u8 = 0x03;
 pub const METHOD_UNSUBSCRIBE: u8 = 0x04;
 pub const METHOD_STATUS: u8 = 0x05;
 pub const METHOD_ASK: u8 = 0x06;
+pub const METHOD_GET_EVENTS: u8 = 0x07;
 
 // --- Frame encoding/decoding ---
 
@@ -230,6 +231,7 @@ impl ConnectionHandler {
             METHOD_UNSUBSCRIBE => self.handle_unsubscribe(&params).await,
             METHOD_STATUS => self.handle_status().await,
             METHOD_ASK => self.handle_ask(&params).await,
+            METHOD_GET_EVENTS => self.handle_get_events(&params).await,
             other => Err(format!("unknown method: 0x{other:02x}")),
         };
         encode_response(request_id, result)
@@ -249,21 +251,21 @@ impl ConnectionHandler {
                     .filter(|f| f.important)
                     .map(|f| {
                         Value::Map(vec![
-                            (vs("name"), vs(&f.name)),
-                            (vs("meaning"), vs(&f.meaning)),
-                            (vs("important"), Value::Boolean(true)),
+                            (msgpack_str("name"), msgpack_str(&f.name)),
+                            (msgpack_str("meaning"), msgpack_str(&f.meaning)),
+                            (msgpack_str("important"), Value::Boolean(true)),
                         ])
                     })
                     .collect();
 
                 Value::Map(vec![
-                    (vs("function"), vs(&probe.function)),
-                    (vs("attachment"), vs(&probe.attachment)),
-                    (vs("event_type"), vs(&probe.event_type)),
-                    (vs("why"), vs(&probe.use_when)),
-                    (vs("fields"), Value::Array(fields)),
-                    (vs("combine_with"), Value::Array(
-                        probe.combine_with.iter().map(|s| vs(s)).collect(),
+                    (msgpack_str("function"), msgpack_str(&probe.function)),
+                    (msgpack_str("attachment"), msgpack_str(&probe.attachment)),
+                    (msgpack_str("event_type"), msgpack_str(&probe.event_type)),
+                    (msgpack_str("why"), msgpack_str(&probe.use_when)),
+                    (msgpack_str("fields"), Value::Array(fields)),
+                    (msgpack_str("combine_with"), Value::Array(
+                        probe.combine_with.iter().map(|s| msgpack_str(s)).collect(),
                     )),
                 ])
             })
@@ -287,9 +289,9 @@ impl ConnectionHandler {
             .map_err(|e| e.to_string())?;
 
         Ok(Value::Map(vec![
-            (vs("probe_id"), vs(&probe_id)),
-            (vs("function"), vs(&function)),
-            (vs("status"), vs("attached")),
+            (msgpack_str("probe_id"), msgpack_str(&probe_id)),
+            (msgpack_str("function"), msgpack_str(&function)),
+            (msgpack_str("status"), msgpack_str("attached")),
         ]))
     }
 
@@ -314,7 +316,7 @@ impl ConnectionHandler {
         let response = encode_response(
             request_id,
             Ok(Value::Map(vec![
-                (vs("stream_id"), vs(&stream_id)),
+                (msgpack_str("stream_id"), msgpack_str(&stream_id)),
             ])),
         );
 
@@ -325,7 +327,7 @@ impl ConnectionHandler {
 
         let task = tokio::spawn(async move {
             // Send STREAM_START.
-            let start_arr = Value::Array(vec![vs(&probe_id_clone)]);
+            let start_arr = Value::Array(vec![msgpack_str(&probe_id_clone)]);
             let start_frame = encode_frame(MSG_STREAM_START, 0, &encode_msgpack(&start_arr));
             if tx.send(start_frame).await.is_err() {
                 return;
@@ -384,7 +386,7 @@ impl ConnectionHandler {
         let end_frame = encode_frame(MSG_STREAM_END, 0, &encode_msgpack(&Value::Array(vec![])));
         let _ = self.tx.send(end_frame).await;
 
-        Ok(Value::Map(vec![(vs("ok"), Value::Boolean(true))]))
+        Ok(Value::Map(vec![(msgpack_str("ok"), Value::Boolean(true))]))
     }
 
     async fn handle_status(&self) -> Result<Value, String> {
@@ -393,12 +395,12 @@ impl ConnectionHandler {
             .iter()
             .map(|s| {
                 Value::Map(vec![
-                    (vs("probe_id"), vs(&s.probe_id)),
-                    (vs("function"), vs(&s.function)),
-                    (vs("events_total"), Value::Integer(s.events_total.into())),
-                    (vs("ring_buffer_drops"), Value::Integer(s.ring_buffer_drops.into())),
-                    (vs("sample_rate"), Value::F64(s.sample_rate)),
-                    (vs("attached_since"), vs(&s.attached_since.to_rfc3339())),
+                    (msgpack_str("probe_id"), msgpack_str(&s.probe_id)),
+                    (msgpack_str("function"), msgpack_str(&s.function)),
+                    (msgpack_str("events_total"), Value::Integer(s.events_total.into())),
+                    (msgpack_str("ring_buffer_drops"), Value::Integer(s.ring_buffer_drops.into())),
+                    (msgpack_str("sample_rate"), Value::F64(s.sample_rate)),
+                    (msgpack_str("attached_since"), msgpack_str(&s.attached_since.to_rfc3339())),
                 ])
             })
             .collect();
@@ -506,15 +508,37 @@ impl ConnectionHandler {
             false,
         ))
     }
+
+    async fn handle_get_events(&self, params: &Value) -> Result<Value, String> {
+        let probe_id = get_str(params, "probe_id");
+        let filter = parse_event_filter(params);
+
+        let events = if let Some(ref pid) = probe_id {
+            self.handle.store.query(pid, &filter)
+        } else {
+            self.handle.store.query_all(&filter)
+        };
+
+        let compact: Vec<Value> = events
+            .iter()
+            .map(|e| encode_compact_event(e, &self.handle.kb))
+            .collect();
+
+        Ok(Value::Map(vec![
+            (msgpack_str("events"), Value::Array(compact)),
+            (msgpack_str("total"), Value::Integer(events.len().into())),
+        ]))
+    }
 }
 
 // --- Encoding helpers ---
 
-fn vs(s: &str) -> Value {
+/// Create a msgpack string value.
+pub fn msgpack_str(s: &str) -> Value {
     Value::String(s.into())
 }
 
-fn get_str(v: &Value, key: &str) -> Option<String> {
+pub fn get_str(v: &Value, key: &str) -> Option<String> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -528,7 +552,7 @@ fn get_str(v: &Value, key: &str) -> Option<String> {
     }
 }
 
-fn get_u64(v: &Value, key: &str) -> Option<u64> {
+pub fn get_u64(v: &Value, key: &str) -> Option<u64> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -542,7 +566,7 @@ fn get_u64(v: &Value, key: &str) -> Option<u64> {
     }
 }
 
-fn get_f64(v: &Value, key: &str) -> Option<f64> {
+pub fn get_f64(v: &Value, key: &str) -> Option<f64> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -556,7 +580,7 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
     }
 }
 
-fn get_bool(v: &Value, key: &str) -> Option<bool> {
+pub fn get_bool(v: &Value, key: &str) -> Option<bool> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -633,7 +657,7 @@ fn encode_stream_event(
         Value::Map(
             occ.labels
                 .iter()
-                .map(|(k, v)| (vs(k), vs(v)))
+                .map(|(k, v)| (msgpack_str(k), msgpack_str(v)))
                 .collect(),
         )
     };
@@ -642,23 +666,23 @@ fn encode_stream_event(
         let function = occ.source.strip_prefix("jalki/").unwrap_or(&occ.source);
         let fields = extract_event_fields(occ);
         kb.explain(function, &fields).first().map(|i| {
-            Value::Array(vec![vs(&i.conclusion), vs(&i.action)])
+            Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)])
         })
     } else {
         None
     };
 
     let arr = Value::Array(vec![
-        vs(&occ.id.to_string()),
+        msgpack_str(&occ.id.to_string()),
         Value::Integer(probe_idx.into()),
         Value::Integer(ts_ns.into()),
         Value::Integer(severity.into()),
         Value::Integer(outcome.into()),
-        net_src.map(|s| vs(&s)).unwrap_or(Value::Nil),
-        net_dst.map(|s| vs(&s)).unwrap_or(Value::Nil),
+        net_src.map(|s| msgpack_str(&s)).unwrap_or(Value::Nil),
+        net_dst.map(|s| msgpack_str(&s)).unwrap_or(Value::Nil),
         proto.map(|p| Value::Integer(p.into())).unwrap_or(Value::Nil),
         pid.map(|p| Value::Integer(p.into())).unwrap_or(Value::Nil),
-        cmd.map(|c| vs(&c)).unwrap_or(Value::Nil),
+        cmd.map(|c| msgpack_str(&c)).unwrap_or(Value::Nil),
         labels,
         interp.unwrap_or(Value::Nil),
     ]);
@@ -688,22 +712,22 @@ fn encode_compact_event(
 
     let fields = extract_event_fields(occ);
     let interp = kb.explain(probe, &fields).first().map(|i| {
-        Value::Array(vec![vs(&i.conclusion), vs(&i.action)])
+        Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)])
     });
 
     Value::Array(vec![
-        vs(&occ.id.to_string()),
+        msgpack_str(&occ.id.to_string()),
         Value::Integer(0.into()),
         Value::Integer(ts_ns.into()),
         Value::Integer(severity.into()),
         Value::Integer(outcome.into()),
         occ.network_data
             .as_ref()
-            .map(|n| vs(&format!("{}:{}", n.src_ip, n.src_port)))
+            .map(|n| msgpack_str(&format!("{}:{}", n.src_ip, n.src_port)))
             .unwrap_or(Value::Nil),
         occ.network_data
             .as_ref()
-            .map(|n| vs(&format!("{}:{}", n.dst_ip, n.dst_port)))
+            .map(|n| msgpack_str(&format!("{}:{}", n.dst_ip, n.dst_port)))
             .unwrap_or(Value::Nil),
         occ.network_data
             .as_ref()
@@ -715,12 +739,12 @@ fn encode_compact_event(
             .unwrap_or(Value::Nil),
         occ.process_data
             .as_ref()
-            .map(|p| vs(&p.command))
+            .map(|p| msgpack_str(&p.command))
             .unwrap_or(Value::Nil),
         if occ.labels.is_empty() {
             Value::Nil
         } else {
-            Value::Map(occ.labels.iter().map(|(k, v)| (vs(k), vs(v))).collect())
+            Value::Map(occ.labels.iter().map(|(k, v)| (msgpack_str(k), msgpack_str(v))).collect())
         },
         interp.unwrap_or(Value::Nil),
     ])
@@ -735,12 +759,12 @@ fn encode_ask_result(
     kb_only: bool,
 ) -> Value {
     Value::Map(vec![
-        (vs("interpretation"), vs(interpretation)),
-        (vs("severity"), Value::Integer(severity.into())),
-        (vs("action"), vs(action)),
-        (vs("events"), Value::Array(events)),
-        (vs("probes_used"), Value::Array(probes_used.iter().map(|s| vs(s)).collect())),
-        (vs("kb_only"), Value::Boolean(kb_only)),
+        (msgpack_str("interpretation"), msgpack_str(interpretation)),
+        (msgpack_str("severity"), Value::Integer(severity.into())),
+        (msgpack_str("action"), msgpack_str(action)),
+        (msgpack_str("events"), Value::Array(events)),
+        (msgpack_str("probes_used"), Value::Array(probes_used.iter().map(|s| msgpack_str(s)).collect())),
+        (msgpack_str("kb_only"), Value::Boolean(kb_only)),
     ])
 }
 
@@ -794,54 +818,63 @@ pub async fn connect() -> Result<UnixStream> {
         ))
 }
 
-/// IPC response (matches old interface for CLI/MCP compatibility).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// IPC response — carries native msgpack values, no JSON conversion.
+#[derive(Debug)]
 pub struct Response {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
     pub error: Option<String>,
 }
 
 impl Response {
-    fn success(result: serde_json::Value) -> Self {
+    fn success(result: Value) -> Self {
         Self { ok: true, result: Some(result), error: None }
     }
 
     fn err(msg: impl Into<String>) -> Self {
         Self { ok: false, result: None, error: Some(msg.into()) }
     }
+
+    /// Get a string field from the result map.
+    pub fn get_str(&self, key: &str) -> Option<String> {
+        self.result.as_ref().and_then(|v| get_str(v, key))
+    }
+
+    /// Get a u64 field from the result map.
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.result.as_ref().and_then(|v| get_u64(v, key))
+    }
+
+    /// Get a f64 field from the result map.
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.result.as_ref().and_then(|v| get_f64(v, key))
+    }
+
+    /// Get the result as an array slice.
+    pub fn as_array(&self) -> Option<&[Value]> {
+        self.result.as_ref().and_then(|v| v.as_array()).map(|v| v.as_slice())
+    }
+
+    /// Convert result to JSON (for MCP compatibility layer).
+    pub fn to_json(&self) -> serde_json::Value {
+        match &self.result {
+            Some(v) => msgpack_to_json(v),
+            None => serde_json::Value::Null,
+        }
+    }
 }
 
-/// Send a request to the daemon and receive the response.
-/// Maps method name → method u8, converts JSON ↔ MessagePack on the wire.
-pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
+/// Send a request to the daemon using the binary frame protocol.
+/// Params are native msgpack — no JSON conversion.
+pub async fn call_native(method: u8, params: Value) -> Result<Response> {
     let stream = connect().await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let method_u8 = match method {
-        "find_probe" | "find" => METHOD_FIND,
-        "deploy_probe" | "deploy" => METHOD_DEPLOY,
-        "subscribe" => METHOD_SUBSCRIBE,
-        "unsubscribe" => METHOD_UNSUBSCRIBE,
-        "probe_status" | "status" => METHOD_STATUS,
-        "ask" => METHOD_ASK,
-        // Legacy method names from old ndjson protocol.
-        "get_events" => METHOD_SUBSCRIBE, // best effort
-        "get_all_events" => METHOD_STATUS, // best effort
-        "explain_event" => METHOD_FIND,    // best effort
-        _ => return Ok(Response::err(format!("unknown method: {method}"))),
-    };
-
-    // Convert JSON params → msgpack Value.
-    let params_msgpack = json_to_msgpack(&params);
-
     let request = Value::Array(vec![
-        Value::Integer(1u32.into()), // request_id
-        Value::Integer(method_u8.into()),
-        params_msgpack,
+        Value::Integer(1u32.into()),
+        Value::Integer(method.into()),
+        params,
     ]);
     let payload = encode_msgpack(&request);
     let frame = encode_frame(MSG_REQUEST, 0, &payload);
@@ -849,7 +882,6 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
     write_half.write_all(&frame).await?;
     write_half.flush().await?;
 
-    // Read response.
     let (msg_type, _flags, resp_payload) = read_frame(&mut reader).await?;
 
     if msg_type != MSG_RESPONSE {
@@ -858,13 +890,11 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
 
     let resp_value = decode_msgpack(&resp_payload)?;
 
-    // Parse [request_id, ok, result_or_error]
     if let Value::Array(ref arr) = resp_value {
         if arr.len() >= 3 {
             let ok = arr[1].as_bool().unwrap_or(false);
             if ok {
-                let json_result = msgpack_to_json(&arr[2]);
-                return Ok(Response::success(json_result));
+                return Ok(Response::success(arr[2].clone()));
             } else {
                 let err_msg = arr[2].as_str().unwrap_or("unknown error").to_string();
                 return Ok(Response::err(err_msg));
@@ -873,6 +903,22 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
     }
 
     Ok(Response::err("malformed response"))
+}
+
+/// Convenience: call with method name string and JSON params.
+/// Converts JSON → msgpack for the wire. Used by MCP which still works in JSON.
+pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
+    let method_u8 = match method {
+        "find_probe" | "find" => METHOD_FIND,
+        "deploy_probe" | "deploy" => METHOD_DEPLOY,
+        "subscribe" => METHOD_SUBSCRIBE,
+        "unsubscribe" => METHOD_UNSUBSCRIBE,
+        "probe_status" | "status" => METHOD_STATUS,
+        "ask" => METHOD_ASK,
+        "get_events" | "get_all_events" => METHOD_GET_EVENTS,
+        _ => return Ok(Response::err(format!("unknown method: {method}"))),
+    };
+    call_native(method_u8, json_to_msgpack(&params)).await
 }
 
 // --- JSON ↔ MessagePack conversion ---
@@ -892,14 +938,14 @@ fn json_to_msgpack(v: &serde_json::Value) -> Value {
                 Value::Nil
             }
         }
-        serde_json::Value::String(s) => vs(s),
+        serde_json::Value::String(s) => msgpack_str(s),
         serde_json::Value::Array(arr) => {
             Value::Array(arr.iter().map(json_to_msgpack).collect())
         }
         serde_json::Value::Object(map) => {
             Value::Map(
                 map.iter()
-                    .map(|(k, v)| (vs(k), json_to_msgpack(v)))
+                    .map(|(k, v)| (msgpack_str(k), json_to_msgpack(v)))
                     .collect(),
             )
         }

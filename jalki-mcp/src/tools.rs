@@ -312,7 +312,7 @@ impl JalkiState {
         .map_err(|e| format!("daemon connection failed: {e}"))?;
 
         if resp.ok {
-            Ok(resp.result.unwrap_or(json!(null)))
+            Ok(resp.to_json())
         } else {
             Err(resp.error.unwrap_or_else(|| "unknown error".into()))
         }
@@ -325,7 +325,7 @@ impl JalkiState {
             .map_err(|e| format!("daemon connection failed: {e}"))?;
 
         if resp.ok {
-            Ok(resp.result.unwrap_or(json!(null)))
+            Ok(resp.to_json())
         } else {
             Err(resp.error.unwrap_or_else(|| "unknown error".into()))
         }
@@ -338,7 +338,7 @@ impl JalkiState {
             .map_err(|e| format!("daemon connection failed: {e}"))?;
 
         if resp.ok {
-            Ok(resp.result.unwrap_or(json!(null)))
+            Ok(resp.to_json())
         } else {
             Err(resp.error.unwrap_or_else(|| "unknown error".into()))
         }
@@ -379,8 +379,7 @@ impl JalkiState {
         .map_err(|e| format!("daemon connection failed: {e}"))?;
 
         if resp.ok {
-            // Augment with descriptor metadata.
-            let mut result = resp.result.unwrap_or(json!({}));
+            let mut result = resp.to_json();
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("attachment".into(), json!(attachment));
                 obj.insert(

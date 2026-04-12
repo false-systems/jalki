@@ -1,11 +1,9 @@
 use anyhow::Result;
-use serde_json::json;
+use rmpv::Value;
 
-use jalki::ipc;
+use jalki::ipc::{self, msgpack_str, METHOD_DEPLOY, METHOD_GET_EVENTS};
 
 /// `jalki watch tcp_connect --seconds 10 --dst-port 5432`
-///
-/// Deploy a probe, collect events for N seconds, print results.
 pub async fn run(
     function: &str,
     seconds: u64,
@@ -13,22 +11,16 @@ pub async fn run(
     dst_ip: Option<String>,
     pid: Option<u32>,
 ) -> Result<()> {
-    // Deploy probe via daemon.
-    let resp = ipc::call(
-        "deploy_probe",
-        json!({ "function": function, "sample_rate": 1.0 }),
-    )
-    .await;
+    let params = Value::Map(vec![
+        (msgpack_str("function"), msgpack_str(function)),
+        (msgpack_str("sample_rate"), Value::F64(1.0)),
+    ]);
 
-    let probe_id = match resp {
+    let resp = ipc::call_native(METHOD_DEPLOY, params).await;
+
+    let _probe_id = match resp {
         Ok(r) if r.ok => {
-            let id = r
-                .result
-                .as_ref()
-                .and_then(|v| v.get("probe_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(function)
-                .to_string();
+            let id = r.get_str("probe_id").unwrap_or_else(|| function.into());
             eprintln!("Attached {} → {}", function, id);
             id
         }
@@ -53,38 +45,32 @@ pub async fn run(
     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
 
     // Build filter.
-    let mut filter = json!({});
+    let mut filter_pairs = vec![];
     if let Some(p) = dst_port {
-        filter["dst_port"] = json!(p);
+        filter_pairs.push((msgpack_str("dst_port"), Value::Integer(p.into())));
     }
     if let Some(ref ip) = dst_ip {
-        filter["dst_ip"] = json!(ip);
+        filter_pairs.push((msgpack_str("dst_ip"), msgpack_str(ip)));
     }
     if let Some(p) = pid {
-        filter["pid"] = json!(p);
+        filter_pairs.push((msgpack_str("pid"), Value::Integer(p.into())));
     }
 
-    let resp = ipc::call(
-        "get_events",
-        json!({
-            "probe_id": probe_id,
-            "last_seconds": seconds + 1,
-            "filter": filter,
-        }),
+    let events_resp = ipc::call_native(
+        METHOD_GET_EVENTS,
+        Value::Map(vec![
+            (msgpack_str("last_seconds"), Value::Integer((seconds + 1).into())),
+            (msgpack_str("filter"), Value::Map(filter_pairs)),
+        ]),
     )
     .await?;
 
-    if !resp.ok {
-        anyhow::bail!("get_events failed: {}", resp.error.unwrap_or_default());
+    if !events_resp.ok {
+        anyhow::bail!("get_events failed: {}", events_resp.error.unwrap_or_default());
     }
 
-    let events = resp
-        .result
-        .as_ref()
-        .and_then(|v| v.get("events"))
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let json = events_resp.to_json();
+    let events = json.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
     eprintln!("{} events collected.", events.len());
     println!();

@@ -1,7 +1,7 @@
 use anyhow::Result;
-use serde_json::json;
+use rmpv::Value;
 
-use jalki::ipc;
+use jalki::ipc::{self, msgpack_str, METHOD_ASK, METHOD_DEPLOY};
 use jalki::knowledge::KnowledgeBase;
 
 /// `jalki ask "why is postgres slow"`
@@ -46,22 +46,17 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
 
     let mut deployed = Vec::new();
     for probe in &selected {
-        let resp = ipc::call(
-            "deploy_probe",
-            json!({ "function": probe.function, "sample_rate": 1.0 }),
-        )
-        .await;
+        let params = Value::Map(vec![
+            (msgpack_str("function"), msgpack_str(&probe.function)),
+            (msgpack_str("sample_rate"), Value::F64(1.0)),
+        ]);
+        let resp = ipc::call_native(METHOD_DEPLOY, params).await;
 
         match resp {
             Ok(r) if r.ok => {
-                let probe_id = r
-                    .result
-                    .as_ref()
-                    .and_then(|v| v.get("probe_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let probe_id = r.get_str("probe_id").unwrap_or_else(|| "unknown".into());
                 eprintln!("  attached {} → {}", probe.function, probe_id);
-                deployed.push((probe.function.clone(), probe_id.to_string()));
+                deployed.push((probe.function.clone(), probe_id));
             }
             Ok(r) => {
                 let err = r.error.unwrap_or_default();
@@ -84,29 +79,27 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
         return print_kb_answer(question, &selected, &kb);
     }
 
-    // 3. Collect events.
+    // 3. Use server-side ask for collection + interpretation.
     eprintln!("Collecting events for {}s...", collect_seconds);
-    tokio::time::sleep(std::time::Duration::from_secs(collect_seconds)).await;
 
-    // 4. Retrieve and interpret events.
-    let resp = ipc::call(
-        "get_all_events",
-        json!({ "last_seconds": collect_seconds + 1 }),
-    )
-    .await?;
+    let ask_params = Value::Map(vec![
+        (msgpack_str("question"), msgpack_str(question)),
+        (msgpack_str("collect_seconds"), Value::Integer(collect_seconds.into())),
+        (msgpack_str("max_events"), Value::Integer(100.into())),
+    ]);
+    let resp = ipc::call_native(METHOD_ASK, ask_params).await?;
 
     if !resp.ok {
         eprintln!(
-            "Failed to get events: {}",
+            "Failed: {}",
             resp.error.unwrap_or_default()
         );
         return Ok(());
     }
 
-    let events = resp
-        .result
-        .as_ref()
-        .and_then(|v| v.get("events"))
+    let json_result = resp.to_json();
+    let events = json_result
+        .get("events")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();

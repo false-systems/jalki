@@ -1,23 +1,15 @@
 use anyhow::Result;
-use serde_json::json;
+use rmpv::Value;
 
-use jalki::ipc;
+use jalki::ipc::{self, METHOD_STATUS};
 
 /// `jalki status`
-///
-/// Show status of all attached probes on the running daemon.
 pub async fn run() -> Result<()> {
-    let resp = ipc::call("probe_status", json!({})).await;
+    let resp = ipc::call_native(METHOD_STATUS, Value::Map(vec![])).await;
 
     match resp {
         Ok(r) if r.ok => {
-            let probes = r
-                .result
-                .as_ref()
-                .and_then(|v| v.get("probes"))
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let probes = r.as_array().map(|s| s.to_vec()).unwrap_or_default();
 
             if probes.is_empty() {
                 println!("No probes attached.");
@@ -31,21 +23,16 @@ pub async fn run() -> Result<()> {
             for p in &probes {
                 println!(
                     "{:<12} {:<24} {:<10} {:<10} {:<8}",
-                    p.get("probe_id").and_then(|v| v.as_str()).unwrap_or("-"),
-                    p.get("function").and_then(|v| v.as_str()).unwrap_or("-"),
-                    p.get("events_total").and_then(|v| v.as_u64()).unwrap_or(0),
-                    p.get("ring_buffer_drops")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    p.get("sample_rate").and_then(|v| v.as_f64()).unwrap_or(1.0),
+                    ipc::get_str(p, "probe_id").unwrap_or_else(|| "-".into()),
+                    ipc::get_str(p, "function").unwrap_or_else(|| "-".into()),
+                    ipc::get_u64(p, "events_total").unwrap_or(0),
+                    ipc::get_u64(p, "ring_buffer_drops").unwrap_or(0),
+                    ipc::get_f64(p, "sample_rate").unwrap_or(1.0),
                 );
             }
         }
         Ok(r) => {
-            eprintln!(
-                "Error: {}",
-                r.error.unwrap_or_else(|| "unknown".into())
-            );
+            eprintln!("Error: {}", r.error.unwrap_or_else(|| "unknown".into()));
         }
         Err(e) => {
             eprintln!(
