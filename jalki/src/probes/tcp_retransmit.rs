@@ -1,8 +1,7 @@
-use std::net::Ipv4Addr;
-
 use false_protocol::{NetworkEventData, Occurrence, Outcome, ProcessEventData, Severity};
 use jalki_common::TcpRetransmitEvent;
 
+use crate::addr::format_addr;
 use crate::probe::{Attachment, Probe, ProbeError};
 
 pub struct TcpRetransmit {
@@ -48,8 +47,8 @@ impl Probe for TcpRetransmit {
         let event: &TcpRetransmitEvent =
             unsafe { &*(raw.as_ptr() as *const TcpRetransmitEvent) };
 
-        let src_ip = Ipv4Addr::from(u32::from_be(event.src_addr));
-        let dst_ip = Ipv4Addr::from(u32::from_be(event.dst_addr));
+        let src_ip = format_addr(&event.src_addr, event.addr_family);
+        let dst_ip = format_addr(&event.dst_addr, event.addr_family);
         let src_port = event.src_port;
         let dst_port = u16::from_be(event.dst_port);
         let comm = event.comm_str().to_string();
@@ -66,8 +65,8 @@ impl Probe for TcpRetransmit {
 
         occ.network_data = Some(NetworkEventData {
             protocol: "tcp".into(),
-            src_ip: src_ip.to_string(),
-            dst_ip: dst_ip.to_string(),
+            src_ip: src_ip.clone(),
+            dst_ip: dst_ip.clone(),
             src_port,
             dst_port,
             direction: "egress".into(),
@@ -128,16 +127,22 @@ mod tests {
         src_port: u16, dst_port: u16,
         state: u8, comm: &str,
     ) -> Vec<u8> {
+        let mut src_addr = [0u8; 16];
+        src_addr[..4].copy_from_slice(&src);
+        let mut dst_addr = [0u8; 16];
+        dst_addr[..4].copy_from_slice(&dst);
+
         let mut event = TcpRetransmitEvent {
             timestamp_ns: 3_000_000_000,
             pid: 9999,
             tid: 9999,
-            src_addr: u32::from_ne_bytes(src),
-            dst_addr: u32::from_ne_bytes(dst),
+            src_addr,
+            dst_addr,
             src_port,
             dst_port: dst_port.to_be(),
+            addr_family: 2,
             state,
-            _pad1: [0; 3],
+            _pad1: 0,
             comm: [0u8; 16],
             netns: 0,
             _pad2: 0,

@@ -30,16 +30,11 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     // arg0: struct sock *sk
     let sk: u64 = unsafe { ctx.arg(0) };
 
-    // Read 4-tuple from __sk_common.
-    // offset 0: skc_daddr, offset 4: skc_rcv_saddr
-    //
-    // Known issue: skc_num (src_port, offset 14) is cleared by the kernel
-    // before tcp_close returns, so fexit always reads 0. This is correct
-    // kernel behavior. Use tcp_connect event's src_port to correlate.
-    let dst_addr: u32 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(0) as *const u32) }.map_err(|e| e as i64)?;
-    let src_addr: u32 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(4) as *const u32) }.map_err(|e| e as i64)?;
+    // Read address family + src/dst addresses (IPv4 or IPv6).
+    let (addr_family, src_addr, dst_addr) = crate::read_addrs(sk);
+
+    // Ports: skc_dport at offset 12, skc_num at offset 14.
+    // Known issue: skc_num is cleared before tcp_close fexit fires.
     let dst_port: u16 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }.map_err(|e| e as i64)?;
     let src_port: u16 =
@@ -76,12 +71,14 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         dst_addr,
         src_port,
         dst_port,
+        addr_family,
+        _pad1: 0,
         bytes_sent,
         bytes_received,
         duration_ns,
         comm,
         netns,
-        _pad: 0,
+        _pad2: 0,
     };
 
     let _ = TCP_CLOSE_EVENTS.output(&event, 0);

@@ -55,6 +55,62 @@ pub fn is_self_filtered() -> bool {
     unsafe { PID_FILTER.get(&pid).is_some() }
 }
 
+/// Read address family and src/dst addresses from a sock pointer.
+///
+/// For AF_INET (2): reads skc_daddr (4 bytes at offset 0) and skc_rcv_saddr (offset 4).
+///   Stored in first 4 bytes of the 16-byte output, rest zeroed.
+/// For AF_INET6 (10): reads skc_v6_daddr (16 bytes at offset 56) and skc_v6_rcv_saddr (offset 72).
+///
+/// Returns (addr_family, src_addr, dst_addr).
+#[inline(always)]
+pub fn read_addrs(sk: u64) -> (u16, [u8; 16], [u8; 16]) {
+    let family: u16 = unsafe {
+        aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(16) as *const u16)
+    }
+    .unwrap_or(2); // default to AF_INET
+
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+
+    if family == 10 {
+        // AF_INET6: read 16-byte addresses.
+        // skc_v6_daddr at offset 56, skc_v6_rcv_saddr at offset 72.
+        if let Ok(v) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(
+                (sk as *const u8).add(56) as *const [u8; 16],
+            )
+        } {
+            dst = v;
+        }
+        if let Ok(v) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(
+                (sk as *const u8).add(72) as *const [u8; 16],
+            )
+        } {
+            src = v;
+        }
+    } else {
+        // AF_INET: read 4-byte addresses into first 4 bytes.
+        // skc_daddr at offset 0, skc_rcv_saddr at offset 4.
+        if let Ok(v) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(
+                (sk as *const u8).add(0) as *const [u8; 4],
+            )
+        } {
+            dst[..4].copy_from_slice(&v);
+        }
+        if let Ok(v) = unsafe {
+            aya_ebpf::helpers::bpf_probe_read_kernel(
+                (sk as *const u8).add(4) as *const [u8; 4],
+            )
+        } {
+            src[..4].copy_from_slice(&v);
+        }
+    }
+
+    (family, src, dst)
+}
+
 /// Read network namespace inode from a sock pointer.
 ///
 /// Chain: sk.__sk_common.skc_net (offset 48) → struct net *
