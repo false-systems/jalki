@@ -1,20 +1,27 @@
+/// Address family constants.
+pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
+
 /// Event emitted by the tcp_connect fexit probe.
 ///
 /// Captures a TCP connection attempt: 4-tuple, return code, process info.
+/// Supports both IPv4 and IPv6 — check `addr_family` to distinguish.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TcpConnectEvent {
     pub timestamp_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub src_addr: u32,
-    pub dst_addr: u32,
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
     pub src_port: u16,
     pub dst_port: u16,
+    pub addr_family: u16,
+    pub _pad1: u16,
     pub ret: i32,
     pub comm: [u8; 16],
     pub netns: u32,
-    pub _pad: u32,
+    pub _pad2: u32,
 }
 
 /// Event emitted by the tcp_close fexit probe.
@@ -26,16 +33,18 @@ pub struct TcpCloseEvent {
     pub timestamp_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub src_addr: u32,
-    pub dst_addr: u32,
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
     pub src_port: u16,
     pub dst_port: u16,
+    pub addr_family: u16,
+    pub _pad1: u16,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub duration_ns: u64,
     pub comm: [u8; 16],
     pub netns: u32,
-    pub _pad: u32,
+    pub _pad2: u32,
 }
 
 /// Event emitted by the tcp_retransmit_skb fentry probe.
@@ -47,12 +56,13 @@ pub struct TcpRetransmitEvent {
     pub timestamp_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub src_addr: u32,
-    pub dst_addr: u32,
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
     pub src_port: u16,
     pub dst_port: u16,
+    pub addr_family: u16,
     pub state: u8,
-    pub _pad1: [u8; 3],
+    pub _pad1: u8,
     pub comm: [u8; 16],
     pub netns: u32,
     pub _pad2: u32,
@@ -106,17 +116,20 @@ mod tests {
     #[test]
     fn tcp_connect_event_size() {
         // Must be stable for BPF ring buffer reads.
-        assert_eq!(mem::size_of::<TcpConnectEvent>(), 56);
+        // v0.2: 88 bytes (was 56 — added 16-byte addrs + addr_family).
+        assert_eq!(mem::size_of::<TcpConnectEvent>(), 88);
     }
 
     #[test]
     fn tcp_close_event_size() {
-        assert_eq!(mem::size_of::<TcpCloseEvent>(), 80);
+        // v0.2: 104 bytes (was 80 — added 16-byte addrs + addr_family).
+        assert_eq!(mem::size_of::<TcpCloseEvent>(), 104);
     }
 
     #[test]
     fn tcp_retransmit_event_size() {
-        assert_eq!(mem::size_of::<TcpRetransmitEvent>(), 56);
+        // v0.2: 80 bytes (was 56 — added 16-byte addrs + addr_family).
+        assert_eq!(mem::size_of::<TcpRetransmitEvent>(), 80);
     }
 
     #[test]

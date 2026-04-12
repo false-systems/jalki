@@ -1,10 +1,9 @@
-use std::net::Ipv4Addr;
-
 use false_protocol::{
     NetworkEventData, Occurrence, OccurrenceError, Outcome, ProcessEventData, Severity,
 };
 use jalki_common::TcpConnectEvent;
 
+use crate::addr::format_addr;
 use crate::probe::{Attachment, Probe, ProbeError};
 
 pub struct TcpConnect {
@@ -49,8 +48,8 @@ impl Probe for TcpConnect {
 
         let event: &TcpConnectEvent = unsafe { &*(raw.as_ptr() as *const TcpConnectEvent) };
 
-        let src_ip = Ipv4Addr::from(u32::from_be(event.src_addr));
-        let dst_ip = Ipv4Addr::from(u32::from_be(event.dst_addr));
+        let src_ip = format_addr(&event.src_addr, event.addr_family);
+        let dst_ip = format_addr(&event.dst_addr, event.addr_family);
         let src_port = event.src_port;
         let dst_port = u16::from_be(event.dst_port);
         let comm = event.comm_str().to_string();
@@ -80,8 +79,8 @@ impl Probe for TcpConnect {
 
         occ.network_data = Some(NetworkEventData {
             protocol: "tcp".into(),
-            src_ip: src_ip.to_string(),
-            dst_ip: dst_ip.to_string(),
+            src_ip: src_ip.clone(),
+            dst_ip: dst_ip.clone(),
             src_port,
             dst_port,
             direction: "egress".into(),
@@ -148,23 +147,26 @@ mod tests {
     use false_protocol::Severity;
 
     /// Build a raw event as the kernel would produce it.
-    /// IP addresses in __be32: bytes [10, 0, 0, 1] in memory → u32 on LE = 0x0100000A.
     fn make_event(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16, ret: i32, comm: &str) -> Vec<u8> {
+        let mut src_addr = [0u8; 16];
+        src_addr[..4].copy_from_slice(&src);
+        let mut dst_addr = [0u8; 16];
+        dst_addr[..4].copy_from_slice(&dst);
+
         let mut event = TcpConnectEvent {
             timestamp_ns: 1_000_000_000,
             pid: 1234,
             tid: 1234,
-            // __be32 in kernel — bytes in memory are the IP octets, which on
-            // little-endian gets read as from_ne_bytes.
-            src_addr: u32::from_ne_bytes(src),
-            dst_addr: u32::from_ne_bytes(dst),
+            src_addr,
+            dst_addr,
             src_port,
-            // Kernel stores dst_port in network byte order.
             dst_port: dst_port.to_be(),
+            addr_family: 2, // AF_INET
+            _pad1: 0,
             ret,
             comm: [0u8; 16],
             netns: 0,
-            _pad: 0,
+            _pad2: 0,
         };
         let comm_bytes = comm.as_bytes();
         let len = comm_bytes.len().min(16);

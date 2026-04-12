@@ -32,22 +32,10 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     // arg1: return value (fexit provides ret after all params)
     let ret: i32 = unsafe { ctx.arg(1) };
 
-    // Read sock fields via bpf_probe_read_kernel.
-    // struct sock starts with __sk_common:
-    //   offset 0: skc_daddr (__be32) — destination address
-    //   offset 4: skc_rcv_saddr (__be32) — source address
-    //   offset 12: skc_dport (__be16) — destination port (network order)
-    //   offset 14: skc_num (__u16) — source port (host order)
-    //   offset 18: skc_state (u8) — TCP state
-    // Verified via pahole on kernel 6.19.9.
-    //
-    // Known issue: skc_daddr reads 0 for connections rewritten by Cilium
-    // transparent proxy or other eBPF-based CNIs. The real destination is
-    // stored in CNI-specific metadata, not in __sk_common.
-    let dst_addr: u32 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(0) as *const u32) }.map_err(|e| e as i64)?;
-    let src_addr: u32 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(4) as *const u32) }.map_err(|e| e as i64)?;
+    // Read address family + src/dst addresses (IPv4 or IPv6).
+    let (addr_family, src_addr, dst_addr) = crate::read_addrs(sk);
+
+    // Ports: skc_dport at offset 12, skc_num at offset 14.
     let dst_port: u16 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }.map_err(|e| e as i64)?;
     let src_port: u16 =
@@ -65,10 +53,12 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         dst_addr,
         src_port,
         dst_port,
+        addr_family,
+        _pad1: 0,
         ret,
         comm,
         netns,
-        _pad: 0,
+        _pad2: 0,
     };
 
     // Best-effort ring buffer output — drop silently if full.
