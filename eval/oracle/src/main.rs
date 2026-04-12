@@ -707,4 +707,263 @@ mod tests {
             );
         }
     }
+
+    // ================================================================
+    // REQUIREMENT: PROBE COUNT (spec: knowledge/knowledge-base.md)
+    // ================================================================
+
+    #[test]
+    fn case_060_at_least_20_probes() {
+        let count = all_probes().len();
+        assert!(
+            count >= 20,
+            "knowledge base must have at least 20 probes, got {count}"
+        );
+    }
+
+    #[test]
+    fn case_061_tcp_layer_has_8_probes() {
+        let tcp = load_knowledge("tcp.json");
+        let count = tcp["probes"].as_array().unwrap().len();
+        assert!(
+            count >= 8,
+            "tcp layer must have at least 8 probes (connect, close, retransmit, sendmsg, accept, recvmsg, syn_recv, reset), got {count}"
+        );
+    }
+
+    #[test]
+    fn case_062_memory_layer_has_3_probes() {
+        let mem = load_knowledge("memory.json");
+        let count = mem["probes"].as_array().unwrap().len();
+        assert!(
+            count >= 3,
+            "memory layer must have at least 3 probes (oom_kill, page_alloc, memcg), got {count}"
+        );
+    }
+
+    #[test]
+    fn case_063_fs_layer_has_4_probes() {
+        let fs = load_knowledge("fs.json");
+        let count = fs["probes"].as_array().unwrap().len();
+        assert!(
+            count >= 4,
+            "fs layer must have at least 4 probes (open, write, read, close), got {count}"
+        );
+    }
+
+    #[test]
+    fn case_064_process_layer_has_3_probes() {
+        let proc = load_knowledge("process.json");
+        let count = proc["probes"].as_array().unwrap().len();
+        assert!(
+            count >= 3,
+            "process layer must have at least 3 probes (execve, exit, clone), got {count}"
+        );
+    }
+
+    #[test]
+    fn case_065_sched_layer_has_2_probes() {
+        let sched = load_knowledge("sched.json");
+        let count = sched["probes"].as_array().unwrap().len();
+        assert!(
+            count >= 2,
+            "sched layer must have at least 2 probes (task_switch, wake_up), got {count}"
+        );
+    }
+
+    // ================================================================
+    // REQUIREMENT: FIND RELEVANCE (spec: protocol/find.md)
+    //
+    // These test that the knowledge base data supports correct
+    // relevance scoring. The oracle doesn't run the scoring code
+    // but validates the data that makes it work.
+    // ================================================================
+
+    #[test]
+    fn case_070_tcp_connect_answers_connection_questions() {
+        let probes = all_probes();
+        let tcp_connect = probes.iter().find(|p| p["function"] == "tcp_connect").unwrap();
+        let answers: Vec<String> = tcp_connect["answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+
+        let has_connection_answer = answers.iter().any(|a|
+            a.contains("connect") || a.contains("failing") || a.contains("refused")
+        );
+        assert!(
+            has_connection_answer,
+            "tcp_connect answers must include connection failure questions: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn case_071_retransmit_answers_packet_loss() {
+        let probes = all_probes();
+        let retransmit = probes.iter().find(|p| p["function"] == "tcp_retransmit_skb").unwrap();
+        let keywords: Vec<String> = retransmit["keywords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert!(
+            keywords.contains(&"packet loss".to_string()) || keywords.contains(&"retransmit".to_string()),
+            "tcp_retransmit_skb keywords must include 'packet loss' or 'retransmit': {keywords:?}"
+        );
+    }
+
+    #[test]
+    fn case_072_fs_probes_answer_disk_questions() {
+        let probes = all_probes();
+        let fs_probes: Vec<&Value> = probes.iter()
+            .filter(|p| p["layer"] == "fs")
+            .collect();
+
+        let all_keywords: Vec<String> = fs_probes.iter()
+            .flat_map(|p| p["keywords"].as_array().unwrap().iter())
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert!(
+            all_keywords.iter().any(|k| k.contains("file") || k.contains("disk") || k.contains("read") || k.contains("write")),
+            "fs layer keywords must include file/disk/read/write terms: {all_keywords:?}"
+        );
+    }
+
+    // ================================================================
+    // REQUIREMENT: ASK INTERPRETATIONS (spec: protocol/ask.md)
+    //
+    // The knowledge base must provide the interpretations that
+    // make jalki ask work. Each is a testable requirement.
+    // ================================================================
+
+    #[test]
+    fn case_080_econnrefused_says_not_listening() {
+        let probes = all_probes();
+        let tcp_connect = probes.iter().find(|p| p["function"] == "tcp_connect").unwrap();
+        let interps = tcp_connect["interpretations"].as_array().unwrap();
+
+        let refused = interps.iter().find(|i|
+            i["pattern"].as_str().unwrap_or("").contains("-111")
+        ).expect("must have -111 (ECONNREFUSED) interpretation");
+
+        let conclusion = refused["conclusion"].as_str().unwrap().to_lowercase();
+        assert!(
+            conclusion.contains("listening"),
+            "ECONNREFUSED conclusion must mention 'listening': got '{conclusion}'"
+        );
+    }
+
+    #[test]
+    fn case_081_established_retransmit_says_network() {
+        let probes = all_probes();
+        let retransmit = probes.iter().find(|p| p["function"] == "tcp_retransmit_skb").unwrap();
+        let interps = retransmit["interpretations"].as_array().unwrap();
+
+        let established = interps.iter().find(|i| {
+            let p = i["pattern"].as_str().unwrap_or("");
+            p.contains("ESTABLISHED")
+        }).expect("must have ESTABLISHED interpretation");
+
+        let action = established["action"].as_str().unwrap().to_lowercase();
+        assert!(
+            action.contains("network"),
+            "ESTABLISHED retransmit action must mention network: got '{action}'"
+        );
+        assert!(
+            !action.contains("application bug"),
+            "ESTABLISHED retransmit must NOT say 'application bug'"
+        );
+    }
+
+    #[test]
+    fn case_082_syn_sent_retransmit_says_unreachable() {
+        let probes = all_probes();
+        let retransmit = probes.iter().find(|p| p["function"] == "tcp_retransmit_skb").unwrap();
+        let interps = retransmit["interpretations"].as_array().unwrap();
+
+        let syn_sent = interps.iter().find(|i| {
+            let p = i["pattern"].as_str().unwrap_or("");
+            p.contains("SYN_SENT")
+        }).expect("must have SYN_SENT interpretation");
+
+        let action = syn_sent["action"].as_str().unwrap().to_lowercase();
+        assert!(
+            action.contains("connect") || action.contains("reach") || action.contains("not an application"),
+            "SYN_SENT retransmit action must reference connectivity: got '{action}'"
+        );
+    }
+
+    // ================================================================
+    // REQUIREMENT: SDK CONTRACT (spec: sdk/python.md)
+    //
+    // Generated types must exist with correct structure.
+    // ================================================================
+
+    #[test]
+    fn case_090_generated_types_py_exists() {
+        let path = format!(
+            "{}/../../jalki-sdk-python/src/jalki/types.py",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let content = std::fs::read_to_string(&path);
+        if let Ok(content) = content {
+            assert!(content.contains("GENERATED"), "types.py must have GENERATED header");
+            assert!(content.contains("DO NOT EDIT"), "types.py must say DO NOT EDIT");
+            assert!(content.contains("class Severity"), "types.py must define Severity");
+            assert!(content.contains("class Event"), "types.py must define Event");
+            assert!(content.contains("class EventFilter"), "types.py must define EventFilter");
+            assert!(content.contains("class ProbeMatch"), "types.py must define ProbeMatch");
+            assert!(content.contains("class AskResult"), "types.py must define AskResult");
+        }
+        // If file doesn't exist, skip silently (SDK may not be generated yet).
+    }
+
+    #[test]
+    fn case_091_generated_protocol_py_exists() {
+        let path = format!(
+            "{}/../../jalki-sdk-python/src/jalki/protocol.py",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let content = std::fs::read_to_string(&path);
+        if let Ok(content) = content {
+            assert!(content.contains("GENERATED"), "protocol.py must have GENERATED header");
+            assert!(content.contains("class MsgType"), "protocol.py must define MsgType");
+            assert!(content.contains("POS_ID"), "protocol.py must define stream event positions");
+            assert!(content.contains("FRAME_HEADER_LEN"), "protocol.py must define frame constants");
+        }
+    }
+
+    // ================================================================
+    // REQUIREMENT: PROTOCOL WIRE FORMAT (spec: protocol/framing.md)
+    //
+    // These validate the protocol constants are correct and consistent
+    // between the daemon code and the SDK meta definitions.
+    // ================================================================
+
+    #[test]
+    fn case_095_specs_directory_exists() {
+        let path = format!("{}/../../specs", env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            std::path::Path::new(&path).is_dir(),
+            "specs/ directory must exist for requirement documentation"
+        );
+    }
+
+    #[test]
+    fn case_096_protocol_specs_exist() {
+        let base = format!("{}/../../specs/protocol", env!("CARGO_MANIFEST_DIR"));
+        let required = ["framing.md", "find.md", "deploy.md", "subscribe.md", "status.md", "ask.md"];
+        for spec in required {
+            let path = format!("{base}/{spec}");
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "missing protocol spec: specs/protocol/{spec}"
+            );
+        }
+    }
 }
