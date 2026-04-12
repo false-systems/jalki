@@ -245,6 +245,39 @@ helm install jalki helm/jalki/ --set cluster=prod-east-1 --set emit=stdout
 
 ---
 
+## Testing
+
+jälki uses requirement-based testing. Specs define what must be true. The oracle validates it.
+
+```
+specs/                          ← requirements (natural language markdown)
+  protocol/find.md                "find must return tcp_connect for connection questions"
+  protocol/ask.md                 "ESTABLISHED retransmit must say network problem"
+  knowledge/knowledge-base.md     "at least 20 probes across 5 layers"
+       │
+       │  each requirement maps to an oracle test case
+       ▼
+eval/oracle/                    ← standalone Rust binary, reads JSON from disk
+  case_014_retransmit_established_says_network_problem
+  case_080_econnrefused_says_not_listening
+  case_060_at_least_20_probes
+```
+
+The oracle never imports jälki code. It reads knowledge base JSON and generated SDK files, then asserts they match the spec. When a case fails, fix the system — not the test.
+
+```bash
+# Run all 50 oracle cases
+cargo test --manifest-path eval/oracle/Cargo.toml
+
+# Run workspace tests (probes, codegen, store, SDK meta)
+cargo test --workspace
+
+# Python SDK conformance (no daemon needed)
+cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
+```
+
+---
+
 ## Known limitations
 
 - **dst_ip 0.0.0.0 on Cilium-proxied connections** — connections rewritten by Cilium transparent proxy (or other eBPF-based CNIs) may show `dst_ip: 0.0.0.0`. The kernel's `skc_daddr` is 0 at fexit because the CNI has intercepted the connection before the socket's destination field is populated. The real destination is stored in CNI-specific metadata that jälki doesn't read. Affects Chrome, curl, and any process whose connections are transparently proxied.

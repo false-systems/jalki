@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jalki"
+version = "0.1.0"
+description = "jälki SDK — ask the kernel questions"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jalki"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../knowledge" = "jalki/knowledge"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "daemon: requires a running jälki daemon",
+]
