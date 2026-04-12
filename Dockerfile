@@ -15,16 +15,22 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY jalki-common/Cargo.toml jalki-common/Cargo.toml
 COPY jalki/Cargo.toml jalki/Cargo.toml
+COPY jalki-codegen/Cargo.toml jalki-codegen/Cargo.toml
 COPY jalki-mcp/Cargo.toml jalki-mcp/Cargo.toml
+COPY jalki-sdk-meta/Cargo.toml jalki-sdk-meta/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 COPY jalki-ebpf/Cargo.toml jalki-ebpf/Cargo.toml
 
 # Stub out sources for dependency pre-build.
-RUN mkdir -p jalki-common/src jalki/src jalki-mcp/src xtask/src jalki-ebpf/src \
+RUN mkdir -p jalki-common/src jalki/src jalki-codegen/src jalki-mcp/src \
+    jalki-sdk-meta/src xtask/src jalki-ebpf/src \
     && echo '#![no_std]' > jalki-common/src/lib.rs \
     && echo 'fn main() {}' > jalki/src/main.rs \
     && touch jalki/src/lib.rs \
+    && touch jalki-codegen/src/lib.rs \
     && echo 'fn main() {}' > jalki-mcp/src/main.rs \
+    && echo 'fn main() {}' > jalki-sdk-meta/src/main.rs \
+    && touch jalki-sdk-meta/src/lib.rs \
     && echo 'fn main() {}' > xtask/src/main.rs \
     && echo '#![no_std] #![no_main]' > jalki-ebpf/src/main.rs
 
@@ -32,19 +38,21 @@ RUN mkdir -p jalki-common/src jalki/src jalki-mcp/src xtask/src jalki-ebpf/src \
 COPY . .
 
 # Touch sources to invalidate stubs.
-RUN find jalki-common/src jalki/src jalki-mcp/src xtask/src jalki-ebpf/src -name '*.rs' -exec touch {} +
+RUN find jalki-common/src jalki/src jalki-codegen/src jalki-mcp/src \
+    jalki-sdk-meta/src xtask/src jalki-ebpf/src -name '*.rs' -exec touch {} +
 
 # Build eBPF programs.
 RUN cargo run -p xtask -- build-ebpf --release
 
 # Build userspace binaries.
-RUN cargo build --release -p jalki -p jalki-mcp
+RUN cargo build --release -p jalki -p jalki-mcp -p jalki-sdk-meta
 
 # Stage 2: Minimal runtime image
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /build/target/release/jalki /usr/local/bin/jalki
 COPY --from=builder /build/target/release/jalki-mcp /usr/local/bin/jalki-mcp
+COPY --from=builder /build/target/release/jalki-sdk-codegen /usr/local/bin/jalki-sdk-codegen
 COPY --from=builder /build/jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf /usr/local/share/jalki/jalki-ebpf
 
 # eBPF requires running as root with capabilities. The "nonroot" base is
