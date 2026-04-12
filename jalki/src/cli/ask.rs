@@ -1,7 +1,8 @@
 use anyhow::Result;
+use rmpv::Value;
 use serde_json::json;
 
-use jalki::ipc;
+use jalki::ipc::{self, vs, METHOD_DEPLOY};
 use jalki::knowledge::KnowledgeBase;
 
 /// `jalki ask "why is postgres slow"`
@@ -46,22 +47,17 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
 
     let mut deployed = Vec::new();
     for probe in &selected {
-        let resp = ipc::call(
-            "deploy_probe",
-            json!({ "function": probe.function, "sample_rate": 1.0 }),
-        )
-        .await;
+        let params = Value::Map(vec![
+            (vs("function"), vs(&probe.function)),
+            (vs("sample_rate"), Value::F64(1.0)),
+        ]);
+        let resp = ipc::call_native(METHOD_DEPLOY, params).await;
 
         match resp {
             Ok(r) if r.ok => {
-                let probe_id = r
-                    .result
-                    .as_ref()
-                    .and_then(|v| v.get("probe_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let probe_id = r.get_str("probe_id").unwrap_or_else(|| "unknown".into());
                 eprintln!("  attached {} → {}", probe.function, probe_id);
-                deployed.push((probe.function.clone(), probe_id.to_string()));
+                deployed.push((probe.function.clone(), probe_id));
             }
             Ok(r) => {
                 let err = r.error.unwrap_or_default();
@@ -103,10 +99,9 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
         return Ok(());
     }
 
-    let events = resp
-        .result
-        .as_ref()
-        .and_then(|v| v.get("events"))
+    let json_result = resp.to_json();
+    let events = json_result
+        .get("events")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();

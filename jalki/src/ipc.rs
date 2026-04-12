@@ -510,11 +510,12 @@ impl ConnectionHandler {
 
 // --- Encoding helpers ---
 
-fn vs(s: &str) -> Value {
+/// Create a msgpack string value. Public for CLI/MCP callers.
+pub fn vs(s: &str) -> Value {
     Value::String(s.into())
 }
 
-fn get_str(v: &Value, key: &str) -> Option<String> {
+pub fn get_str(v: &Value, key: &str) -> Option<String> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -528,7 +529,7 @@ fn get_str(v: &Value, key: &str) -> Option<String> {
     }
 }
 
-fn get_u64(v: &Value, key: &str) -> Option<u64> {
+pub fn get_u64(v: &Value, key: &str) -> Option<u64> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -542,7 +543,7 @@ fn get_u64(v: &Value, key: &str) -> Option<u64> {
     }
 }
 
-fn get_f64(v: &Value, key: &str) -> Option<f64> {
+pub fn get_f64(v: &Value, key: &str) -> Option<f64> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -556,7 +557,7 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
     }
 }
 
-fn get_bool(v: &Value, key: &str) -> Option<bool> {
+pub fn get_bool(v: &Value, key: &str) -> Option<bool> {
     match v {
         Value::Map(pairs) => {
             for (k, val) in pairs {
@@ -794,54 +795,63 @@ pub async fn connect() -> Result<UnixStream> {
         ))
 }
 
-/// IPC response (matches old interface for CLI/MCP compatibility).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// IPC response — carries native msgpack values, no JSON conversion.
+#[derive(Debug)]
 pub struct Response {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
     pub error: Option<String>,
 }
 
 impl Response {
-    fn success(result: serde_json::Value) -> Self {
+    fn success(result: Value) -> Self {
         Self { ok: true, result: Some(result), error: None }
     }
 
     fn err(msg: impl Into<String>) -> Self {
         Self { ok: false, result: None, error: Some(msg.into()) }
     }
+
+    /// Get a string field from the result map.
+    pub fn get_str(&self, key: &str) -> Option<String> {
+        self.result.as_ref().and_then(|v| get_str(v, key))
+    }
+
+    /// Get a u64 field from the result map.
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.result.as_ref().and_then(|v| get_u64(v, key))
+    }
+
+    /// Get a f64 field from the result map.
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.result.as_ref().and_then(|v| get_f64(v, key))
+    }
+
+    /// Get the result as an array of maps.
+    pub fn as_array(&self) -> Option<&Vec<Value>> {
+        self.result.as_ref().and_then(|v| v.as_array())
+    }
+
+    /// Convert result to JSON (for MCP compatibility layer).
+    pub fn to_json(&self) -> serde_json::Value {
+        match &self.result {
+            Some(v) => msgpack_to_json(v),
+            None => serde_json::Value::Null,
+        }
+    }
 }
 
-/// Send a request to the daemon and receive the response.
-/// Maps method name → method u8, converts JSON ↔ MessagePack on the wire.
-pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
+/// Send a request to the daemon using the binary frame protocol.
+/// Params are native msgpack — no JSON conversion.
+pub async fn call_native(method: u8, params: Value) -> Result<Response> {
     let stream = connect().await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let method_u8 = match method {
-        "find_probe" | "find" => METHOD_FIND,
-        "deploy_probe" | "deploy" => METHOD_DEPLOY,
-        "subscribe" => METHOD_SUBSCRIBE,
-        "unsubscribe" => METHOD_UNSUBSCRIBE,
-        "probe_status" | "status" => METHOD_STATUS,
-        "ask" => METHOD_ASK,
-        // Legacy method names from old ndjson protocol.
-        "get_events" => METHOD_SUBSCRIBE, // best effort
-        "get_all_events" => METHOD_STATUS, // best effort
-        "explain_event" => METHOD_FIND,    // best effort
-        _ => return Ok(Response::err(format!("unknown method: {method}"))),
-    };
-
-    // Convert JSON params → msgpack Value.
-    let params_msgpack = json_to_msgpack(&params);
-
     let request = Value::Array(vec![
-        Value::Integer(1u32.into()), // request_id
-        Value::Integer(method_u8.into()),
-        params_msgpack,
+        Value::Integer(1u32.into()),
+        Value::Integer(method.into()),
+        params,
     ]);
     let payload = encode_msgpack(&request);
     let frame = encode_frame(MSG_REQUEST, 0, &payload);
@@ -849,7 +859,6 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
     write_half.write_all(&frame).await?;
     write_half.flush().await?;
 
-    // Read response.
     let (msg_type, _flags, resp_payload) = read_frame(&mut reader).await?;
 
     if msg_type != MSG_RESPONSE {
@@ -858,13 +867,11 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
 
     let resp_value = decode_msgpack(&resp_payload)?;
 
-    // Parse [request_id, ok, result_or_error]
     if let Value::Array(ref arr) = resp_value {
         if arr.len() >= 3 {
             let ok = arr[1].as_bool().unwrap_or(false);
             if ok {
-                let json_result = msgpack_to_json(&arr[2]);
-                return Ok(Response::success(json_result));
+                return Ok(Response::success(arr[2].clone()));
             } else {
                 let err_msg = arr[2].as_str().unwrap_or("unknown error").to_string();
                 return Ok(Response::err(err_msg));
@@ -873,6 +880,24 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
     }
 
     Ok(Response::err("malformed response"))
+}
+
+/// Convenience: call with method name string and JSON params.
+/// Converts JSON → msgpack for the wire. Used by MCP which still works in JSON.
+pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
+    let method_u8 = match method {
+        "find_probe" | "find" => METHOD_FIND,
+        "deploy_probe" | "deploy" => METHOD_DEPLOY,
+        "subscribe" => METHOD_SUBSCRIBE,
+        "unsubscribe" => METHOD_UNSUBSCRIBE,
+        "probe_status" | "status" => METHOD_STATUS,
+        "ask" => METHOD_ASK,
+        "get_events" => METHOD_SUBSCRIBE,
+        "get_all_events" => METHOD_STATUS,
+        "explain_event" => METHOD_FIND,
+        _ => return Ok(Response::err(format!("unknown method: {method}"))),
+    };
+    call_native(method_u8, json_to_msgpack(&params)).await
 }
 
 // --- JSON ↔ MessagePack conversion ---
