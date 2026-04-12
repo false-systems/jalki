@@ -21,8 +21,13 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
         return Ok(());
     }
 
-    // Take up to 3 most relevant probes.
-    let selected: Vec<&_> = matches.into_iter().take(3).collect();
+    // Take up to 3 most relevant probes, deduplicated by function name.
+    let mut seen = std::collections::HashSet::new();
+    let selected: Vec<&_> = matches
+        .into_iter()
+        .filter(|p| seen.insert(p.function.clone()))
+        .take(3)
+        .collect();
 
     eprintln!("Probes selected:");
     for p in &selected {

@@ -79,7 +79,12 @@ async def deploy(
     if filter is not None:
         params["filter"] = filter
 
-    result = await c.call(Method.DEPLOY, params)
+    try:
+        result = await c.call(Method.DEPLOY, params)
+    except RuntimeError as e:
+        if "already attached" in str(e):
+            return ProbeHandle(probe_id=function, function=function)
+        raise
     probe_id = result.get("probe_id", function) if isinstance(result, dict) else function
     return ProbeHandle(probe_id=probe_id, function=function)
 
@@ -146,8 +151,9 @@ async def ask(
         except Exception:
             return _kb_only_result(question, matches)
 
-    # 3. Deploy top probes (up to 3).
-    selected = matches[:3]
+    # 3. Deploy top probes (up to 3), deduplicated by function name.
+    seen: set[str] = set()
+    selected = [p for p in matches if p.function not in seen and not seen.add(p.function)][:3]
     handles: list[tuple[ProbeMatch, ProbeHandle]] = []
     for probe in selected:
         try:
