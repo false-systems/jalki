@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 jalki-common = { workspace = true }
+jalki-codegen = { path = "../jalki-codegen" }
 false-protocol = { workspace = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
@@ -32,3 +33,4 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 ulid = { workspace = true }
 hostname = { workspace = true }
+bytes = "1"

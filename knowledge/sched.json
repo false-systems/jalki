@@ -31,6 +31,39 @@
           "action": "check CPU affinity and cgroup CPU limits. consider spreading workloads across cores."
         }
       ]
+    },
+    {
+      "function": "try_to_wake_up",
+      "attachment": "fentry",
+      "event_type": "kernel.sched.wakeup",
+      "layer": "sched",
+      "answers": [
+        "which processes are being woken up",
+        "wakeup latency",
+        "is a process waiting too long to be scheduled"
+      ],
+      "keywords": ["wake", "wakeup", "sleep", "latency", "scheduling", "runqueue"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "PID of the process being woken",  "important": true },
+        { "name": "command", "type": "string", "meaning": "process name being woken",        "important": true }
+      ],
+      "use_when": "you suspect scheduling latency — a process is being woken but taking too long to get CPU time. very high frequency — always use sampling (sample_rate: 0.01).",
+      "not_when": "you need CPU utilization metrics — use /proc/stat or cgroup metrics.",
+      "combine_with": ["finish_task_switch"],
+      "interpretations": [
+        {
+          "pattern": "high wakeup rate for a specific process",
+          "conclusion": "process is frequently sleeping and waking — may be waiting on I/O or locks",
+          "severity": "info",
+          "action": "normal for I/O-bound processes. if latency is high, check what the process is blocking on."
+        },
+        {
+          "pattern": "wakeup events without corresponding task switch",
+          "conclusion": "process was woken but did not get scheduled — runqueue congestion",
+          "severity": "warning",
+          "action": "too many runnable processes for available CPUs. check node CPU pressure and pod scheduling."
+        }
+      ]
     }
   ]
 }

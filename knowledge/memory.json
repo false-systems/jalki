@@ -36,6 +36,74 @@
           "action": "check node memory pressure. too many pods scheduled on this node."
         }
       ]
+    },
+    {
+      "function": "mm_page_alloc",
+      "attachment": "fexit",
+      "event_type": "kernel.memory.page_alloc",
+      "layer": "memory",
+      "answers": [
+        "is memory allocation failing",
+        "page allocation pressure",
+        "which process is allocating the most memory"
+      ],
+      "keywords": ["page", "alloc", "allocation", "memory", "allocation failure"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "process allocating memory",  "important": true },
+        { "name": "command", "type": "string", "meaning": "process name",               "important": true },
+        { "name": "ret",     "type": "i64",   "meaning": "page pointer or 0 (failure)", "important": true }
+      ],
+      "use_when": "you suspect memory allocation failures. very high frequency — always use sampling (sample_rate: 0.01 or lower). ret == 0 means allocation failed.",
+      "not_when": "you need cgroup memory usage — use cgroup metrics. this fires on every page allocation, which is millions per second.",
+      "combine_with": ["oom_kill_process"],
+      "interpretations": [
+        {
+          "pattern": "ret == 0 at any rate",
+          "conclusion": "page allocation failing — system is under severe memory pressure",
+          "severity": "critical",
+          "action": "the kernel cannot allocate memory. this precedes OOM kills. check node memory immediately."
+        },
+        {
+          "pattern": "ret != 0 consistently",
+          "conclusion": "normal allocation — memory is available",
+          "severity": "info",
+          "action": "no action. use for baseline allocation rate per process."
+        }
+      ]
+    },
+    {
+      "function": "try_charge_memcg",
+      "attachment": "fexit",
+      "event_type": "kernel.memory.cgroup_charge",
+      "layer": "memory",
+      "answers": [
+        "is a cgroup hitting its memory limit",
+        "which cgroup is being throttled",
+        "memory limit enforcement"
+      ],
+      "keywords": ["cgroup", "memcg", "limit", "charge", "throttle", "memory limit"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "process being charged",  "important": true },
+        { "name": "command", "type": "string", "meaning": "process name",           "important": true },
+        { "name": "ret",     "type": "i32",   "meaning": "0 success, non-zero = cgroup limit hit", "important": true }
+      ],
+      "use_when": "you need to know when a container's memory limit is being enforced by the kernel. ret != 0 means the cgroup memory charge was rejected.",
+      "not_when": "you need aggregate cgroup memory usage — use cgroup metrics.",
+      "combine_with": ["oom_kill_process"],
+      "interpretations": [
+        {
+          "pattern": "ret != 0 at high rate",
+          "conclusion": "cgroup memory limit is being hit repeatedly — container is at its memory ceiling",
+          "severity": "error",
+          "action": "increase container memory limit or investigate application memory usage."
+        },
+        {
+          "pattern": "ret != 0 followed by oom_kill",
+          "conclusion": "memory charge rejection leading to OOM kill — the cgroup has no reclaim headroom",
+          "severity": "critical",
+          "action": "container memory limit is too low. increase limit or reduce application memory footprint."
+        }
+      ]
     }
   ]
 }

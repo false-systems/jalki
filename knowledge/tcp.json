@@ -254,6 +254,115 @@
           "action": "check server process health. correlate with RAUTA HTTP latency."
         }
       ]
+    },
+    {
+      "function": "tcp_recvmsg",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.recv",
+      "layer": "tcp",
+      "answers": [
+        "how much data is being received per connection",
+        "receive throughput per process",
+        "is a process reading slowly"
+      ],
+      "keywords": ["recv", "receive", "read", "throughput", "bytes", "bandwidth"],
+      "fields": [
+        { "name": "src_ip",   "type": "ipv4",   "meaning": "source IP",                                "important": true },
+        { "name": "dst_ip",   "type": "ipv4",   "meaning": "destination IP",                            "important": true },
+        { "name": "dst_port", "type": "u16",    "meaning": "destination port",                           "important": true },
+        { "name": "pid",      "type": "u32",    "meaning": "process reading from socket",                "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name",                               "important": true },
+        { "name": "ret",      "type": "i32",    "meaning": "bytes received or negative errno",            "important": true }
+      ],
+      "use_when": "you need per-connection, per-process receive throughput. high frequency — use sampling (sample_rate: 0.1) for busy nodes.",
+      "not_when": "you need aggregate bandwidth — use network interface counters for that.",
+      "combine_with": ["tcp_sendmsg", "tcp_connect"],
+      "interpretations": [
+        {
+          "pattern": "ret > 0 consistently",
+          "conclusion": "normal data flow — process is actively reading from the connection",
+          "severity": "info",
+          "action": "no action needed. use for throughput baseline."
+        },
+        {
+          "pattern": "ret == 0 repeatedly",
+          "conclusion": "connection closed by peer — no more data to read",
+          "severity": "info",
+          "action": "normal for short-lived connections. investigate if unexpected for long-lived connections."
+        }
+      ]
+    },
+    {
+      "function": "tcp_v4_syn_recv_sock",
+      "attachment": "fexit",
+      "event_type": "kernel.tcp.syn_recv",
+      "layer": "tcp",
+      "answers": [
+        "is the SYN backlog full",
+        "are incoming connections being dropped at the kernel level",
+        "SYN flood detection"
+      ],
+      "keywords": ["syn", "backlog", "flood", "syn queue", "listen", "dropped connections", "accept queue"],
+      "fields": [
+        { "name": "dst_port", "type": "u16",    "meaning": "listening port",        "important": true },
+        { "name": "pid",      "type": "u32",    "meaning": "listening process PID",  "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name",           "important": true },
+        { "name": "ret",      "type": "i64",    "meaning": "new sock pointer or NULL if backlog full", "important": true }
+      ],
+      "use_when": "you suspect incoming connections are being dropped before reaching the application. ret == NULL means the SYN backlog is full.",
+      "not_when": "the issue is outbound connections — use tcp_connect.",
+      "combine_with": ["inet_csk_accept", "tcp_retransmit_skb"],
+      "interpretations": [
+        {
+          "pattern": "ret == 0 (NULL) at high rate",
+          "conclusion": "SYN backlog is full — kernel is dropping incoming connections before they reach the application",
+          "severity": "critical",
+          "action": "increase net.core.somaxconn and net.ipv4.tcp_max_syn_backlog. check if the application's accept loop is keeping up."
+        },
+        {
+          "pattern": "ret != 0 consistently",
+          "conclusion": "SYN processing is normal — connections are being accepted by the kernel",
+          "severity": "info",
+          "action": "no action needed. if clients still report failures, check tcp_connect on the client side."
+        }
+      ]
+    },
+    {
+      "function": "tcp_reset",
+      "attachment": "fentry",
+      "event_type": "kernel.tcp.reset",
+      "layer": "tcp",
+      "answers": [
+        "which connections are being reset",
+        "RST packets — abnormal connection termination",
+        "why are connections being abruptly closed"
+      ],
+      "keywords": ["reset", "rst", "abort", "connection reset", "abnormal close"],
+      "fields": [
+        { "name": "src_ip",   "type": "ipv4",   "meaning": "source IP",       "important": true },
+        { "name": "dst_ip",   "type": "ipv4",   "meaning": "destination IP",   "important": true },
+        { "name": "src_port", "type": "u16",    "meaning": "source port",      "important": true },
+        { "name": "dst_port", "type": "u16",    "meaning": "destination port",  "important": true },
+        { "name": "pid",      "type": "u32",    "meaning": "process owning the socket", "important": true },
+        { "name": "command",  "type": "string", "meaning": "process name",      "important": true }
+      ],
+      "use_when": "connections are being abnormally terminated. RST means one side decided to abort rather than close gracefully. different from tcp_close which is normal FIN.",
+      "not_when": "you need to distinguish graceful from ungraceful closes — combine with tcp_close.",
+      "combine_with": ["tcp_connect", "tcp_close"],
+      "interpretations": [
+        {
+          "pattern": "RSTs from server to specific client",
+          "conclusion": "server is rejecting connections from this client — application-level rejection or load shedding",
+          "severity": "warning",
+          "action": "check server application logs. may be intentional rate limiting or auth rejection."
+        },
+        {
+          "pattern": "RSTs across many connections to same port",
+          "conclusion": "widespread connection resets — service may be crashing or restarting",
+          "severity": "error",
+          "action": "check service health. correlate with process exit events and container restarts."
+        }
+      ]
     }
   ]
 }

@@ -64,6 +64,40 @@
           "action": "check application logs. correlate with container restart events in TAPIO."
         }
       ]
+    },
+    {
+      "function": "sys_clone",
+      "attachment": "fexit",
+      "event_type": "kernel.process.clone",
+      "layer": "process",
+      "answers": [
+        "which processes are forking",
+        "is fork failing",
+        "process/thread creation rate"
+      ],
+      "keywords": ["fork", "clone", "thread", "spawn", "process creation"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "parent PID",                  "important": true },
+        { "name": "command", "type": "string", "meaning": "parent process name",          "important": true },
+        { "name": "ret",     "type": "i64",   "meaning": "child PID or negative errno",   "important": true }
+      ],
+      "use_when": "you need to track process or thread creation. ret < 0 means fork failed — system may be out of PIDs or memory.",
+      "not_when": "you need to know what the child process does — use do_execve for that.",
+      "combine_with": ["do_execve", "do_exit"],
+      "interpretations": [
+        {
+          "pattern": "ret < 0",
+          "conclusion": "fork/clone failed — system cannot create new processes. may be out of PIDs, memory, or hitting cgroup pids limit",
+          "severity": "error",
+          "action": "check cgroup pids limit, system PID max, and memory. EAGAIN = resource limit, ENOMEM = no memory."
+        },
+        {
+          "pattern": "high clone rate from one process",
+          "conclusion": "process is forking rapidly — possible fork bomb or poorly designed spawning",
+          "severity": "warning",
+          "action": "investigate the process. set cgroup pids limit to prevent fork bombs."
+        }
+      ]
     }
   ]
 }
