@@ -6,8 +6,10 @@ Handles:
 - Frame encoding/decoding (length-prefixed binary)
 - MessagePack serialization
 - Request/response multiplexing
-- Automatic reconnect with exponential backoff
 - Keepalive via PING/PONG
+
+A single client supports at most one active subscription at a time.
+Open multiple client connections for concurrent streams.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
 
 import msgpack
@@ -37,6 +40,15 @@ logger = logging.getLogger("jalki.client")
 SOCKET_PATH = "/run/jalki/jalki.sock"
 
 
+@dataclass
+class _Subscription:
+    """State for a single active subscription on this client."""
+
+    stream_id: str
+    queue: asyncio.Queue[Any]
+    probe_names: list[str] = field(default_factory=list)
+
+
 class JalkiClient:
     """Connection to the jälki daemon over Unix socket."""
 
@@ -46,7 +58,11 @@ class JalkiClient:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._request_id: int = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
-        self._streams: dict[str, asyncio.Queue[Any]] = {}
+        # At most one active subscription per client connection. The daemon
+        # does not tag STREAM_* frames with a stream_id, so multiplexing would
+        # be ambiguous. Callers needing multiple streams should use multiple
+        # client connections.
+        self._active_sub: Optional[_Subscription] = None
         self._connected = False
         self._lock = asyncio.Lock()
         self._reader_task: Optional[asyncio.Task[None]] = None
@@ -87,7 +103,7 @@ class JalkiClient:
             self._request_id += 1
             req_id = self._request_id
 
-        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = future
 
         payload = msgpack.packb([req_id, method.value, params], use_bin_type=True)
@@ -104,12 +120,25 @@ class JalkiClient:
         return result
 
     async def subscribe(self, params: Any) -> AsyncIterator[Any]:
-        """Send subscribe request, yield STREAM_EVENTs until STREAM_END."""
-        result = await self.call(Method.SUBSCRIBE, params)
+        """Send subscribe request, yield STREAM_EVENTs until STREAM_END.
 
-        probe_id = result.get("probe_id", "unknown") if isinstance(result, dict) else "unknown"
+        Only one active subscription is allowed per client. Raises
+        RuntimeError if a subscription is already active.
+        """
+        if self._active_sub is not None:
+            raise RuntimeError(
+                "client already has an active subscription; open a separate "
+                "client connection for concurrent streams"
+            )
+
+        result = await self.call(Method.SUBSCRIBE, params)
+        stream_id = (
+            result.get("stream_id") if isinstance(result, dict) else None
+        ) or "anon"
+
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=4096)
-        self._streams[probe_id] = queue
+        sub = _Subscription(stream_id=stream_id, queue=queue)
+        self._active_sub = sub
 
         try:
             while True:
@@ -118,7 +147,12 @@ class JalkiClient:
                     break
                 yield item
         finally:
-            self._streams.pop(probe_id, None)
+            if self._active_sub is sub:
+                self._active_sub = None
+
+    def active_subscription(self) -> Optional[_Subscription]:
+        """Expose the current subscription (for callers needing probe_names)."""
+        return self._active_sub
 
     async def _fetch_full(self, event_id: str) -> dict[str, Any]:
         """Fetch full FALSE Protocol Occurrence for an event by id."""
@@ -136,6 +170,8 @@ class JalkiClient:
         header = await self._reader.readexactly(4)
         frame_len = struct.unpack(">I", header)[0]
 
+        if frame_len < 2:
+            raise ValueError(f"frame too small: {frame_len} (need at least type+flags)")
         if frame_len > FRAME_MAX_LEN:
             raise ValueError(f"frame too large: {frame_len}")
 
@@ -166,18 +202,31 @@ class JalkiClient:
                                     RuntimeError(f"daemon error: {result}")
                                 )
 
+                elif msg_type == MsgType.STREAM_START:
+                    # payload: [probe_names: [str]]
+                    sub = self._active_sub
+                    if sub is not None and isinstance(payload, list) and payload:
+                        first = payload[0]
+                        if isinstance(first, list):
+                            sub.probe_names = [str(x) for x in first]
+                        else:
+                            sub.probe_names = [str(x) for x in payload]
+
                 elif msg_type == MsgType.STREAM_EVENT:
-                    # Dispatch to all active streams.
-                    for queue in self._streams.values():
+                    sub = self._active_sub
+                    if sub is not None:
                         try:
-                            queue.put_nowait(payload)
+                            sub.queue.put_nowait(payload)
                         except asyncio.QueueFull:
                             logger.warning("stream queue full, dropping event")
+                    else:
+                        logger.debug("STREAM_EVENT with no active subscription")
 
                 elif msg_type == MsgType.STREAM_END:
-                    for queue in self._streams.values():
+                    sub = self._active_sub
+                    if sub is not None:
                         try:
-                            queue.put_nowait(None)
+                            sub.queue.put_nowait(None)
                         except asyncio.QueueFull:
                             pass
 
@@ -196,6 +245,19 @@ class JalkiClient:
         except Exception as e:
             logger.error("reader loop error: %s", e)
             self._connected = False
+        finally:
+            # Fail any pending request/subscription so callers don't hang
+            # waiting for a response that will never arrive.
+            err = ConnectionError("daemon connection closed")
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(err)
+            self._pending.clear()
+            if self._active_sub is not None:
+                try:
+                    self._active_sub.queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
     async def _keepalive_loop(self) -> None:
         """Background task: PING every 30s."""

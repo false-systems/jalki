@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from importlib import resources
 from pathlib import Path
 from typing import Optional
 
@@ -15,30 +16,47 @@ from jalki.types import FieldInfo, ProbeMatch
 
 
 def _load_layers() -> list[dict]:
-    """Load all knowledge base layers from embedded JSON."""
-    # Look for knowledge/ directory relative to the jalki repo root.
-    # In development: ../../knowledge/ from this file.
-    # In installed package: fall back to a bundled copy.
-    # __file__ is jalki-sdk-python/src/jalki/knowledge.py
-    # knowledge/ is at jalki/knowledge/ (4 levels up from __file__)
-    candidates = [
-        Path(__file__).resolve().parent.parent.parent.parent / "knowledge",
-        Path(__file__).parent / "knowledge",
-        Path(os.environ.get("JALKI_KNOWLEDGE_PATH", "")) if os.environ.get("JALKI_KNOWLEDGE_PATH") else None,
-    ]
+    """Load all knowledge base layers from embedded JSON.
 
-    knowledge_dir: Optional[Path] = None
-    for candidate in candidates:
-        if candidate is not None and candidate.is_dir():
-            knowledge_dir = candidate
-            break
+    Order of preference:
+      1. $JALKI_KNOWLEDGE_PATH (explicit override)
+      2. Packaged resource (jalki/knowledge/*.json — included in the wheel)
+      3. Repo-root knowledge/ (development checkout)
+    """
+    # 1. Explicit override.
+    env_path = os.environ.get("JALKI_KNOWLEDGE_PATH")
+    if env_path:
+        layers = _load_from_dir(Path(env_path))
+        if layers:
+            return layers
 
-    if knowledge_dir is None:
+    # 2. Packaged resource — works for `pip install`-ed wheels.
+    try:
+        packaged = resources.files("jalki").joinpath("knowledge")
+        if packaged.is_dir():
+            layers = []
+            for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
+                if entry.name.endswith(".json"):
+                    with entry.open("r", encoding="utf-8") as f:
+                        layers.append(json.load(f))
+            if layers:
+                return layers
+    except (AttributeError, FileNotFoundError, ModuleNotFoundError):
+        pass
+
+    # 3. Repo-root fallback (development checkout).
+    repo_root_knowledge = (
+        Path(__file__).resolve().parent.parent.parent.parent / "knowledge"
+    )
+    return _load_from_dir(repo_root_knowledge)
+
+
+def _load_from_dir(knowledge_dir: Path) -> list[dict]:
+    if not knowledge_dir.is_dir():
         return []
-
     layers = []
     for json_file in sorted(knowledge_dir.glob("*.json")):
-        with open(json_file) as f:
+        with open(json_file, encoding="utf-8") as f:
             layers.append(json.load(f))
     return layers
 

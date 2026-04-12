@@ -111,10 +111,16 @@ async def stream(
     if interpreted:
         params["interpreted"] = True
 
-    probe_names = [handle.function]
+    # Fallback probe_names if the daemon's STREAM_START arrives after the
+    # first event (or is missing for legacy daemons).
+    fallback_names = [handle.function]
 
     async for raw in c.subscribe(params):
         if isinstance(raw, list):
+            sub = c.active_subscription()
+            probe_names = (
+                sub.probe_names if sub is not None and sub.probe_names else fallback_names
+            )
             yield _decode_stream_event(raw, probe_names, c)
 
 
@@ -123,7 +129,6 @@ async def ask(
     *,
     collect_seconds: int = 5,
     max_events: int = 100,
-    filter: Optional[dict[str, object]] = None,
     client: Optional[JalkiClient] = None,
 ) -> AskResult:
     """
@@ -166,19 +171,26 @@ async def ask(
         return _kb_only_result(question, matches)
 
     # 4. Collect events.
+    #
+    # The daemon tags STREAM_* frames per client connection, so a single
+    # client supports one active subscription at a time. Give each handle
+    # a fair slice of the total budget, and stop early if we hit max_events.
     events: list[Event] = []
-    try:
-        async def _collect() -> None:
-            for _, handle in handles:
+    per_handle = max(0.1, collect_seconds / max(1, len(handles)))
+    for _, handle in handles:
+        if len(events) >= max_events:
+            break
+        try:
+            async def _one() -> None:
                 async for event in stream(handle, interpreted=True, client=c):
                     events.append(event)
                     if len(events) >= max_events:
                         return
-
-        await asyncio.wait_for(_collect(), timeout=collect_seconds)
-    except (asyncio.TimeoutError, Exception) as e:
-        if not isinstance(e, asyncio.TimeoutError):
-            logger.debug("collect failed: %s", e)
+            await asyncio.wait_for(_one(), timeout=per_handle)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            logger.debug("collect from %s failed: %s", handle.function, e)
 
     # 5. Interpret.
     probes_used = [p.function for p, _ in handles]

@@ -10,6 +10,8 @@ import asyncio
 import pytest
 
 import jalki
+import jalki.api
+import jalki.client
 from jalki.types import Outcome, Severity
 
 
@@ -35,10 +37,23 @@ class TestNoDaemon:
         assert matches[0].function == "tcp_connect"
 
     @pytest.mark.asyncio
-    async def test_ask_fallback_no_daemon(self) -> None:
-        """ask_fallback_no_daemon: ask falls back to KB when no daemon."""
+    async def test_ask_fallback_no_daemon(self, monkeypatch) -> None:
+        """ask_fallback_no_daemon: ask falls back to KB when no daemon.
+
+        Force connection failure via monkeypatch so the test is deterministic
+        even if a real daemon is running on the machine.
+        """
+
+        async def _no_daemon(*_args, **_kwargs):
+            raise ConnectionError("simulated: no daemon")
+
+        monkeypatch.setattr(jalki.api, "connect", _no_daemon)
+        previous_default = jalki._default_client
         jalki._default_client = None
-        result = await jalki.ask("why are connections failing")
+        try:
+            result = await jalki.ask("why are connections failing")
+        finally:
+            jalki._default_client = previous_default
         assert result.interpretation
         assert result.action
         assert result.kb_only is True
@@ -103,11 +118,45 @@ class TestWithDaemon:
         except asyncio.TimeoutError:
             pass
 
+        # Canonical no_field list — matches jalki-sdk-meta/src/conformance.rs
+        # case `compact_no_false_protocol_fields`.
+        forbidden = (
+            "source",
+            "enrichment_state",
+            "entity_ids",
+            "correlation_keys",
+            "occurrence_type",
+        )
         for event in events:
-            assert not hasattr(event, "source")
-            assert not hasattr(event, "enrichment_state")
-            assert not hasattr(event, "entity_ids")
-            assert not hasattr(event, "correlation_keys")
+            for field_name in forbidden:
+                assert not hasattr(event, field_name), (
+                    f"event has forbidden FALSE Protocol field: {field_name}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_filter_server_side(self) -> None:
+        """filter_server_side: server-side filter means non-matching events never arrive."""
+        handle = await jalki.deploy("tcp_connect")
+        events: list[jalki.Event] = []
+
+        async def collect() -> None:
+            async for event in jalki.stream(handle, filter={"dst_port": 9999}):
+                events.append(event)
+                if len(events) >= 5:
+                    break
+
+        try:
+            await asyncio.wait_for(collect(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+
+        # Every event we got back must match the filter.
+        for event in events:
+            assert event.net is not None
+            # dst is "ip:port" — split and check port.
+            assert event.net.dst.endswith(":9999"), (
+                f"filter violation: {event.net.dst} not filtered to port 9999"
+            )
 
     @pytest.mark.asyncio
     async def test_ask_with_daemon(self) -> None:

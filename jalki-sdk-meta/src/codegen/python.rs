@@ -25,7 +25,7 @@ impl CodegenTarget for PythonTarget {
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Optional
 
 
@@ -47,9 +47,10 @@ class Proto(IntEnum):
     UDP = 1
 
 
-class Attachment(IntEnum):
-    FENTRY = 0
-    FEXIT = 1
+class Attachment(StrEnum):
+    # Lowercase string values match Rust's serde rename_all = "lowercase".
+    FENTRY = "fentry"
+    FEXIT = "fexit"
 
 
 @dataclass
