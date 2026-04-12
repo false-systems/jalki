@@ -214,6 +214,28 @@ An agent asks the knowledge base before guessing. Deploys probes. Reads events. 
 
 ---
 
+## Python SDK
+
+For agents and rapid iteration. `pip install jalki` and ask the kernel from Python:
+
+```python
+import jalki
+
+# one call: find → deploy → collect → interpret
+result = await jalki.ask("why are connections failing")
+print(result.interpretation, result.action)
+
+# or control each step
+matches = jalki.find("packet loss")                         # local KB, no daemon
+handle  = await jalki.deploy("tcp_retransmit_skb")          # attach probe
+async for event in jalki.stream(handle, interpreted=True):  # live events
+    print(event.net.dst, event.severity, event.interp)
+```
+
+`find()` works offline — the knowledge base ships in the wheel. `ask()` falls back to KB-only analysis when no daemon is running, so it never raises.
+
+---
+
 ## Built-in probes
 
 | Probe | Hook | What it gives you |
