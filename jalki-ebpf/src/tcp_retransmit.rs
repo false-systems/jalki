@@ -46,7 +46,7 @@ fn try_handle(ctx: &FEntryContext) -> Result<(), i64> {
     let state: u8 =
         unsafe { bpf_probe_read_kernel((sk as *const u8).add(18) as *const u8) }.unwrap_or(0);
 
-    let netns: u32 = 0;
+    let netns: u32 = crate::read_netns(sk);
 
     let comm = aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]);
 
