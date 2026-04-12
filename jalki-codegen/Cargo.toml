@@ -1,0 +1,11 @@
+[package]
+name = "jalki-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BPF probe codegen from BTF — generate fentry/fexit programs at runtime"
+
+[dependencies]
+object = { version = "0.36", features = ["write"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -13,6 +13,7 @@ use crate::knowledge::KnowledgeBase;
 use crate::loader;
 use crate::metrics::{EmitterLabel, Metrics};
 use crate::probe::Probe;
+use crate::probes::generated::GeneratedProbeReader;
 use crate::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
 use crate::reader::{self, ProbeStats};
 use crate::registry::ProbeRegistry;
@@ -76,6 +77,8 @@ impl Runtime {
 
         // Load BTF for runtime probe attachment.
         let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
+        let btf_data = jalki_codegen::btf::BtfData::from_sys_fs()
+            .context("failed to parse BTF for codegen")?;
 
         // Channel: readers → emit loop.
         let (tx, mut rx) = mpsc::channel::<Occurrence>(8192);
@@ -100,6 +103,7 @@ impl Runtime {
         let handle = Arc::new(DaemonHandle {
             ebpf: Mutex::new(ebpf),
             btf,
+            btf_data,
             registry: registry.clone(),
             store: store.clone(),
             kb: kb.clone(),
@@ -186,6 +190,7 @@ impl Runtime {
 pub struct DaemonHandle {
     ebpf: Mutex<Ebpf>,
     btf: Btf,
+    btf_data: jalki_codegen::btf::BtfData,
     pub registry: Arc<ProbeRegistry>,
     pub store: Arc<EventStore>,
     pub kb: Arc<KnowledgeBase>,
@@ -196,37 +201,167 @@ pub struct DaemonHandle {
 impl DaemonHandle {
     /// Deploy a probe by kernel function name at runtime.
     ///
-    /// Looks up the function in the knowledge base to determine attachment type,
-    /// instantiates the right built-in probe, attaches the eBPF program, and
-    /// starts draining events.
+    /// Fast path: pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb).
+    /// Slow path: codegen — generate BPF bytecode from BTF at runtime.
     pub async fn deploy_probe(
         &self,
         function: &str,
         _sample_rate: f64,
     ) -> Result<String> {
-        // Resolve function → built-in probe.
-        let probe: Arc<dyn Probe> = match function {
-            "tcp_connect" => Arc::new(TcpConnect::new()),
-            "tcp_close" => Arc::new(TcpClose::new()),
-            "tcp_retransmit_skb" => Arc::new(TcpRetransmit::new()),
-            other => anyhow::bail!(
-                "no pre-compiled probe for '{}'. Known: tcp_connect, tcp_close, tcp_retransmit_skb",
-                other
-            ),
+        // Fast path: pre-compiled probes.
+        let pre_compiled: Option<Arc<dyn Probe>> = match function {
+            "tcp_connect" => Some(Arc::new(TcpConnect::new())),
+            "tcp_close" => Some(Arc::new(TcpClose::new())),
+            "tcp_retransmit_skb" => Some(Arc::new(TcpRetransmit::new())),
+            _ => None,
         };
 
-        let mut ebpf = self.ebpf.lock().await;
+        if let Some(probe) = pre_compiled {
+            let mut ebpf = self.ebpf.lock().await;
+            let probe_id = self.registry.attach(
+                probe,
+                &mut ebpf,
+                &self.btf,
+                &self.cluster,
+                self.tx.clone(),
+                &self.store,
+            )?;
+            return Ok(probe_id.to_string());
+        }
+
+        // Slow path: codegen.
+        info!(function = function, "generating probe via codegen");
+        self.deploy_codegen(function).await
+    }
+
+    /// Generate and deploy a probe for any kernel function using codegen.
+    async fn deploy_codegen(&self, function: &str) -> Result<String> {
+        // Determine attachment type from knowledge base, default to fentry.
+        let (attachment, event_type, fields) = match self.kb.get_probe(function) {
+            Some(probe_info) => {
+                let attach = match probe_info.attachment.as_str() {
+                    "fexit" => jalki_codegen::program::AttachType::Fexit,
+                    _ => jalki_codegen::program::AttachType::Fentry,
+                };
+                let fields: Vec<String> = probe_info
+                    .fields
+                    .iter()
+                    .filter(|f| f.important)
+                    .map(|f| f.name.clone())
+                    .collect();
+                (attach, probe_info.event_type.clone(), fields)
+            }
+            None => {
+                // No KB entry — generate a minimal probe with basic fields.
+                // Try fexit first (gives return value).
+                let attach = jalki_codegen::program::AttachType::Fentry;
+                let event_type = format!("kernel.{}", function.replace('_', "."));
+                let fields = vec!["comm".to_string()];
+                (attach, event_type, fields)
+            }
+        };
+
+        // Map KB field names to BTF paths.
+        let btf_fields = map_kb_fields_to_btf(function, &fields, &self.btf_data);
+
+        let spec = jalki_codegen::program::ProbeSpec {
+            function: function.to_string(),
+            attachment,
+            fields: btf_fields,
+            event_type: event_type.clone(),
+        };
+
+        let generated = jalki_codegen::generate(&spec, &self.btf_data)
+            .with_context(|| format!("codegen failed for {function}"))?;
+
+        info!(
+            function = function,
+            event_size = generated.event_size,
+            instructions = generated.spec.fields.len(),
+            "probe generated"
+        );
+
+        // Load the generated ELF.
+        let mut gen_ebpf = Ebpf::load(&generated.elf_bytes)
+            .with_context(|| format!("failed to load generated ELF for {function}"))?;
+
+        // Populate PID filter.
+        crate::filter::populate_pid_filter(&mut gen_ebpf)?;
+
+        // Create the probe reader.
+        // Find the program name — it's the only text section symbol.
+        let prog_name = format!("jalki_codegen_{function}");
+        let probe = Arc::new(GeneratedProbeReader::new(
+            spec,
+            generated.field_layout,
+            generated.event_size,
+            generated.map_name,
+            prog_name.clone(),
+        ));
+
+        // Attach via BTF.
         let probe_id = self.registry.attach(
             probe,
-            &mut ebpf,
+            &mut gen_ebpf,
             &self.btf,
             &self.cluster,
             self.tx.clone(),
             &self.store,
         )?;
 
+        // Keep the generated Ebpf object alive (it owns the loaded programs).
+        // TODO: Store in a Vec<Ebpf> on DaemonHandle to prevent drop.
+        // For now, leak it — this is correct but not ideal.
+        std::mem::forget(gen_ebpf);
+
         Ok(probe_id.to_string())
     }
+}
+
+/// Map knowledge base field names to BTF field paths.
+///
+/// KB fields like "src_ip", "dst_port" are human-friendly.
+/// BTF needs "sk.__sk_common.skc_rcv_saddr", etc.
+fn map_kb_fields_to_btf(
+    function: &str,
+    kb_fields: &[String],
+    btf_data: &jalki_codegen::btf::BtfData,
+) -> Vec<String> {
+    let mut result = Vec::new();
+
+    // Check if the function's first param is a sock pointer.
+    let has_sock = btf_data
+        .resolve_function(function)
+        .ok()
+        .and_then(|sig| sig.params.first().cloned())
+        .map(|p| p.name == "sk")
+        .unwrap_or(false);
+
+    for field in kb_fields {
+        match field.as_str() {
+            "src_ip" if has_sock => result.push("sk.__sk_common.skc_rcv_saddr".into()),
+            "dst_ip" if has_sock => result.push("sk.__sk_common.skc_daddr".into()),
+            "src_port" if has_sock => result.push("sk.__sk_common.skc_num".into()),
+            "dst_port" if has_sock => result.push("sk.__sk_common.skc_dport".into()),
+            "tcp_state" if has_sock => result.push("sk.__sk_common.skc_state".into()),
+            "pid" | "tid" | "timestamp_ns" => {} // always included in header
+            "command" | "comm" => result.push("comm".into()),
+            "ret" => result.push("ret".into()),
+            // Pass through anything that looks like a BTF path already.
+            other if other.contains('.') => result.push(other.to_string()),
+            _ => {
+                // Unknown field — try "comm" as a safe default.
+                // Don't add unknown fields that would cause codegen to fail.
+            }
+        }
+    }
+
+    // Always include comm if not already present.
+    if !result.iter().any(|f| f == "comm") {
+        result.push("comm".into());
+    }
+
+    result
 }
 
 /// Periodically check probe stats and emit self-observability Occurrences.

@@ -67,6 +67,67 @@
           "action": "normal for databases and log writers. investigate if unexpected."
         }
       ]
+    },
+    {
+      "function": "vfs_read",
+      "attachment": "fexit",
+      "event_type": "kernel.fs.read",
+      "layer": "fs",
+      "answers": [
+        "which process is reading from disk",
+        "read throughput per process",
+        "is a process reading too much"
+      ],
+      "keywords": ["read", "disk", "io", "throughput", "bytes read"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "process reading",            "important": true },
+        { "name": "command", "type": "string", "meaning": "process name",               "important": true },
+        { "name": "ret",     "type": "i64",   "meaning": "bytes read or negative errno", "important": true }
+      ],
+      "use_when": "you need per-process read throughput. high frequency — use sampling. pair with vfs_write for complete I/O picture.",
+      "not_when": "you just need to know if a file was accessed — use vfs_open.",
+      "combine_with": ["vfs_write", "vfs_open"],
+      "interpretations": [
+        {
+          "pattern": "high bytes per call from one process",
+          "conclusion": "heavy reader — this process is generating significant read I/O",
+          "severity": "info",
+          "action": "normal for databases and log processors. investigate if unexpected."
+        },
+        {
+          "pattern": "ret < 0",
+          "conclusion": "read error — the kernel returned an error for this read operation",
+          "severity": "warning",
+          "action": "check filesystem health. may indicate disk errors or corrupt filesystem."
+        }
+      ]
+    },
+    {
+      "function": "filp_close",
+      "attachment": "fentry",
+      "event_type": "kernel.fs.close",
+      "layer": "fs",
+      "answers": [
+        "which process is closing file descriptors",
+        "file descriptor lifecycle",
+        "fd leak detection"
+      ],
+      "keywords": ["close", "fd", "file descriptor", "cleanup", "leak"],
+      "fields": [
+        { "name": "pid",     "type": "u32",   "meaning": "process closing the fd",  "important": true },
+        { "name": "command", "type": "string", "meaning": "process name",            "important": true }
+      ],
+      "use_when": "you want to track file descriptor lifecycle. combine with vfs_open to detect fd leaks — opens without corresponding closes.",
+      "not_when": "you need I/O throughput — use vfs_read/vfs_write.",
+      "combine_with": ["vfs_open"],
+      "interpretations": [
+        {
+          "pattern": "close rate much lower than open rate for same process",
+          "conclusion": "possible file descriptor leak — process is opening files faster than closing them",
+          "severity": "warning",
+          "action": "check application for fd leaks. compare open vs close rates over time."
+        }
+      ]
     }
   ]
 }

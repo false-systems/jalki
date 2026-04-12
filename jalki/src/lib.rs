@@ -18,6 +18,7 @@ pub mod emit {
 }
 
 pub mod probes {
+    pub mod generated;
     pub mod tcp_close;
     pub mod tcp_connect;
     pub mod tcp_retransmit;
