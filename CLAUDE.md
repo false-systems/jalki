@@ -317,13 +317,53 @@ Every probe emits a FALSE Protocol Occurrence. The schema:
 - Not a replacement for metrics — use Prometheus for rates, jälki for per-event causality
 - Not coupled to POLKU — stdout is a valid production destination
 
-## Oracle (`eval/oracle/`)
+## Specs and Oracle
 
-Standalone ground-truth test binary. Validates jälki's public contract — knowledge base schema, semantic correctness, interpretation accuracy, MCP tool inventory, FALSE Protocol compliance.
+### Requirement specs (`specs/`)
 
-**The oracle MUST NOT depend on any jalki crate.** It reads knowledge base JSON files from disk and makes assertions. It never imports jalki code. If you need a jalki type to write a test, you're testing code, not contract. The oracle tests requirements, not implementation.
+Luotain-compatible markdown specs organized by domain. Each file defines testable requirements in natural language.
 
-The oracle must not be modified as a side effect of modifying the system. When an oracle case fails, fix the system or the data — not the test.
+```
+specs/
+├── _config.md                # probe configuration
+├── protocol/                 # wire protocol requirements
+│   ├── framing.md            # binary frame structure, socket, keepalive
+│   ├── find.md               # find method behavior + required relevance matches
+│   ├── deploy.md             # deploy method, pre-compiled + codegen paths
+│   ├── subscribe.md          # streaming: STREAM_EVENT shape, filtering, interpretation
+│   ├── status.md             # status method fields
+│   └── ask.md                # ask orchestration, fallback, required interpretations
+├── sdk/
+│   └── python.md             # Python SDK: 4 methods, offline find, graceful fallback
+└── knowledge/
+    └── knowledge-base.md     # schema, layers, semantic correctness rules
+```
+
+### Oracle (`eval/oracle/`)
+
+Standalone Rust binary. Validates jälki's public contract by reading data files from disk. Never imports jalki code. Every test case maps to a requirement in `specs/`.
+
+**Rules:**
+- The oracle tests requirements, not implementation
+- If you need a jalki type to write a test, you're testing code, not contract
+- When an oracle case fails, fix the system or the data — not the test
+- The oracle must not be modified as a side effect of modifying the system
+
+**50 cases, organized by domain:**
+
+| Range | Domain | Spec |
+|-------|--------|------|
+| 001-010 | KB schema validity | knowledge-base.md |
+| 011-020 | KB semantic correctness | knowledge-base.md |
+| 021-030 | MCP contract | (MCP tool inventory) |
+| 031-040 | Event schema | (FALSE Protocol) |
+| 041-050 | Interpretation accuracy | ask.md, knowledge-base.md |
+| 051-055 | Cross-layer consistency | knowledge-base.md |
+| 060-065 | Probe counts per layer | knowledge-base.md |
+| 070-072 | Find relevance | find.md |
+| 080-082 | Ask interpretations | ask.md |
+| 090-091 | SDK generated types | sdk/python.md |
+| 095-096 | Specs directory structure | framing.md |
 
 ## Conventions
 
