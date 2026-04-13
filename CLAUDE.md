@@ -27,12 +27,18 @@ jalki/
 ├── jalki-common/     # no_std shared types — kernel + userspace
 ├── jalki-ebpf/       # eBPF programs — NOT a workspace member (separate build target)
 ├── jalki/            # userspace daemon + library
+├── jalki-codegen/    # runtime BPF program generation from BTF (no C, no clang)
 ├── jalki-mcp/        # MCP server (JSON-RPC 2.0 over stdin/stdout)
+├── jalki-sdk-meta/   # source of truth for SDK types, wire protocol, conformance tests
+├── jalki-sdk-python/ # Python SDK (NOT a workspace member — pyproject.toml)
 ├── xtask/            # build orchestration (eBPF compilation)
+├── knowledge/        # JSON knowledge base — compiled into binary via include_str!
+├── specs/            # Luotain-compatible requirement specs (tested by oracle)
+├── helm/jalki/       # Helm chart for k8s deployment
 └── eval/oracle/      # standalone contract test suite — NOT in workspace
 ```
 
-Workspace members: `jalki-common`, `jalki`, `jalki-mcp`, `xtask`. The eBPF crate and oracle are built separately.
+Workspace members: `jalki-common`, `jalki`, `jalki-codegen`, `jalki-mcp`, `jalki-sdk-meta`, `xtask`. The eBPF crate, Python SDK, and oracle are built separately.
 
 External dependency: `false-protocol` is a path dependency from `../ahti/false-protocol`.
 
@@ -72,6 +78,28 @@ External dependency: `false-protocol` is a path dependency from `../ahti/false-p
   - `Metrics` — Prometheus on :9090
 - Built-in emitters: `StdoutEmitter`, `FileEmitter`, `GrpcEmitter` (stub in v0.1)
 - Built-in probes: `TcpConnect`, `TcpClose`, `TcpRetransmit`
+
+### jalki-codegen
+
+- Generates BPF ELF bytecode at runtime from a `ProbeSpec` — no C, no clang, no pre-compiled object
+- Flow: `ProbeSpec → BTF resolution → BPF instructions → ELF → aya::Ebpf::load()`
+- Used by the daemon's `deploy_descriptor` IPC method so SDK-defined probes don't require rebuilding
+- Pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb) still use the fast path in `jalki-ebpf`
+
+### jalki-sdk-meta
+
+- Single source of truth for SDK types, wire protocol framing, and conformance tests
+- `types`, `protocol`, `conformance` modules describe what every SDK must implement
+- `codegen` module emits per-language bindings (currently Python); binary `jalki-sdk-codegen` runs it
+- Conformance cases carry a `requires_daemon` flag — daemon-free cases can run in CI without privileges
+- Workflow: change types here → regenerate → all SDKs update. Do not add fields by hand-editing SDKs.
+
+### jalki-sdk-python
+
+- Python package at `jalki-sdk-python/` (pyproject.toml, hatchling)
+- `client.py` talks to the daemon over the binary framed protocol; `knowledge.py` loads KB offline
+- The wheel force-includes `../knowledge` so `jalki.find(...)` works without a daemon
+- Conformance-tested against `jalki-sdk-meta` — see `specs/sdk/python.md`
 
 ### jalki-mcp
 
@@ -395,7 +423,7 @@ The Rust trait is the foundation. The goal is to make probe authorship accessibl
 ```
 v0.1  Rust trait (current)
 v0.2  Rust macro — simpler ergonomics, less boilerplate
-v0.3  Python SDK
+v0.3  Python SDK (landed — jalki-sdk-python)
 v0.4  Go SDK
 ```
 
