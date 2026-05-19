@@ -78,6 +78,8 @@ If the answer to "where does this live for a week?" is anywhere other than Ahti,
 
 ### 2.2 No product interpretation
 
+> **⚠ Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md).** Jälki **MAY** now decide root cause and stamp severity — but **only** on `jalki.diagnosis.*` occurrences (`evidence_level: derived`, `evidence_refs` required). Raw `observed` kernel occurrences **MUST** still be neutral (no product severity, no root-cause field). The clauses below apply unchanged to raw evidence.
+
 Jälki **MUST NOT** decide:
 
 - Root cause ("network is the problem" — Lähde decides).
@@ -88,6 +90,8 @@ Jälki **MUST NOT** decide:
 The Jälki TCP retransmit record states the retransmit happened. It does not say "this is a network problem."
 
 ### 2.3 No Actor attribution
+
+> **⚠ Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md).** Jälki **MAY** now perform *diagnostic correlation* — joining `tcp_connect` + `tcp_retransmit` + `tcp_close` into a connection story over the 4-tuple / pid / cgroup / netns. *Actor and ownership* attribution (the bullets below) remains forbidden and stays Vartio's.
 
 Jälki **MUST NOT** assert:
 
@@ -104,6 +108,8 @@ Jälki **MUST NOT** block, deny, kill, throttle, or rate-limit anything. The age
 Syvä will own enforcement when it exists. Jälki may later provide evidence that informs Syvä decisions, but Jälki itself remains observe-only.
 
 ### 2.5 No incident or chain concepts
+
+> **⚠ Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md).** Jälki **MAY** emit `jalki.diagnosis.*` occurrences carrying a candidate conclusion + confidence. It still **MUST NOT** define new top-level `incident` / `chain` / `attribution` *record kinds* — §2.7 holds; a diagnosis is an `occurrence`, not a new kind.
 
 Jälki **MUST NOT** define:
 

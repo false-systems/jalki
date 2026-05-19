@@ -1,8 +1,10 @@
 # Jälki — Design
 
-> Jälki observes runtime evidence. Ahti stores it. Vartio and Lähde interpret it. Syvä enforces later.
+> Jälki observes the kernel and interprets what it sees. Polku routes the evidence. Ahti stores it. Lähde and Vartio reason across producers. Syvä enforces later.
 
-This directory contains the design documents for Jälki in the new False Systems architecture. **Design only — no implementation code.** When the design is approved, implementation will follow in separate PRs against the existing crate layout (see top-level `CLAUDE.md`).
+> **Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md) (2026-05-20).** The original pass made Jälki strictly observe-only with all interpretation in Lähde. ADR-0001 supersedes that for probe intelligence: Jälki now plans probes, correlates, and emits authoritative interpretations as `jalki.diagnosis.*` occurrences — while the datastore boundary (no Jälki datastore; Polku routes; Ahti stores) is unchanged. Read the ADR before relying on any "MUST NOT interpret" clause below.
+
+This directory contains the design documents for Jälki in the new False Systems architecture. When the design is approved, implementation will follow in separate PRs against the existing crate layout (see top-level `CLAUDE.md`).
 
 ## What Jälki is
 
@@ -60,7 +62,8 @@ The boundaries are deliberate:
 
 | Document | Purpose |
 |---|---|
-| [`product-boundaries.md`](./product-boundaries.md) | The does/does-not contract. Read first when in doubt. |
+| [`adr/0001-evidence-sinks-and-probe-intelligence.md`](./adr/0001-evidence-sinks-and-probe-intelligence.md) | The architectural gate for implementation: `EvidenceSink`, Polku/Ahti routing, and the probe-intelligence reversal. Read before the boundary docs. |
+| [`product-boundaries.md`](./product-boundaries.md) | The does/does-not contract. Read first when in doubt — but note §2.2/§2.3/§2.5 are amended by ADR-0001. |
 | [`ahti-record-mapping.md`](./ahti-record-mapping.md) | How every Jälki concept maps to one of Ahti's 7 core record kinds, using Ahti's actual field names. |
 | [`runtime-evidence-model.md`](./runtime-evidence-model.md) | Per-evidence-type definitions: process_exec, file_open, network_connect, tcp_retransmit, etc. Source mechanism, required/optional fields, Ahti binding. |
 | [`probe-definitions.md`](./probe-definitions.md) | How Jälki represents probe plan templates, kernel hook references, and sampling policies as Ahti `definition` / `reference` records. Ahti stores; agents execute. |
@@ -77,9 +80,9 @@ Details in [`local-agent-state.md`](./local-agent-state.md).
 
 ## The design sentence to preserve
 
-> *"Jälki asks the kernel questions and emits structured evidence. Ahti preserves that evidence. Products such as Lähde and Vartio decide what it means."*
+> *"Jälki asks the kernel questions, emits structured evidence, and says what it likely means. Polku routes it. Ahti preserves it. Lähde and Vartio reason across producers."*
 
-When any future design choice conflicts with this sentence, the design choice is wrong, not the sentence.
+When any future design choice conflicts with this sentence, the design choice is wrong, not the sentence. (The earlier sentence — which placed *all* interpretation in Lähde — was deliberately replaced by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md). Changing this sentence requires an ADR, not an edit.)
 
 ## Relationship to today's repo
 
