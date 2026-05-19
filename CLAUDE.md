@@ -4,9 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is jälki
 
-jälki is a programmable fentry/fexit probe framework. You define a probe in Rust, jälki handles BTF loading, attachment, ring buffer management, self-filtering, serialization, and emission. Output is structured FALSE Protocol Occurrence JSON.
+jälki is an Ahti producer for kernel and runtime evidence. It has four pieces:
 
-The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults — jälki is the framework that makes writing *any* fentry/fexit probe a matter of implementing one trait.
+- **SDK** — `jalki-sdk-meta` (source of truth) plus language SDKs (`jalki-sdk-python`, future Go/Rust). Defines types and the wire protocol.
+- **API** — daemon IPC over `/run/jalki/jalki.sock`, MCP server, and the producer contract with Ahti.
+- **Logic** — the `Probe` trait, eBPF programs, BTF resolution, ring buffer management, self-filtering, and the embedded knowledge base. Turns raw kernel signals into validated evidence.
+- **Ahti** — where evidence lives durably. Jälki MUST NOT keep a parallel datastore.
+
+The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults — the logic layer makes writing *any* fentry/fexit probe a matter of implementing one trait.
+
+Current code implements logic + SDK + local API. The Ahti producer path is the v0 work in `docs/jalki/v0-scope.md`.
 
 ## Crate Structure
 
@@ -193,6 +200,20 @@ pub trait Emitter: Send + Sync {
 - **src_port 0 on tcp_close** — kernel clears `skc_num` before `tcp_close` returns. Correlate by 4-tuple with `tcp_connect` events.
 - **tcp_sock offsets hardcoded** — bytes_sent (1608) and bytes_received (1808) verified on kernel 6.19.9.
 - **Self-filter** — jälki's own PID is always excluded. This is correct behavior, not a bug.
+
+## Design docs
+
+`docs/jalki/` contains a 7-document design pass (May 2026) that reframes jälki as a producer for Ahti — the agent stops being its own product surface, evidence becomes Ahti records, and Lähde/Vartio interpret. **Design-only, no code yet.** Read these before making architectural changes; the fentry/fexit framework is preserved but the output, storage, and CLI/MCP boundaries change.
+
+- `docs/jalki/README.md` — start here, document map and the "design sentence to preserve"
+- `docs/jalki/product-boundaries.md` — what jälki MUST and MUST NOT do
+- `docs/jalki/v0-scope.md` — the first implementation slice
+- `docs/jalki/ahti-record-mapping.md` — how every concept maps to Ahti's record kinds
+- `docs/jalki/runtime-evidence-model.md` — per-evidence-type definitions
+- `docs/jalki/probe-definitions.md` — probe plan templates as Ahti definition records
+- `docs/jalki/local-agent-state.md` — what stays on the node vs. what reaches Ahti
+
+For architectural changes, write a design doc first (MUST/SHOULD/MAY discipline) and get sign-off before implementing.
 
 ## Part of False Systems
 
