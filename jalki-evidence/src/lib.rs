@@ -8,9 +8,13 @@
 //! See `docs/jalki/adr/0001-evidence-sinks-and-probe-intelligence.md` (decision D3).
 
 pub mod event;
+pub mod evidence;
 pub mod normalize;
 
 pub use event::{
     DecodeError, KernelEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent, TcpState,
+};
+pub use evidence::{
+    EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata, ProducerMetadata,
 };
 pub use normalize::errno_name;
