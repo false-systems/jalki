@@ -1,4 +1,3 @@
-pub mod addr;
 pub mod descriptor;
 pub mod emitter;
 pub mod filter;

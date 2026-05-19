@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 jalki-common = { workspace = true }
+jalki-evidence = { path = "../jalki-evidence" }
 jalki-codegen = { path = "../jalki-codegen" }
 false-protocol = { workspace = true }
 aya = { workspace = true }

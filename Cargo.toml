@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "jalki-common",
+    "jalki-evidence",
     "jalki",
     "jalki-codegen",
     "jalki-mcp",
