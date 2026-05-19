@@ -77,6 +77,35 @@ pub struct EvidenceRecord {
     pub occurrence: Occurrence,
 }
 
+impl EvidenceRecord {
+    /// Project into a single `Occurrence` carrying the full ADR-0001 D6 metadata
+    /// set, with the agent-constant fields supplied by the batch's
+    /// [`ProducerMetadata`].
+    ///
+    /// This is the contract a sink MUST go through: it folds the batch- and
+    /// record-level metadata into the record so a downstream consumer that only
+    /// sees the `Occurrence` still has producer / probe / kernel / node identity
+    /// and the observed time. Forwarding `record.occurrence` directly would drop
+    /// all of it. Until the Ahti record kinds land, these ride in `labels`; the
+    /// sink projection (a later slice) maps them onto envelope/payload fields.
+    /// `cluster` is omitted — it is already a first-class `Occurrence` field.
+    pub fn into_occurrence_with_metadata(self, producer: &ProducerMetadata) -> Occurrence {
+        let mut occ = self.occurrence;
+        let labels = &mut occ.labels;
+        labels.insert("producer".into(), producer.producer.clone());
+        labels.insert("producer_version".into(), producer.producer_version.clone());
+        labels.insert("node_id".into(), producer.node_id.clone());
+        labels.insert("kernel_release".into(), producer.kernel_release.clone());
+        labels.insert("probe_id".into(), self.probe.probe_id);
+        labels.insert("probe_version".into(), self.probe.probe_version);
+        labels.insert("probe_family".into(), self.probe.probe_family);
+        labels.insert("hook_kind".into(), self.probe.hook_kind.as_str().into());
+        labels.insert("kernel_function".into(), self.probe.kernel_function);
+        labels.insert("observed_at_ns".into(), self.observed_at_ns.to_string());
+        occ
+    }
+}
+
 /// The records produced by normalizing one `KernelEvent`.
 ///
 /// A `Vec` so a single event can yield multiple records (an occurrence plus,
@@ -134,6 +163,17 @@ impl EvidenceBatch {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Project every record into an `Occurrence` carrying full metadata, applying
+    /// this batch's [`ProducerMetadata`] to each. Consumes the batch — this is the
+    /// intended hand-off into a sink.
+    pub fn into_occurrences(self) -> Vec<Occurrence> {
+        let producer = self.producer;
+        self.records
+            .into_iter()
+            .map(|r| r.into_occurrence_with_metadata(&producer))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +230,27 @@ mod tests {
         let batch = EvidenceBatch::new(ProducerMetadata::new("c", "n", "k"), vec![]);
         assert!(batch.is_empty());
         assert_eq!((batch.observed_at_min, batch.observed_at_max), (0, 0));
+    }
+
+    #[test]
+    fn projection_carries_full_d6_metadata() {
+        let batch =
+            EvidenceBatch::new(ProducerMetadata::new("prod", "node-1", "6.17.0"), vec![record(42)]);
+        let occ = batch.into_occurrences().pop().unwrap();
+        let get = |k: &str| occ.labels.get(k).map(String::as_str);
+
+        // producer-constant fields, supplied by the batch
+        assert_eq!(get("producer"), Some("jalki"));
+        assert!(occ.labels.contains_key("producer_version"));
+        assert_eq!(get("node_id"), Some("node-1"));
+        assert_eq!(get("kernel_release"), Some("6.17.0"));
+        // probe-constant fields, supplied by the record
+        assert_eq!(get("probe_id"), Some("tcp_retransmit"));
+        assert!(occ.labels.contains_key("probe_version"));
+        assert_eq!(get("probe_family"), Some("tcp"));
+        assert_eq!(get("hook_kind"), Some("fentry"));
+        assert_eq!(get("kernel_function"), Some("tcp_retransmit_skb"));
+        // observed time travels with the record
+        assert_eq!(get("observed_at_ns"), Some("42"));
     }
 }
