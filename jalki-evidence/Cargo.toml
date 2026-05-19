@@ -6,9 +6,10 @@ license.workspace = true
 description = "Typed kernel-event model and FALSE Protocol normalization for jälki (aya-free, host-portable)"
 
 [dependencies]
-# Direct path dep with DEFAULT features on purpose: the workspace alias pins
-# `userspace` (= aya, Linux-only). Keeping this crate aya-free is what lets it
-# compile and unit-test on macOS, where `jalki` itself cannot build.
+# Use a direct path dep, NOT the workspace `jalki-common` alias: the alias pins
+# `userspace` (= aya, Linux-only), so inheriting it would pull aya in. The direct
+# dep gets jalki-common's default (empty) feature set, keeping this crate aya-free
+# so it compiles and unit-tests on macOS, where `jalki` itself cannot build.
 jalki-common = { path = "../jalki-common" }
 false-protocol = { workspace = true }
 thiserror = { workspace = true }
