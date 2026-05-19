@@ -40,6 +40,17 @@ pub enum KernelEvent {
     TcpRetransmit(TcpRetransmitEvent),
 }
 
+impl KernelEvent {
+    /// The kernel's monotonic observation time, in nanoseconds.
+    pub fn observed_at_ns(&self) -> u64 {
+        match self {
+            KernelEvent::TcpConnect(e) => e.observed_at_ns,
+            KernelEvent::TcpClose(e) => e.observed_at_ns,
+            KernelEvent::TcpRetransmit(e) => e.observed_at_ns,
+        }
+    }
+}
+
 /// TCP connection state, as carried by the kernel `sk_state` byte.
 ///
 /// `Unknown(n)` preserves the raw value for any state jälki does not name; its

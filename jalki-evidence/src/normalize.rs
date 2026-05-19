@@ -9,6 +9,7 @@
 use false_protocol::{NetworkEventData, Occurrence, OccurrenceError, Outcome, ProcessEventData, Severity};
 
 use crate::event::{KernelEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent};
+use crate::evidence::{EvidenceRecord, NormalizedEvidence, ProbeMetadata};
 
 impl KernelEvent {
     /// Convert to a FALSE Protocol `Occurrence`.
@@ -18,6 +19,18 @@ impl KernelEvent {
             KernelEvent::TcpClose(e) => e.to_occurrence(cluster),
             KernelEvent::TcpRetransmit(e) => e.to_occurrence(cluster),
         }
+    }
+
+    /// Normalize into stamped evidence records.
+    ///
+    /// Today each event yields a single occurrence record; the `Vec` shape leaves
+    /// room for `entity_version` / `relationship_claim` records once those land.
+    pub fn normalize(&self, probe: ProbeMetadata, cluster: &str) -> NormalizedEvidence {
+        NormalizedEvidence::single(EvidenceRecord {
+            observed_at_ns: self.observed_at_ns(),
+            probe,
+            occurrence: self.to_occurrence(cluster),
+        })
     }
 }
 
@@ -347,5 +360,42 @@ mod tests {
         assert_eq!(errno_name(-113), "EHOSTUNREACH");
         assert_eq!(errno_name(-101), "ENETUNREACH");
         assert_eq!(errno_name(-42), "E42");
+    }
+
+    #[test]
+    fn normalize_stamps_probe_metadata_and_observed_time() {
+        use crate::evidence::HookKind;
+
+        let event = TcpRetransmitEvent {
+            observed_at_ns: 123_456_789,
+            pid: 9999,
+            tid: 9999,
+            src_ip: ip(10, 0, 0, 1),
+            dst_ip: ip(10, 0, 0, 2),
+            src_port: 12345,
+            dst_port: 443,
+            addr_family: 2,
+            state: TcpState::Established,
+            comm: "curl".into(),
+            netns: 0,
+        };
+        let probe = ProbeMetadata {
+            probe_id: "tcp_retransmit".into(),
+            probe_version: "1".into(),
+            probe_family: "tcp".into(),
+            hook_kind: HookKind::Fentry,
+            kernel_function: "tcp_retransmit_skb".into(),
+        };
+
+        let norm = KernelEvent::TcpRetransmit(event).normalize(probe, "prod");
+
+        assert_eq!(norm.records.len(), 1);
+        let r = &norm.records[0];
+        assert_eq!(r.observed_at_ns, 123_456_789);
+        assert_eq!(r.probe.probe_id, "tcp_retransmit");
+        assert_eq!(r.probe.kernel_function, "tcp_retransmit_skb");
+        assert_eq!(r.occurrence.occurrence_type.as_str(), "kernel.tcp.retransmit");
+        // jälki never sets Ahti's ingest-time.
+        assert!(r.occurrence.received_at.is_none());
     }
 }
