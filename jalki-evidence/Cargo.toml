@@ -1,0 +1,14 @@
+[package]
+name = "jalki-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed kernel-event model and FALSE Protocol normalization for jälki (aya-free, host-portable)"
+
+[dependencies]
+# Direct path dep with DEFAULT features on purpose: the workspace alias pins
+# `userspace` (= aya, Linux-only). Keeping this crate aya-free is what lets it
+# compile and unit-test on macOS, where `jalki` itself cannot build.
+jalki-common = { path = "../jalki-common" }
+false-protocol = { workspace = true }
+thiserror = { workspace = true }

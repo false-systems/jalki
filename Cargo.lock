@@ -718,6 +718,7 @@ dependencies = [
  "hostname",
  "jalki-codegen",
  "jalki-common",
+ "jalki-evidence",
  "prometheus-client",
  "rmpv",
  "serde",
@@ -744,6 +745,15 @@ name = "jalki-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+]
+
+[[package]]
+name = "jalki-evidence"
+version = "0.1.0"
+dependencies = [
+ "false-protocol",
+ "jalki-common",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

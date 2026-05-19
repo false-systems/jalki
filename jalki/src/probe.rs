@@ -11,6 +11,17 @@ pub enum ProbeError {
     InvalidData(String),
 }
 
+impl From<jalki_evidence::DecodeError> for ProbeError {
+    fn from(err: jalki_evidence::DecodeError) -> Self {
+        match err {
+            jalki_evidence::DecodeError::TooShort { expected, actual } => {
+                ProbeError::TooShort { expected, actual }
+            }
+            jalki_evidence::DecodeError::Invalid(msg) => ProbeError::InvalidData(msg),
+        }
+    }
+}
+
 /// How a probe attaches to a kernel function.
 #[derive(Debug, Clone)]
 pub enum Attachment {
