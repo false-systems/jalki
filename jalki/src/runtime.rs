@@ -5,13 +5,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
+use jalki_evidence::{
+    EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind, ProbeMetadata, ProducerMetadata,
+};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use crate::emitter::Emitter;
 use crate::knowledge::KnowledgeBase;
 use crate::loader;
-use crate::metrics::{EmitterLabel, Metrics};
+use crate::metrics::{Metrics, SinkLabel};
 use crate::probe::Probe;
 use crate::probes::generated::GeneratedProbeReader;
 use crate::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
@@ -22,7 +24,7 @@ use crate::store::EventStore;
 /// Builder for configuring and running jälki.
 pub struct Runtime {
     probes: Vec<Arc<dyn Probe>>,
-    emitters: Vec<Box<dyn Emitter>>,
+    sink: Option<Box<dyn EvidenceSink>>,
     ebpf_path: String,
     cluster: String,
 }
@@ -31,7 +33,7 @@ impl Runtime {
     pub fn new(ebpf_path: impl Into<String>) -> Self {
         Self {
             probes: Vec::new(),
-            emitters: Vec::new(),
+            sink: None,
             ebpf_path: ebpf_path.into(),
             cluster: hostname::get()
                 .ok()
@@ -50,8 +52,8 @@ impl Runtime {
         self
     }
 
-    pub fn emit_to(mut self, emitter: impl Emitter + 'static) -> Self {
-        self.emitters.push(Box::new(emitter));
+    pub fn sink_to(mut self, sink: Box<dyn EvidenceSink>) -> Self {
+        self.sink = Some(sink);
         self
     }
 
@@ -67,7 +69,7 @@ impl Runtime {
 
         info!(
             probes = self.probes.len(),
-            emitters = self.emitters.len(),
+            sink = self.sink.as_ref().map(|s| s.name()).unwrap_or("stdout"),
             cluster = %self.cluster,
             "starting jalki"
         );
@@ -80,8 +82,10 @@ impl Runtime {
         let btf_data = jalki_codegen::btf::BtfData::from_sys_fs()
             .context("failed to parse BTF for codegen")?;
 
-        // Channel: readers → emit loop.
-        let (tx, mut rx) = mpsc::channel::<Occurrence>(8192);
+        let producer = producer_metadata(&self.cluster);
+
+        // Channel: readers → sink loop.
+        let (tx, mut rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
 
         // Spawn a reader for each probe, register in the registry.
         let mut stats_map: Vec<(String, Arc<ProbeStats>)> = Vec::new();
@@ -111,7 +115,7 @@ impl Runtime {
             cluster: self.cluster.clone(),
         });
 
-        // Spawn self-observability: periodically emit drops/errors as Occurrences.
+        // Spawn self-observability: periodically emit drops/errors as evidence.
         let stats_tx = tx.clone();
         let stats_cluster = self.cluster.clone();
         let stats_for_task = stats_map.clone();
@@ -130,42 +134,32 @@ impl Runtime {
         // Drop the original sender so the channel closes when all readers stop.
         drop(tx);
 
-        // Emit loop: batch events and send to all emitters.
-        let emitters = self.emitters;
+        // Sink loop: one EvidenceBatch per ring-buffer drain cycle.
+        let sink = self
+            .sink
+            .unwrap_or_else(|| Box::new(jalki_evidence::StdoutSink::new()));
         let metrics_clone = metrics.clone();
+        let producer_for_sink = producer.clone();
 
-        let emit_handle = tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(128);
-
-            loop {
-                match rx.recv().await {
-                    Some(occ) => batch.push(occ),
-                    None => break,
+        let sink_handle = tokio::spawn(async move {
+            while let Some(records) = rx.recv().await {
+                if records.is_empty() {
+                    continue;
                 }
 
-                while batch.len() < 128 {
-                    match rx.try_recv() {
-                        Ok(occ) => batch.push(occ),
-                        Err(_) => break,
-                    }
+                let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
+                if let Err(e) = sink.append_batch(batch).await {
+                    error!(sink = sink.name(), error = %e, "evidence sink append failed");
+                    metrics_clone
+                        .sink_errors
+                        .get_or_create(&SinkLabel {
+                            sink: sink.name().into(),
+                        })
+                        .inc();
                 }
-
-                for emitter in &emitters {
-                    if let Err(e) = emitter.emit(&batch).await {
-                        error!(emitter = emitter.name(), error = %e, "emit failed");
-                        metrics_clone
-                            .emit_errors
-                            .get_or_create(&EmitterLabel {
-                                emitter: emitter.name().into(),
-                            })
-                            .inc();
-                    }
-                }
-
-                batch.clear();
             }
 
-            info!("emit loop finished");
+            info!("sink loop finished");
         });
 
         // Spawn metrics server.
@@ -178,7 +172,7 @@ impl Runtime {
             })
         };
 
-        emit_handle.await?;
+        sink_handle.await?;
         Ok(())
     }
 }
@@ -194,7 +188,7 @@ pub struct DaemonHandle {
     pub registry: Arc<ProbeRegistry>,
     pub store: Arc<EventStore>,
     pub kb: Arc<KnowledgeBase>,
-    tx: mpsc::Sender<Occurrence>,
+    tx: mpsc::Sender<Vec<EvidenceRecord>>,
     pub cluster: String,
 }
 
@@ -203,11 +197,7 @@ impl DaemonHandle {
     ///
     /// Fast path: pre-compiled probes (tcp_connect, tcp_close, tcp_retransmit_skb).
     /// Slow path: codegen — generate BPF bytecode from BTF at runtime.
-    pub async fn deploy_probe(
-        &self,
-        function: &str,
-        _sample_rate: f64,
-    ) -> Result<String> {
+    pub async fn deploy_probe(&self, function: &str, _sample_rate: f64) -> Result<String> {
         // Fast path: pre-compiled probes.
         let pre_compiled: Option<Arc<dyn Probe>> = match function {
             "tcp_connect" => Some(Arc::new(TcpConnect::new())),
@@ -318,6 +308,17 @@ impl DaemonHandle {
     }
 }
 
+fn producer_metadata(cluster: &str) -> ProducerMetadata {
+    let node_id = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".into());
+    let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    ProducerMetadata::new(cluster, node_id, kernel_release)
+}
+
 /// Map knowledge base field names to BTF field paths.
 ///
 /// KB fields like "src_ip", "dst_port" are human-friendly.
@@ -370,7 +371,7 @@ fn map_kb_fields_to_btf(
 /// it will misdiagnose. These events close that gap.
 async fn emit_self_observability(
     stats_map: Vec<(String, Arc<ProbeStats>)>,
-    tx: mpsc::Sender<Occurrence>,
+    tx: mpsc::Sender<Vec<EvidenceRecord>>,
     cluster: &str,
 ) {
     let mut prev_dropped: Vec<u64> = vec![0; stats_map.len()];
@@ -394,7 +395,7 @@ async fn emit_self_observability(
                     .severity(Severity::Warning)
                     .in_cluster(cluster);
                 // Best-effort — if the channel is full, we can't do anything about it.
-                let _ = tx.try_send(occ);
+                let _ = tx.try_send(vec![self_observability_record(occ)]);
             }
 
             if new_errors > 0 {
@@ -402,12 +403,26 @@ async fn emit_self_observability(
                 let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
                     .severity(Severity::Warning)
                     .in_cluster(cluster);
-                let _ = tx.try_send(occ);
+                let _ = tx.try_send(vec![self_observability_record(occ)]);
             }
 
             prev_dropped[i] = dropped;
             prev_errors[i] = errors;
         }
+    }
+}
+
+fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
+    EvidenceRecord {
+        observed_at_ns: 0,
+        probe: ProbeMetadata {
+            probe_id: "jalki_self".into(),
+            probe_version: "1".into(),
+            probe_family: "agent".into(),
+            hook_kind: HookKind::Fentry,
+            kernel_function: "jalki_self_observability".into(),
+        },
+        occurrence,
     }
 }
 

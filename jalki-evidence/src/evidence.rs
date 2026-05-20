@@ -88,12 +88,14 @@ impl EvidenceRecord {
     /// and the observed time. Forwarding `record.occurrence` directly would drop
     /// all of it. Until the Ahti record kinds land, these ride in `labels`; the
     /// sink projection (a later slice) maps them onto envelope/payload fields.
-    /// `cluster` is omitted — it is already a first-class `Occurrence` field.
+    /// `cluster_id` is additive metadata; `Occurrence::cluster` remains the
+    /// first-class cluster field for existing consumers.
     pub fn into_occurrence_with_metadata(self, producer: &ProducerMetadata) -> Occurrence {
         let mut occ = self.occurrence;
         let labels = &mut occ.labels;
         labels.insert("producer".into(), producer.producer.clone());
         labels.insert("producer_version".into(), producer.producer_version.clone());
+        labels.insert("cluster_id".into(), producer.cluster.clone());
         labels.insert("node_id".into(), producer.node_id.clone());
         labels.insert("kernel_release".into(), producer.kernel_release.clone());
         labels.insert("probe_id".into(), self.probe.probe_id);
@@ -234,14 +236,17 @@ mod tests {
 
     #[test]
     fn projection_carries_full_d6_metadata() {
-        let batch =
-            EvidenceBatch::new(ProducerMetadata::new("prod", "node-1", "6.17.0"), vec![record(42)]);
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![record(42)],
+        );
         let occ = batch.into_occurrences().pop().unwrap();
         let get = |k: &str| occ.labels.get(k).map(String::as_str);
 
         // producer-constant fields, supplied by the batch
         assert_eq!(get("producer"), Some("jalki"));
         assert!(occ.labels.contains_key("producer_version"));
+        assert_eq!(get("cluster_id"), Some("prod"));
         assert_eq!(get("node_id"), Some("node-1"));
         assert_eq!(get("kernel_release"), Some("6.17.0"));
         // probe-constant fields, supplied by the record

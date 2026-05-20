@@ -1,5 +1,4 @@
-use false_protocol::Occurrence;
-use jalki_evidence::TcpRetransmitEvent;
+use jalki_evidence::{KernelEvent, TcpRetransmitEvent};
 
 use crate::probe::{Attachment, Probe, ProbeError};
 
@@ -34,10 +33,10 @@ impl Probe for TcpRetransmit {
         "TCP_RETRANSMIT_EVENTS"
     }
 
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
-        // Decode (raw -> typed) and normalize (typed -> Occurrence) both live in
-        // jalki-evidence; the probe only owns kernel attachment metadata.
-        Ok(TcpRetransmitEvent::from_bytes(raw)?.to_occurrence(cluster))
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        Ok(KernelEvent::TcpRetransmit(TcpRetransmitEvent::from_bytes(
+            raw,
+        )?))
     }
 }
 
@@ -76,18 +75,25 @@ mod tests {
     #[test]
     fn delegates_to_evidence_normalizer() {
         let occ = TcpRetransmit::new()
-            .to_occurrence(&raw_retransmit(1), "prod")
+            .to_evidence(&raw_retransmit(1), "prod")
             .unwrap();
+        let occ = occ.records.into_iter().next().unwrap().occurrence;
         assert_eq!(occ.source, "jalki/tcp_retransmit");
         assert_eq!(occ.occurrence_type.as_str(), "kernel.tcp.retransmit");
-        assert_eq!(occ.labels.get("tcp_state"), Some(&"ESTABLISHED".to_string()));
-        assert_eq!(occ.correlation_keys, vec!["172.16.0.1:12345->172.16.0.2:443"]);
+        assert_eq!(
+            occ.labels.get("tcp_state"),
+            Some(&"ESTABLISHED".to_string())
+        );
+        assert_eq!(
+            occ.correlation_keys,
+            vec!["172.16.0.1:12345->172.16.0.2:443"]
+        );
     }
 
     #[test]
     fn too_short_maps_to_probe_error() {
         let err = TcpRetransmit::new()
-            .to_occurrence(&[0u8; 8], "prod")
+            .to_evidence(&[0u8; 8], "prod")
             .unwrap_err();
         assert!(matches!(err, ProbeError::TooShort { .. }));
     }

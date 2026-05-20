@@ -2,29 +2,45 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use jalki_evidence::{CompositeSink, EvidenceSink, FileSink, StdoutSink};
 use tracing_subscriber::EnvFilter;
 
-use jalki::emit::{file::FileEmitter, grpc::GrpcEmitter, stdout::StdoutEmitter};
 use jalki::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
 use jalki::runtime::Runtime;
 
 mod cli;
 
 #[derive(Parser)]
-#[command(name = "jalki", about = "Programmable fentry/fexit framework for Linux")]
+#[command(
+    name = "jalki",
+    about = "Programmable fentry/fexit framework for Linux"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
     /// Path to the compiled eBPF object.
-    #[arg(long, env = "JALKI_EBPF_PATH",
+    #[arg(
+        long,
+        env = "JALKI_EBPF_PATH",
         default_value = "jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf",
-        global = true)]
+        global = true
+    )]
     ebpf_path: String,
 
-    /// Emit destination: "stdout", "grpc://<endpoint>", or a file path.
-    #[arg(long, env = "JALKI_EMIT", default_value = "stdout", global = true)]
-    emit: Vec<String>,
+    /// Primary evidence sink: "stdout", "file", or a file path.
+    #[arg(
+        long,
+        alias = "emit",
+        env = "JALKI_SINK",
+        default_value = "stdout",
+        global = true
+    )]
+    sink: String,
+
+    /// Additional best-effort evidence sink: "stdout", "file", or a file path.
+    #[arg(long, env = "JALKI_ALSO_SINK", global = true)]
+    also_sink: Vec<String>,
 
     /// Cluster name for FALSE Protocol Occurrences.
     #[arg(long, env = "JALKI_CLUSTER", global = true)]
@@ -142,15 +158,29 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         runtime = runtime.cluster(cluster);
     }
 
-    for dest in &cli.emit {
-        if dest == "stdout" {
-            runtime = runtime.emit_to(StdoutEmitter::new());
-        } else if let Some(endpoint) = dest.strip_prefix("grpc://") {
-            runtime = runtime.emit_to(GrpcEmitter::new(endpoint));
-        } else {
-            runtime = runtime.emit_to(FileEmitter::new(PathBuf::from(dest)));
-        }
-    }
+    let sink = build_sink(&cli.sink, &cli.also_sink);
+    runtime = runtime.sink_to(sink);
 
     runtime.run().await
+}
+
+fn build_sink(primary: &str, secondaries: &[String]) -> Box<dyn EvidenceSink> {
+    let primary = sink_from_spec(primary);
+    if secondaries.is_empty() {
+        primary
+    } else {
+        let secondaries = secondaries
+            .iter()
+            .map(|spec| sink_from_spec(spec))
+            .collect();
+        Box::new(CompositeSink::new(primary, secondaries))
+    }
+}
+
+fn sink_from_spec(spec: &str) -> Box<dyn EvidenceSink> {
+    match spec {
+        "stdout" => Box::new(StdoutSink::new()),
+        "file" => Box::new(FileSink::new(PathBuf::from("jalki-events.ndjson"))),
+        other => Box::new(FileSink::new(PathBuf::from(other))),
+    }
 }

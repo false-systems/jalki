@@ -782,7 +782,7 @@ fn encode_ask_result_kb_only(
     encode_ask_result(
         &interpretation,
         0,
-        "Start the daemon for live events: sudo jalki --emit stdout",
+        "Start the daemon for live events: sudo jalki --sink stdout",
         vec![],
         selected.iter().map(|p| p.function.clone()).collect(),
         true,

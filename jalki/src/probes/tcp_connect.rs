@@ -1,5 +1,4 @@
-use false_protocol::Occurrence;
-use jalki_evidence::TcpConnectEvent;
+use jalki_evidence::{KernelEvent, TcpConnectEvent};
 
 use crate::probe::{Attachment, Probe, ProbeError};
 
@@ -34,10 +33,8 @@ impl Probe for TcpConnect {
         "TCP_CONNECT_EVENTS"
     }
 
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
-        // Decode (raw -> typed) and normalize (typed -> Occurrence) both live in
-        // jalki-evidence; the probe only owns kernel attachment metadata.
-        Ok(TcpConnectEvent::from_bytes(raw)?.to_occurrence(cluster))
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        Ok(KernelEvent::TcpConnect(TcpConnectEvent::from_bytes(raw)?))
     }
 }
 
@@ -76,8 +73,9 @@ mod tests {
     #[test]
     fn delegates_to_evidence_normalizer() {
         let occ = TcpConnect::new()
-            .to_occurrence(&raw_connect(), "prod")
+            .to_evidence(&raw_connect(), "prod")
             .unwrap();
+        let occ = occ.records.into_iter().next().unwrap().occurrence;
         assert_eq!(occ.source, "jalki/tcp_connect");
         assert_eq!(occ.occurrence_type.as_str(), "kernel.tcp.connect");
         assert_eq!(occ.network_data.unwrap().dst_port, 8080);
@@ -85,7 +83,9 @@ mod tests {
 
     #[test]
     fn too_short_maps_to_probe_error() {
-        let err = TcpConnect::new().to_occurrence(&[0u8; 8], "prod").unwrap_err();
+        let err = TcpConnect::new()
+            .to_evidence(&[0u8; 8], "prod")
+            .unwrap_err();
         assert!(matches!(err, ProbeError::TooShort { .. }));
     }
 }

@@ -29,10 +29,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 prometheus-client = { workspace = true }
 clap = { workspace = true }
-tonic = { workspace = true }
-async-trait = { workspace = true }
 chrono = { workspace = true }
 ulid = { workspace = true }
 hostname = { workspace = true }
-bytes = "1"
 rmpv = { workspace = true }

@@ -1,5 +1,4 @@
 pub mod descriptor;
-pub mod emitter;
 pub mod filter;
 pub mod ipc;
 pub mod knowledge;
@@ -11,12 +10,6 @@ pub mod registry;
 pub mod runtime;
 pub mod store;
 
-pub mod emit {
-    pub mod file;
-    pub mod grpc;
-    pub mod stdout;
-}
-
 pub mod probes {
     pub mod generated;
     pub mod tcp_close;
@@ -25,7 +18,6 @@ pub mod probes {
 }
 
 pub use descriptor::ProbeDescriptor;
-pub use emitter::Emitter;
 pub use knowledge::KnowledgeBase;
 pub use probe::{Attachment, Probe};
 pub use registry::ProbeRegistry;

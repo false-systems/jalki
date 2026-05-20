@@ -37,7 +37,7 @@ pub async fn run() -> Result<()> {
         Err(e) => {
             eprintln!(
                 "Cannot connect to jalki daemon: {e}\n\
-                 Start the daemon first: sudo jalki --emit stdout"
+                 Start the daemon first: sudo jalki --sink stdout"
             );
         }
     }

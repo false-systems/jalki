@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use aya::programs::{FEntry, FExit};
 use aya::{Btf, Ebpf};
 use chrono::{DateTime, Utc};
-use false_protocol::Occurrence;
+use jalki_evidence::EvidenceRecord;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -73,10 +73,12 @@ impl ProbeRegistry {
         ebpf: &mut Ebpf,
         btf: &Btf,
         cluster: &str,
-        tx: mpsc::Sender<Occurrence>,
+        tx: mpsc::Sender<Vec<EvidenceRecord>>,
         store: &Arc<EventStore>,
     ) -> Result<ProbeId> {
-        let function = probe.attachments().first()
+        let function = probe
+            .attachments()
+            .first()
             .map(|a| match a {
                 Attachment::Fentry { function } | Attachment::Fexit { function } => *function,
             })
@@ -146,7 +148,10 @@ impl ProbeRegistry {
             stats,
         };
 
-        self.attached.write().unwrap().insert(probe_id.clone(), entry);
+        self.attached
+            .write()
+            .unwrap()
+            .insert(probe_id.clone(), entry);
         Ok(ProbeId(probe_id))
     }
 
@@ -161,7 +166,10 @@ impl ProbeRegistry {
             stats,
         };
 
-        self.attached.write().unwrap().insert(probe_id.clone(), entry);
+        self.attached
+            .write()
+            .unwrap()
+            .insert(probe_id.clone(), entry);
         ProbeId(probe_id)
     }
 
@@ -170,7 +178,9 @@ impl ProbeRegistry {
         let attached = self.attached.read().unwrap();
         attached.values().any(|a| {
             a.probe.attachments().iter().any(|att| match att {
-                Attachment::Fentry { function: f } | Attachment::Fexit { function: f } => *f == function,
+                Attachment::Fentry { function: f } | Attachment::Fexit { function: f } => {
+                    *f == function
+                }
             })
         })
     }
@@ -181,9 +191,14 @@ impl ProbeRegistry {
         attached
             .iter()
             .map(|(id, entry)| {
-                let function = entry.probe.attachments().first()
+                let function = entry
+                    .probe
+                    .attachments()
+                    .first()
                     .map(|a| match a {
-                        Attachment::Fentry { function } | Attachment::Fexit { function } => function.to_string(),
+                        Attachment::Fentry { function } | Attachment::Fexit { function } => {
+                            function.to_string()
+                        }
                     })
                     .unwrap_or_default();
 

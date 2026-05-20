@@ -56,7 +56,7 @@ cargo run -p jalki-sdk-meta -- --lang python --out jalki-sdk-python/src/jalki/
 # Run daemon (requires root or CAP_BPF + CAP_PERFMON)
 sudo RUST_LOG=jalki=debug ./target/debug/jalki \
     --ebpf-path jalki-ebpf/target/bpfel-unknown-none/debug/jalki-ebpf \
-    --emit stdout
+    --sink stdout
 ```
 
 ### macOS Development
@@ -113,7 +113,7 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
   - `stream [function]` — live ndjson event stream
   - `list [--layer tcp]` — browse the knowledge base
   - `status` — show attached probes, event counts, drops
-- Key types: `Probe` trait, `Emitter` trait, `Runtime` (builder API), `DaemonHandle` (shared state), `Loader`, `Reader`, `KnowledgeBase`, `ProbeRegistry`, `EventStore`
+- Key types: `Probe` trait, `EvidenceSink` trait (in `jalki-evidence`), `Runtime` (builder API), `DaemonHandle` (shared state), `Loader`, `Reader`, `KnowledgeBase`, `ProbeRegistry`, `EventStore`
 - IPC: Unix socket at `/run/jalki/jalki.sock`. **Binary frame protocol**: `[frame_len: u32 BE][msg_type: u8][flags: u8][msgpack payload]`, `frame_len = payload.len() + 2`. Encoded via `rmpv`. Wire constants live in `jalki-sdk-meta/src/protocol.rs` — single source of truth, do not hardcode message-type bytes elsewhere. `ipc::call()` is the client used by CLI and MCP.
 
 ### jalki-codegen
@@ -178,9 +178,9 @@ pub trait Probe: Send + Sync + 'static {
 }
 
 #[async_trait]
-pub trait Emitter: Send + Sync {
+pub trait EvidenceSink: Send + Sync {
     fn name(&self) -> &str;
-    async fn emit(&self, occurrences: &[Occurrence]) -> Result<(), EmitError>;
+    async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError>;
     async fn health(&self) -> HealthStatus;
 }
 ```

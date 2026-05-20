@@ -1,5 +1,4 @@
-use false_protocol::Occurrence;
-use jalki_evidence::TcpCloseEvent;
+use jalki_evidence::{KernelEvent, TcpCloseEvent};
 
 use crate::probe::{Attachment, Probe, ProbeError};
 
@@ -34,10 +33,8 @@ impl Probe for TcpClose {
         "TCP_CLOSE_EVENTS"
     }
 
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
-        // Decode (raw -> typed) and normalize (typed -> Occurrence) both live in
-        // jalki-evidence; the probe only owns kernel attachment metadata.
-        Ok(TcpCloseEvent::from_bytes(raw)?.to_occurrence(cluster))
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        Ok(KernelEvent::TcpClose(TcpCloseEvent::from_bytes(raw)?))
     }
 }
 
@@ -78,8 +75,9 @@ mod tests {
     #[test]
     fn delegates_to_evidence_normalizer() {
         let occ = TcpClose::new()
-            .to_occurrence(&raw_close(5_000_000), "prod")
+            .to_evidence(&raw_close(5_000_000), "prod")
             .unwrap();
+        let occ = occ.records.into_iter().next().unwrap().occurrence;
         assert_eq!(occ.source, "jalki/tcp_close");
         assert_eq!(occ.occurrence_type.as_str(), "kernel.tcp.close");
         assert_eq!(occ.network_data.unwrap().bytes_sent, Some(1024));
@@ -88,7 +86,7 @@ mod tests {
 
     #[test]
     fn too_short_maps_to_probe_error() {
-        let err = TcpClose::new().to_occurrence(&[0u8; 4], "prod").unwrap_err();
+        let err = TcpClose::new().to_evidence(&[0u8; 4], "prod").unwrap_err();
         assert!(matches!(err, ProbeError::TooShort { .. }));
     }
 }

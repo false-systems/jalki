@@ -1,4 +1,4 @@
-use false_protocol::Occurrence;
+use jalki_evidence::{HookKind, KernelEvent, NormalizedEvidence, ProbeMetadata};
 use thiserror::Error;
 
 /// Error from probe event conversion.
@@ -29,6 +29,21 @@ pub enum Attachment {
     Fexit { function: &'static str },
 }
 
+impl Attachment {
+    pub fn hook_kind(&self) -> HookKind {
+        match self {
+            Attachment::Fentry { .. } => HookKind::Fentry,
+            Attachment::Fexit { .. } => HookKind::Fexit,
+        }
+    }
+
+    pub fn function(&self) -> &'static str {
+        match self {
+            Attachment::Fentry { function } | Attachment::Fexit { function } => function,
+        }
+    }
+}
+
 /// A kernel probe that converts raw ring buffer events to FALSE Protocol Occurrences.
 ///
 /// This is the core abstraction. Implement this trait to observe any kernel function.
@@ -52,8 +67,44 @@ pub trait Probe: Send + Sync + 'static {
     /// Must match the `#[map]` name in the eBPF program.
     fn ring_buffer_map(&self) -> &str;
 
-    /// Convert raw ring buffer bytes to a FALSE Protocol Occurrence.
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError>;
+    /// Probe version carried in emitted evidence metadata.
+    fn probe_version(&self) -> &str {
+        "1"
+    }
+
+    /// Probe family carried in emitted evidence metadata.
+    fn family(&self) -> &str {
+        match self.name().split('_').next() {
+            Some(family) if !family.is_empty() => family,
+            _ => self.name(),
+        }
+    }
+
+    /// Decode raw ring buffer bytes to a typed kernel event.
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError>;
+
+    /// Metadata constant for records produced by this probe.
+    fn probe_metadata(&self) -> ProbeMetadata {
+        let attachment = self.attachments().first();
+        ProbeMetadata {
+            probe_id: self.name().into(),
+            probe_version: self.probe_version().into(),
+            probe_family: self.family().into(),
+            hook_kind: attachment
+                .map(Attachment::hook_kind)
+                .unwrap_or(HookKind::Fentry),
+            kernel_function: attachment
+                .map(Attachment::function)
+                .unwrap_or("unknown")
+                .into(),
+        }
+    }
+
+    /// Convert raw ring buffer bytes to normalized evidence records.
+    fn to_evidence(&self, raw: &[u8], cluster: &str) -> Result<NormalizedEvidence, ProbeError> {
+        let event = self.decode_event(raw)?;
+        Ok(event.normalize(self.probe_metadata(), cluster))
+    }
 
     /// Sampling rate: 1.0 = all events, 0.1 = 10%.
     /// Applied in the reader — events below the threshold are dropped before
