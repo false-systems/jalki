@@ -28,7 +28,7 @@ pub async fn run(function: Option<&str>) -> Result<()> {
             Err(e) => {
                 anyhow::bail!(
                     "Cannot connect to jalki daemon: {e}\n\
-                     Start the daemon first: sudo jalki --emit stdout"
+                     Start the daemon first: sudo jalki --sink stdout"
                 );
             }
         }

@@ -10,6 +10,7 @@
 pub mod event;
 pub mod evidence;
 pub mod normalize;
+pub mod sink;
 
 pub use event::{
     DecodeError, KernelEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent, TcpState,
@@ -18,3 +19,7 @@ pub use evidence::{
     EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata, ProducerMetadata,
 };
 pub use normalize::errno_name;
+pub use sink::{
+    AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, SinkError,
+    StdoutSink,
+};

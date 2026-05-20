@@ -39,7 +39,7 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
 
     if !daemon_available {
         eprintln!("No daemon running — showing knowledge base analysis only.");
-        eprintln!("For live events, start the daemon: sudo jalki --emit stdout");
+        eprintln!("For live events, start the daemon: sudo jalki --sink stdout");
         println!();
         return print_kb_answer(question, &selected, &kb);
     }
@@ -240,7 +240,7 @@ fn print_kb_answer(
 
     println!("## To collect live events");
     println!();
-    println!("  sudo jalki --emit stdout    # terminal 1");
+    println!("  sudo jalki --sink stdout    # terminal 1");
     println!("  jalki ask \"{}\"              # terminal 2", question);
     println!();
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use aya::maps::{MapData, RingBuf};
 use aya::Ebpf;
-use false_protocol::Occurrence;
+use jalki_evidence::EvidenceRecord;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -30,15 +30,15 @@ impl ProbeStats {
     }
 }
 
-/// Drain a ring buffer and convert events to Occurrences.
+/// Drain a ring buffer and convert events to evidence records.
 ///
 /// Runs as a blocking task (ring buffer polling is synchronous in aya).
-/// Sends converted Occurrences through an mpsc channel to the emit task.
+/// Sends one batch per ring-buffer drain cycle through an mpsc channel.
 pub fn spawn_reader(
     ebpf: &mut Ebpf,
     probe: Arc<dyn Probe>,
     cluster: String,
-    tx: mpsc::Sender<Occurrence>,
+    tx: mpsc::Sender<Vec<EvidenceRecord>>,
     stats: Arc<ProbeStats>,
     store: Arc<EventStore>,
 ) -> Result<()> {
@@ -64,7 +64,7 @@ fn drain_loop(
     mut ring_buf: RingBuf<aya::maps::MapData>,
     probe: Arc<dyn Probe>,
     cluster: &str,
-    tx: mpsc::Sender<Occurrence>,
+    tx: mpsc::Sender<Vec<EvidenceRecord>>,
     stats: Arc<ProbeStats>,
     probe_name: &str,
     store: Arc<EventStore>,
@@ -81,6 +81,8 @@ fn drain_loop(
     let mut counter: u64 = 0;
 
     loop {
+        let mut records = Vec::new();
+
         while let Some(item) = ring_buf.next() {
             // Apply sampling before parsing — skip the conversion cost too.
             if do_sampling {
@@ -93,20 +95,24 @@ fn drain_loop(
 
             let raw = item.as_ref();
 
-            match probe.to_occurrence(raw, cluster) {
-                Ok(occ) => {
-                    store.push(probe_name, occ.clone());
-                    if tx.blocking_send(occ).is_err() {
-                        debug!(probe = probe_name, "emit channel closed, stopping reader");
-                        return;
+            match probe.to_evidence(raw, cluster) {
+                Ok(evidence) => {
+                    for record in evidence.records {
+                        store.push(probe_name, record.occurrence.clone());
+                        stats.events_emitted.fetch_add(1, Ordering::Relaxed);
+                        records.push(record);
                     }
-                    stats.events_emitted.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
                     stats.parse_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(probe = probe_name, error = %e, "failed to parse event");
                 }
             }
+        }
+
+        if !records.is_empty() && tx.blocking_send(records).is_err() {
+            debug!(probe = probe_name, "sink channel closed, stopping reader");
+            return;
         }
 
         // No events available — sleep briefly before polling again.

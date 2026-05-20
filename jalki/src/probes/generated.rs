@@ -3,6 +3,7 @@ use std::net::Ipv4Addr;
 use false_protocol::{NetworkEventData, Occurrence, ProcessEventData, Severity};
 use jalki_codegen::btf::FieldType;
 use jalki_codegen::program::{AttachType, FieldLayout, ProbeSpec};
+use jalki_evidence::{EvidenceRecord, KernelEvent, NormalizedEvidence};
 
 use crate::probe::{Attachment, Probe, ProbeError};
 
@@ -62,7 +63,12 @@ impl GeneratedProbeReader {
 
     fn read_u32(raw: &[u8], offset: usize) -> u32 {
         if offset + 4 <= raw.len() {
-            u32::from_le_bytes([raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3]])
+            u32::from_le_bytes([
+                raw[offset],
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+            ])
         } else {
             0
         }
@@ -70,7 +76,12 @@ impl GeneratedProbeReader {
 
     fn read_i32(raw: &[u8], offset: usize) -> i32 {
         if offset + 4 <= raw.len() {
-            i32::from_le_bytes([raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3]])
+            i32::from_le_bytes([
+                raw[offset],
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+            ])
         } else {
             0
         }
@@ -79,8 +90,14 @@ impl GeneratedProbeReader {
     fn read_u64(raw: &[u8], offset: usize) -> u64 {
         if offset + 8 <= raw.len() {
             u64::from_le_bytes([
-                raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
-                raw[offset + 4], raw[offset + 5], raw[offset + 6], raw[offset + 7],
+                raw[offset],
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+                raw[offset + 4],
+                raw[offset + 5],
+                raw[offset + 6],
+                raw[offset + 7],
             ])
         } else {
             0
@@ -115,7 +132,13 @@ impl Probe for GeneratedProbeReader {
         &self.map_name
     }
 
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
+    fn decode_event(&self, _raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        Err(ProbeError::InvalidData(
+            "generated probes produce normalized evidence directly".into(),
+        ))
+    }
+
+    fn to_evidence(&self, raw: &[u8], cluster: &str) -> Result<NormalizedEvidence, ProbeError> {
         if raw.len() < self.event_size {
             return Err(ProbeError::TooShort {
                 expected: self.event_size,
@@ -124,6 +147,7 @@ impl Probe for GeneratedProbeReader {
         }
 
         // Header is always: timestamp_ns(u64), pid(u32), tid(u32)
+        let observed_at_ns = Self::read_u64(raw, 0);
         let pid = Self::read_u32(raw, 8);
         let source = format!("jalki/{}", self.spec.function);
 
@@ -201,8 +225,16 @@ impl Probe for GeneratedProbeReader {
             });
 
             // Correlation key.
-            let s_ip = occ.network_data.as_ref().map(|n| n.src_ip.as_str()).unwrap_or("?");
-            let d_ip = occ.network_data.as_ref().map(|n| n.dst_ip.as_str()).unwrap_or("?");
+            let s_ip = occ
+                .network_data
+                .as_ref()
+                .map(|n| n.src_ip.as_str())
+                .unwrap_or("?");
+            let d_ip = occ
+                .network_data
+                .as_ref()
+                .map(|n| n.dst_ip.as_str())
+                .unwrap_or("?");
             let s_port = src_port.unwrap_or(0);
             let d_port = dst_port.unwrap_or(0);
             occ.correlation_keys = vec![format!("{s_ip}:{s_port}->{d_ip}:{d_port}")];
@@ -230,6 +262,10 @@ impl Probe for GeneratedProbeReader {
             }
         }
 
-        Ok(occ)
+        Ok(NormalizedEvidence::single(EvidenceRecord {
+            observed_at_ns,
+            probe: self.probe_metadata(),
+            occurrence: occ,
+        }))
     }
 }
