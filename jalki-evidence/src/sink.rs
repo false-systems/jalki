@@ -139,6 +139,7 @@ impl StdoutSink {
         Self
     }
 
+    #[doc(hidden)]
     pub fn encode_batch_for_test(batch: EvidenceBatch) -> Result<Vec<u8>, SinkError> {
         encode_ndjson(batch, "stdout").map(|(bytes, _)| bytes)
     }
@@ -258,6 +259,12 @@ impl EvidenceSink for CompositeSink {
     }
 
     async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
+        if self.secondaries.is_empty() {
+            let mut result = self.primary.append_batch(batch).await?;
+            result.sink_name = self.name().into();
+            return Ok(result);
+        }
+
         let mut result = self.primary.append_batch(batch.clone()).await?;
         result.sink_name = self.name().into();
 

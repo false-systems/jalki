@@ -98,6 +98,9 @@ fn drain_loop(
             match probe.to_evidence(raw, cluster) {
                 Ok(evidence) => {
                     for record in evidence.records {
+                        // The local debug store keeps the lean occurrence shape used by
+                        // IPC stream/watch. Durable sinks project D6 metadata later via
+                        // EvidenceBatch::into_occurrences().
                         store.push(probe_name, record.occurrence.clone());
                         stats.events_emitted.fetch_add(1, Ordering::Relaxed);
                         records.push(record);
