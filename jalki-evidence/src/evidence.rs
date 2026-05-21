@@ -89,7 +89,11 @@ impl EvidenceRecord {
     /// all of it. Until the Ahti record kinds land, these ride in `labels`; the
     /// sink projection (a later slice) maps them onto envelope/payload fields.
     /// `cluster_id` is additive metadata; `Occurrence::cluster` remains the
-    /// first-class cluster field for existing consumers.
+    /// first-class cluster field for existing consumers. The two come from
+    /// different sources — `cluster_id` from `ProducerMetadata` (the agent's
+    /// cluster identity), `Occurrence::cluster` from the normalize-time cluster
+    /// argument — so callers MUST source both from the same value (the daemon
+    /// uses `Runtime.cluster` for both) to avoid divergence.
     pub fn into_occurrence_with_metadata(self, producer: &ProducerMetadata) -> Occurrence {
         let mut occ = self.occurrence;
         let labels = &mut occ.labels;
