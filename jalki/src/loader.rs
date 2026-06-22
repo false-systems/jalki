@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use aya::programs::{FEntry, FExit};
+use aya::programs::{FEntry, FExit, TracePoint};
 use aya::{Btf, Ebpf};
 use tracing::{info, warn};
 
@@ -44,6 +44,10 @@ pub fn load_and_attach(ebpf_path: &Path, probes: &[Arc<dyn Probe>]) -> Result<Eb
                     attach_fexit(&mut ebpf, prog_name, function, &btf)
                         .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
                 }
+                Attachment::Tracepoint { category, name } => {
+                    attach_tracepoint(&mut ebpf, prog_name, category, name)
+                        .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
+                }
             }
             attached += 1;
         }
@@ -78,5 +82,19 @@ fn attach_fexit(ebpf: &mut Ebpf, prog_name: &str, fn_name: &str, btf: &Btf) -> R
     prog.attach()
         .with_context(|| format!("failed to attach fexit/{fn_name}"))?;
     info!("attached fexit/{fn_name}");
+    Ok(())
+}
+
+fn attach_tracepoint(ebpf: &mut Ebpf, prog_name: &str, category: &str, name: &str) -> Result<()> {
+    let prog: &mut TracePoint = ebpf
+        .program_mut(prog_name)
+        .ok_or_else(|| anyhow::anyhow!("program {prog_name} not found in eBPF object"))?
+        .try_into()
+        .context("program is not a tracepoint")?;
+    prog.load()
+        .with_context(|| format!("failed to load tracepoint/{category}/{name}"))?;
+    prog.attach(category, name)
+        .with_context(|| format!("failed to attach tracepoint/{category}/{name}"))?;
+    info!("attached tracepoint/{category}/{name}");
     Ok(())
 }

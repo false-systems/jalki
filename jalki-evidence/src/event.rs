@@ -10,8 +10,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use jalki_common::{
-    TcpCloseEvent as RawTcpClose, TcpConnectEvent as RawTcpConnect,
-    TcpRetransmitEvent as RawTcpRetransmit, AF_INET6,
+    ProcessExecEvent as RawProcessExec, TcpCloseEvent as RawTcpClose,
+    TcpConnectEvent as RawTcpConnect, TcpRetransmitEvent as RawTcpRetransmit, AF_INET6,
 };
 use thiserror::Error;
 
@@ -35,6 +35,7 @@ pub enum DecodeError {
 /// Protocol `Occurrence`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelEvent {
+    ProcessExec(ProcessExecEvent),
     TcpConnect(TcpConnectEvent),
     TcpClose(TcpCloseEvent),
     TcpRetransmit(TcpRetransmitEvent),
@@ -44,10 +45,67 @@ impl KernelEvent {
     /// The kernel's monotonic observation time, in nanoseconds.
     pub fn observed_at_ns(&self) -> u64 {
         match self {
+            KernelEvent::ProcessExec(e) => e.observed_at_ns,
             KernelEvent::TcpConnect(e) => e.observed_at_ns,
             KernelEvent::TcpClose(e) => e.observed_at_ns,
             KernelEvent::TcpRetransmit(e) => e.observed_at_ns,
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        match self {
+            KernelEvent::ProcessExec(e) => e.pid,
+            KernelEvent::TcpConnect(e) => e.pid,
+            KernelEvent::TcpClose(e) => e.pid,
+            KernelEvent::TcpRetransmit(e) => e.pid,
+        }
+    }
+
+    pub fn cgroup_id(&self) -> u64 {
+        match self {
+            KernelEvent::ProcessExec(e) => e.cgroup_id,
+            KernelEvent::TcpConnect(e) => e.cgroup_id,
+            KernelEvent::TcpClose(e) => e.cgroup_id,
+            KernelEvent::TcpRetransmit(e) => e.cgroup_id,
+        }
+    }
+}
+
+/// A successful process exec observed via sched_process_exec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessExecEvent {
+    pub observed_at_ns: u64,
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cgroup_id: u64,
+    pub ret: i32,
+    pub comm: String,
+    pub filename: String,
+    pub argv_hash: [u8; 32],
+}
+
+impl ProcessExecEvent {
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, DecodeError> {
+        let raw = read_raw::<RawProcessExec>(raw)?;
+        Ok(Self {
+            observed_at_ns: raw.timestamp_ns,
+            pid: raw.pid,
+            ppid: raw.ppid,
+            uid: raw.uid,
+            gid: raw.gid,
+            cgroup_id: raw.cgroup_id,
+            ret: raw.ret,
+            comm: raw.comm_str().to_string(),
+            filename: raw.filename_str().to_string(),
+            argv_hash: raw.argv_hash,
+        })
+    }
+
+    /// Whether exec completed successfully (kernel returned 0).
+    pub fn succeeded(&self) -> bool {
+        self.ret == 0
     }
 }
 
@@ -120,6 +178,7 @@ pub struct TcpConnectEvent {
     pub addr_family: u16,
     /// Kernel return value: 0 on success, negative errno on failure.
     pub ret: i32,
+    pub cgroup_id: u64,
     pub comm: String,
     pub netns: u32,
 }
@@ -137,6 +196,7 @@ impl TcpConnectEvent {
             dst_port: u16::from_be(raw.dst_port),
             addr_family: raw.addr_family,
             ret: raw.ret,
+            cgroup_id: raw.cgroup_id,
             comm: raw.comm_str().to_string(),
             netns: raw.netns,
         })
@@ -162,6 +222,7 @@ pub struct TcpCloseEvent {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub duration_ns: u64,
+    pub cgroup_id: u64,
     pub comm: String,
     pub netns: u32,
 }
@@ -181,6 +242,7 @@ impl TcpCloseEvent {
             bytes_sent: raw.bytes_sent,
             bytes_received: raw.bytes_received,
             duration_ns: raw.duration_ns,
+            cgroup_id: raw.cgroup_id,
             comm: raw.comm_str().to_string(),
             netns: raw.netns,
         })
@@ -199,6 +261,7 @@ pub struct TcpRetransmitEvent {
     pub dst_port: u16,
     pub addr_family: u16,
     pub state: TcpState,
+    pub cgroup_id: u64,
     pub comm: String,
     pub netns: u32,
 }
@@ -216,6 +279,7 @@ impl TcpRetransmitEvent {
             dst_port: u16::from_be(raw.dst_port),
             addr_family: raw.addr_family,
             state: TcpState::from_u8(raw.state),
+            cgroup_id: raw.cgroup_id,
             comm: raw.comm_str().to_string(),
             netns: raw.netns,
         })
@@ -257,7 +321,10 @@ fn ip_from(raw: &[u8; 16], family: u16) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jalki_common::{TcpCloseEvent as RawClose, TcpConnectEvent as RawConnect, TcpRetransmitEvent as RawRetransmit};
+    use jalki_common::{
+        ProcessExecEvent as RawExec, TcpCloseEvent as RawClose, TcpConnectEvent as RawConnect,
+        TcpRetransmitEvent as RawRetransmit,
+    };
 
     fn raw_bytes<T: Copy>(value: &T) -> Vec<u8> {
         let ptr = value as *const T as *const u8;
@@ -278,6 +345,40 @@ mod tests {
         out
     }
 
+    fn filename(s: &str) -> [u8; jalki_common::PROCESS_EXEC_FILENAME_LEN] {
+        let mut out = [0u8; jalki_common::PROCESS_EXEC_FILENAME_LEN];
+        let b = s.as_bytes();
+        let len = b.len().min(out.len());
+        out[..len].copy_from_slice(&b[..len]);
+        out
+    }
+
+    #[test]
+    fn decode_process_exec_preserves_hash_not_argv() {
+        let raw = RawExec {
+            timestamp_ns: 4,
+            pid: 42,
+            ppid: 7,
+            uid: 1000,
+            gid: 1000,
+            cgroup_id: 99,
+            ret: 0,
+            _pad1: 0,
+            comm: comm16("true"),
+            filename: filename("/bin/true"),
+            argv_hash: [0xabu8; 32],
+        };
+        let ev = ProcessExecEvent::from_bytes(&raw_bytes(&raw)).unwrap();
+        assert_eq!(ev.pid, 42);
+        assert_eq!(ev.ppid, 7);
+        assert_eq!(ev.uid, 1000);
+        assert_eq!(ev.gid, 1000);
+        assert_eq!(ev.cgroup_id, 99);
+        assert_eq!(ev.filename, "/bin/true");
+        assert_eq!(ev.argv_hash, [0xabu8; 32]);
+        assert!(ev.succeeded());
+    }
+
     #[test]
     fn decode_connect_parses_4tuple_and_byteorder() {
         let raw = RawConnect {
@@ -291,6 +392,7 @@ mod tests {
             addr_family: 2,
             _pad1: 0,
             ret: 0,
+            cgroup_id: 42,
             comm: comm16("nginx"),
             netns: 0,
             _pad2: 0,
@@ -302,6 +404,7 @@ mod tests {
         // src_port host-order, dst_port byte-swapped from network order.
         assert_eq!(ev.src_port, 54321);
         assert_eq!(ev.dst_port, 8080);
+        assert_eq!(ev.cgroup_id, 42);
         assert_eq!(ev.comm, "nginx");
         assert!(ev.succeeded());
     }
@@ -319,6 +422,7 @@ mod tests {
             addr_family: 2,
             _pad1: 0,
             ret: -111,
+            cgroup_id: 0,
             comm: comm16("curl"),
             netns: 0,
             _pad2: 0,
@@ -343,6 +447,7 @@ mod tests {
             bytes_sent: 1024,
             bytes_received: 2048,
             duration_ns: 5_000_000,
+            cgroup_id: 43,
             comm: comm16("nginx"),
             netns: 0,
             _pad2: 0,
@@ -351,6 +456,7 @@ mod tests {
         assert_eq!(ev.bytes_sent, 1024);
         assert_eq!(ev.bytes_received, 2048);
         assert_eq!(ev.duration_ns, 5_000_000);
+        assert_eq!(ev.cgroup_id, 43);
     }
 
     #[test]
@@ -366,13 +472,16 @@ mod tests {
             addr_family: 2,
             state: 1,
             _pad1: 0,
+            _pad2: 0,
+            cgroup_id: 44,
             comm: comm16("app"),
             netns: 0,
-            _pad2: 0,
+            _pad3: 0,
         };
         let ev = TcpRetransmitEvent::from_bytes(&raw_bytes(&raw)).unwrap();
         assert_eq!(ev.state, TcpState::Established);
         assert_eq!(ev.state.as_str(), "ESTABLISHED");
+        assert_eq!(ev.cgroup_id, 44);
     }
 
     #[test]
@@ -404,6 +513,7 @@ mod tests {
             addr_family: AF_INET6,
             _pad1: 0,
             ret: 0,
+            cgroup_id: 0,
             comm: comm16("app"),
             netns: 0,
             _pad2: 0,

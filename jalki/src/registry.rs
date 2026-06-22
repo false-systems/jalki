@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
-use aya::programs::{FEntry, FExit};
+use aya::programs::{FEntry, FExit, TracePoint};
 use aya::{Btf, Ebpf};
 use chrono::{DateTime, Utc};
 use jalki_evidence::EvidenceRecord;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::enrich::RuntimeEnricher;
 use crate::probe::{Attachment, Probe};
 use crate::reader::{self, ProbeStats};
 use crate::store::EventStore;
@@ -75,12 +76,14 @@ impl ProbeRegistry {
         cluster: &str,
         tx: mpsc::Sender<Vec<EvidenceRecord>>,
         store: &Arc<EventStore>,
+        enricher: Arc<dyn RuntimeEnricher>,
     ) -> Result<ProbeId> {
         let function = probe
             .attachments()
             .first()
             .map(|a| match a {
                 Attachment::Fentry { function } | Attachment::Fexit { function } => *function,
+                Attachment::Tracepoint { name, .. } => *name,
             })
             .unwrap_or("unknown");
 
@@ -118,6 +121,18 @@ impl ProbeRegistry {
                     prog.attach()
                         .with_context(|| format!("failed to attach fexit/{function}"))?;
                 }
+                Attachment::Tracepoint { category, name } => {
+                    let prog: &mut TracePoint = ebpf
+                        .program_mut(prog_name)
+                        .ok_or_else(|| anyhow::anyhow!("program {prog_name} not found"))?
+                        .try_into()
+                        .context("not a tracepoint")?;
+                    prog.load()
+                        .with_context(|| format!("failed to load tracepoint/{category}/{name}"))?;
+                    prog.attach(category, name).with_context(|| {
+                        format!("failed to attach tracepoint/{category}/{name}")
+                    })?;
+                }
             }
         }
 
@@ -130,6 +145,7 @@ impl ProbeRegistry {
             tx,
             stats.clone(),
             store.clone(),
+            enricher,
         )?;
 
         let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -181,6 +197,7 @@ impl ProbeRegistry {
                 Attachment::Fentry { function: f } | Attachment::Fexit { function: f } => {
                     *f == function
                 }
+                Attachment::Tracepoint { name, .. } => *name == function,
             })
         })
     }
@@ -199,6 +216,7 @@ impl ProbeRegistry {
                         Attachment::Fentry { function } | Attachment::Fexit { function } => {
                             function.to_string()
                         }
+                        Attachment::Tracepoint { name, .. } => name.to_string(),
                     })
                     .unwrap_or_default();
 

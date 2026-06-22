@@ -4,6 +4,7 @@ members = [
     "false-protocol",
     "jalki-common",
     "jalki-evidence",
+    "jalki-enrich",
     "jalki",
     "jalki-codegen",
     "jalki-mcp",

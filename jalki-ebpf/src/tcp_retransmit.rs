@@ -1,4 +1,6 @@
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel};
+use aya_ebpf::helpers::{
+    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+};
 use aya_ebpf::programs::FEntryContext;
 
 use jalki_common::TcpRetransmitEvent;
@@ -34,10 +36,10 @@ fn try_handle(ctx: &FEntryContext) -> Result<(), i64> {
     // Read address family + src/dst addresses (IPv4 or IPv6).
     let (addr_family, src_addr, dst_addr) = crate::read_addrs(sk);
 
-    let dst_port: u16 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }.map_err(|e| e as i64)?;
-    let src_port: u16 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }.map_err(|e| e as i64)?;
+    let dst_port: u16 = unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }
+        .map_err(|e| e as i64)?;
+    let src_port: u16 = unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }
+        .map_err(|e| e as i64)?;
 
     // TCP state: __sk_common.skc_state (offset 18, u8).
     let state: u8 =
@@ -58,9 +60,13 @@ fn try_handle(ctx: &FEntryContext) -> Result<(), i64> {
         addr_family,
         state,
         _pad1: 0,
+        _pad2: 0,
+        // SAFETY: helper reads the current task's cgroup id and does not
+        // dereference program-provided pointers.
+        cgroup_id: unsafe { bpf_get_current_cgroup_id() },
         comm,
         netns,
-        _pad2: 0,
+        _pad3: 0,
     };
 
     let _ = TCP_RETRANSMIT_EVENTS.output(&event, 0);

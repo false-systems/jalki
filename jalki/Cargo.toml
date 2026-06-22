@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 jalki-common = { workspace = true }
 jalki-evidence = { path = "../jalki-evidence" }
+jalki-enrich = { path = "../jalki-enrich" }
 jalki-codegen = { path = "../jalki-codegen" }
 false-protocol = { workspace = true }
 aya = { workspace = true }
@@ -33,3 +34,6 @@ chrono = { workspace = true }
 ulid = { workspace = true }
 hostname = { workspace = true }
 rmpv = { workspace = true }
+kube = { version = "4.0.0", default-features = false, features = ["runtime", "client", "rustls-tls"] }
+k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
+futures = "0.3.32"

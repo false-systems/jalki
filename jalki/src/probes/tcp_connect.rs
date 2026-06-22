@@ -62,6 +62,7 @@ mod tests {
             addr_family: 2,
             _pad1: 0,
             ret: 0,
+            cgroup_id: 0,
             comm,
             netns: 0,
             _pad2: 0,

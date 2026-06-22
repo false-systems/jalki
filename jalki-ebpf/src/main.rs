@@ -1,14 +1,16 @@
 #![no_std]
 #![no_main]
 
-mod tcp_connect;
+mod process_exec;
 mod tcp_close;
+mod tcp_connect;
 mod tcp_retransmit;
 
-use aya_ebpf::macros::{fentry, fexit, map};
+use aya_ebpf::macros::{fentry, fexit, map, tracepoint};
 use aya_ebpf::maps::{HashMap, RingBuf};
 use aya_ebpf::programs::FEntryContext;
 use aya_ebpf::programs::FExitContext;
+use aya_ebpf::programs::TracePointContext;
 
 // === BPF Maps ===
 
@@ -21,6 +23,10 @@ static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 #[map]
 static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+/// Ring buffer for ProcessExecEvent (tracepoint/sched_process_exec).
+#[map]
+static PROCESS_EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
 /// Ring buffer for TcpCloseEvent (fexit/tcp_close).
 #[map]
 static TCP_CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
@@ -30,6 +36,11 @@ static TCP_CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 static TCP_RETRANSMIT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
 // === Probe Entrypoints ===
+
+#[tracepoint(category = "sched", name = "sched_process_exec")]
+pub fn jalki_process_exec(ctx: TracePointContext) -> i32 {
+    process_exec::handle(&ctx)
+}
 
 #[fexit(function = "tcp_connect")]
 pub fn jalki_tcp_connect(ctx: FExitContext) -> i32 {
@@ -76,16 +87,12 @@ pub fn read_addrs(sk: u64) -> (u16, [u8; 16], [u8; 16]) {
         // AF_INET6: read 16-byte addresses.
         // skc_v6_daddr at offset 56, skc_v6_rcv_saddr at offset 72.
         if let Ok(v) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(
-                (sk as *const u8).add(56) as *const [u8; 16],
-            )
+            aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(56) as *const [u8; 16])
         } {
             dst = v;
         }
         if let Ok(v) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(
-                (sk as *const u8).add(72) as *const [u8; 16],
-            )
+            aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(72) as *const [u8; 16])
         } {
             src = v;
         }
@@ -93,16 +100,12 @@ pub fn read_addrs(sk: u64) -> (u16, [u8; 16], [u8; 16]) {
         // AF_INET: read 4-byte addresses into first 4 bytes.
         // skc_daddr at offset 0, skc_rcv_saddr at offset 4.
         if let Ok(v) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(
-                (sk as *const u8).add(0) as *const [u8; 4],
-            )
+            aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(0) as *const [u8; 4])
         } {
             dst[..4].copy_from_slice(&v);
         }
         if let Ok(v) = unsafe {
-            aya_ebpf::helpers::bpf_probe_read_kernel(
-                (sk as *const u8).add(4) as *const [u8; 4],
-            )
+            aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(4) as *const [u8; 4])
         } {
             src[..4].copy_from_slice(&v);
         }
@@ -122,9 +125,7 @@ pub fn read_addrs(sk: u64) -> (u16, [u8; 16], [u8; 16]) {
 pub fn read_netns(sk: u64) -> u32 {
     // Read skc_net pointer.
     let net_ptr: u64 = match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(
-            (sk as *const u8).add(48) as *const u64,
-        )
+        aya_ebpf::helpers::bpf_probe_read_kernel((sk as *const u8).add(48) as *const u64)
     } {
         Ok(v) => v,
         Err(_) => return 0,
@@ -136,9 +137,7 @@ pub fn read_netns(sk: u64) -> u32 {
 
     // Read ns.inum: net + 152 (ns offset) + 24 (inum offset) = net + 176.
     match unsafe {
-        aya_ebpf::helpers::bpf_probe_read_kernel(
-            (net_ptr as *const u8).add(176) as *const u32,
-        )
+        aya_ebpf::helpers::bpf_probe_read_kernel((net_ptr as *const u8).add(176) as *const u32)
     } {
         Ok(v) => v,
         Err(_) => 0,

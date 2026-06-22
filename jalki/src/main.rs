@@ -1,11 +1,18 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use jalki_enrich::BindingCache;
 use jalki_evidence::{CompositeSink, EvidenceSink, FileSink, StdoutSink};
 use tracing_subscriber::EnvFilter;
 
-use jalki::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
+use jalki::enrich::CachedEnricher;
+use jalki::kube_watch;
+use jalki::probes::{
+    process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
+    tcp_retransmit::TcpRetransmit,
+};
 use jalki::runtime::Runtime;
 
 mod cli;
@@ -45,6 +52,23 @@ struct Cli {
     /// Cluster name for FALSE Protocol Occurrences.
     #[arg(long, env = "JALKI_CLUSTER", global = true)]
     cluster: Option<String>,
+
+    /// Enable Kubernetes pod/container enrichment for Plane-B evidence.
+    #[arg(long, env = "JALKI_K8S_ENRICHMENT", global = true)]
+    k8s_enrichment: bool,
+
+    /// Kubernetes node name for pod watches. Defaults to the host name.
+    #[arg(long, env = "JALKI_NODE_NAME", global = true)]
+    node_name: Option<String>,
+
+    /// cgroup filesystem root used to resolve cgroup_id to container id.
+    #[arg(
+        long,
+        env = "JALKI_CGROUP_ROOT",
+        default_value = "/sys/fs/cgroup",
+        global = true
+    )]
+    cgroup_root: String,
 }
 
 #[derive(Subcommand)]
@@ -150,18 +174,48 @@ async fn main() -> Result<()> {
 
 async fn run_daemon(cli: Cli) -> Result<()> {
     let mut runtime = Runtime::new(&cli.ebpf_path)
+        .attach(ProcessExec::new())
         .attach(TcpConnect::new())
         .attach(TcpClose::new())
         .attach(TcpRetransmit::new());
 
-    if let Some(cluster) = cli.cluster {
+    if let Some(cluster) = cli.cluster.clone() {
         runtime = runtime.cluster(cluster);
+    }
+
+    if cli.k8s_enrichment {
+        runtime = configure_k8s_enrichment(runtime, &cli).await?;
     }
 
     let sink = build_sink(&cli.sink, &cli.also_sink);
     runtime = runtime.sink_to(sink);
 
     runtime.run().await
+}
+
+async fn configure_k8s_enrichment(mut runtime: Runtime, cli: &Cli) -> Result<Runtime> {
+    let node_name = cli.node_name.clone().unwrap_or_else(default_node_name);
+    let cache = Arc::new(RwLock::new(BindingCache::new()));
+    let enricher = Arc::new(CachedEnricher::new(&cli.cgroup_root, cache.clone()));
+    runtime = runtime.enrich_with(enricher);
+
+    let client = kube::Client::try_default()
+        .await
+        .context("failed to create Kubernetes client for jalki pod enrichment")?;
+    tokio::spawn(async move {
+        if let Err(err) = kube_watch::run_pod_binding_watcher(client, node_name, cache).await {
+            tracing::error!(error = %err, "Kubernetes pod binding watcher stopped");
+        }
+    });
+
+    Ok(runtime)
+}
+
+fn default_node_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn build_sink(primary: &str, secondaries: &[String]) -> Box<dyn EvidenceSink> {

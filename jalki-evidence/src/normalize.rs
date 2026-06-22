@@ -6,15 +6,20 @@
 //! relationship_claim) arrives in a later slice; keeping this faithful means the
 //! existing daemon output and oracle expectations are unchanged.
 
-use false_protocol::{NetworkEventData, Occurrence, OccurrenceError, Outcome, ProcessEventData, Severity};
+use false_protocol::{
+    NetworkEventData, Occurrence, OccurrenceError, Outcome, ProcessEventData, Severity,
+};
 
-use crate::event::{KernelEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent};
+use crate::event::{
+    KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent,
+};
 use crate::evidence::{EvidenceRecord, NormalizedEvidence, ProbeMetadata};
 
 impl KernelEvent {
     /// Convert to a FALSE Protocol `Occurrence`.
     pub fn to_occurrence(&self, cluster: &str) -> Occurrence {
         match self {
+            KernelEvent::ProcessExec(e) => e.to_occurrence(cluster),
             KernelEvent::TcpConnect(e) => e.to_occurrence(cluster),
             KernelEvent::TcpClose(e) => e.to_occurrence(cluster),
             KernelEvent::TcpRetransmit(e) => e.to_occurrence(cluster),
@@ -30,7 +35,52 @@ impl KernelEvent {
             observed_at_ns: self.observed_at_ns(),
             probe,
             occurrence: self.to_occurrence(cluster),
+            binding: None,
         })
+    }
+}
+
+impl ProcessExecEvent {
+    pub fn to_occurrence(&self, cluster: &str) -> Occurrence {
+        let success = self.succeeded();
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
+
+        let mut occ = Occurrence::new("jalki/process_exec", "kernel.process.exec")
+            .severity(Severity::Info)
+            .outcome(outcome)
+            .in_cluster(cluster)
+            .with_entities(vec![
+                format!("process:{}", self.pid),
+                format!("executable:{}", self.filename),
+            ]);
+
+        occ.process_data = Some(ProcessEventData {
+            pid: self.pid,
+            ppid: Some(self.ppid),
+            command: self.filename.clone(),
+            args: None,
+            uid: self.uid,
+            exit_code: if success { None } else { Some(self.ret) },
+        });
+
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels.insert("gid".into(), self.gid.to_string());
+        occ.labels
+            .insert("resource_ref_kind".into(), "executable".into());
+        occ.labels
+            .insert("resource_ref_id".into(), self.filename.clone());
+        occ.labels.insert(
+            "argv_hash".into(),
+            format!("sha256:{}", hex32(&self.argv_hash)),
+        );
+
+        occ.correlation_keys = vec![format!("process:{}", self.pid)];
+        occ
     }
 }
 
@@ -41,8 +91,16 @@ impl TcpConnectEvent {
         let conn_id = format!("{src_ip}:{}->{dst_ip}:{}", self.src_port, self.dst_port);
         let success = self.succeeded();
 
-        let severity = if success { Severity::Info } else { Severity::Warning };
-        let outcome = if success { Outcome::Success } else { Outcome::Failure };
+        let severity = if success {
+            Severity::Info
+        } else {
+            Severity::Warning
+        };
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
 
         let mut occ = Occurrence::new("jalki/tcp_connect", "kernel.tcp.connect")
             .severity(severity)
@@ -80,6 +138,9 @@ impl TcpConnectEvent {
             uid: 0,
             exit_code: None,
         });
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels.insert("netns".into(), self.netns.to_string());
 
         if !success {
             occ.error = Some(OccurrenceError {
@@ -147,6 +208,9 @@ impl TcpCloseEvent {
             uid: 0,
             exit_code: None,
         });
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels.insert("netns".into(), self.netns.to_string());
 
         if self.duration_ns > 0 {
             occ.duration_us = Some(self.duration_ns / 1000);
@@ -199,6 +263,9 @@ impl TcpRetransmitEvent {
             uid: 0,
             exit_code: None,
         });
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels.insert("netns".into(), self.netns.to_string());
 
         occ.labels
             .insert("tcp_state".into(), self.state.as_str().into());
@@ -217,6 +284,16 @@ pub fn errno_name(ret: i32) -> String {
         101 => "ENETUNREACH".into(),
         _ => format!("E{}", -ret),
     }
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -240,9 +317,60 @@ mod tests {
             dst_port: 8080,
             addr_family: 2,
             ret,
+            cgroup_id: 42,
             comm: "nginx".into(),
             netns: 0,
         }
+    }
+
+    fn exec_event(ret: i32) -> ProcessExecEvent {
+        ProcessExecEvent {
+            observed_at_ns: 4,
+            pid: 42,
+            ppid: 7,
+            uid: 1000,
+            gid: 1000,
+            cgroup_id: 99,
+            ret,
+            comm: "true".into(),
+            filename: "/bin/true".into(),
+            argv_hash: [0xabu8; 32],
+        }
+    }
+
+    #[test]
+    fn exec_success_is_neutral_and_redacted() {
+        let occ = exec_event(0).to_occurrence("prod");
+        assert_eq!(occ.source, "jalki/process_exec");
+        assert_eq!(occ.occurrence_type.as_str(), "kernel.process.exec");
+        assert_eq!(occ.severity, Severity::Info);
+        assert_eq!(occ.outcome, Some(Outcome::Success));
+        assert!(occ.error.is_none());
+        let proc = occ.process_data.unwrap();
+        assert_eq!(proc.pid, 42);
+        assert_eq!(proc.ppid, Some(7));
+        assert_eq!(proc.command, "/bin/true");
+        assert!(proc.args.is_none());
+        assert_eq!(
+            occ.labels.get("argv_hash"),
+            Some(&format!("sha256:{}", "ab".repeat(32)))
+        );
+        assert_eq!(
+            occ.labels.get("resource_ref_kind"),
+            Some(&"executable".to_string())
+        );
+        assert_eq!(
+            occ.labels.get("resource_ref_id"),
+            Some(&"/bin/true".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_failure_sets_outcome_without_interpretation() {
+        let occ = exec_event(-13).to_occurrence("prod");
+        assert_eq!(occ.outcome, Some(Outcome::Failure));
+        assert!(occ.error.is_none());
+        assert_eq!(occ.process_data.unwrap().exit_code, Some(-13));
     }
 
     #[test]
@@ -254,6 +382,7 @@ mod tests {
         assert_eq!(occ.outcome, Some(Outcome::Success));
         assert_eq!(occ.cluster, "test-cluster");
         assert!(occ.error.is_none());
+        assert_eq!(occ.labels.get("cgroup_id"), Some(&"42".to_string()));
 
         let net = occ.network_data.unwrap();
         assert_eq!(net.src_ip, "10.0.0.1");
@@ -292,6 +421,7 @@ mod tests {
             bytes_sent: 1024,
             bytes_received: 2048,
             duration_ns: 5_000_000,
+            cgroup_id: 43,
             comm: "nginx".into(),
             netns: 0,
         };
@@ -316,6 +446,7 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
             duration_ns: 0,
+            cgroup_id: 43,
             comm: "app".into(),
             netns: 0,
         };
@@ -336,6 +467,7 @@ mod tests {
             dst_port: 443,
             addr_family: 2,
             state: TcpState::Established,
+            cgroup_id: 44,
             comm: "curl".into(),
             netns: 0,
         };
@@ -343,8 +475,15 @@ mod tests {
         assert_eq!(occ.severity, Severity::Warning);
         assert_eq!(occ.outcome, Some(Outcome::Failure));
         assert_eq!(occ.occurrence_type.as_str(), "kernel.tcp.retransmit");
-        assert_eq!(occ.labels.get("tcp_state"), Some(&"ESTABLISHED".to_string()));
-        assert_eq!(occ.correlation_keys, vec!["172.16.0.1:12345->172.16.0.2:443"]);
+        assert_eq!(
+            occ.labels.get("tcp_state"),
+            Some(&"ESTABLISHED".to_string())
+        );
+        assert_eq!(occ.labels.get("cgroup_id"), Some(&"44".to_string()));
+        assert_eq!(
+            occ.correlation_keys,
+            vec!["172.16.0.1:12345->172.16.0.2:443"]
+        );
     }
 
     #[test]
@@ -376,6 +515,7 @@ mod tests {
             dst_port: 443,
             addr_family: 2,
             state: TcpState::Established,
+            cgroup_id: 44,
             comm: "curl".into(),
             netns: 0,
         };
@@ -394,7 +534,10 @@ mod tests {
         assert_eq!(r.observed_at_ns, 123_456_789);
         assert_eq!(r.probe.probe_id, "tcp_retransmit");
         assert_eq!(r.probe.kernel_function, "tcp_retransmit_skb");
-        assert_eq!(r.occurrence.occurrence_type.as_str(), "kernel.tcp.retransmit");
+        assert_eq!(
+            r.occurrence.occurrence_type.as_str(),
+            "kernel.tcp.retransmit"
+        );
         // jälki never sets Ahti's ingest-time.
         assert!(r.occurrence.received_at.is_none());
     }

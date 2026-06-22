@@ -1,0 +1,10 @@
+[package]
+name = "jalki-enrich"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node-local runtime binding helpers for jalki evidence"
+
+[dependencies]
+jalki-evidence = { path = "../jalki-evidence" }
+thiserror = { workspace = true }

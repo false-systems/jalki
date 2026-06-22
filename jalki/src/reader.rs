@@ -8,6 +8,7 @@ use jalki_evidence::EvidenceRecord;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::enrich::{bind_record, RuntimeEnricher};
 use crate::probe::Probe;
 use crate::store::EventStore;
 
@@ -41,6 +42,7 @@ pub fn spawn_reader(
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
     stats: Arc<ProbeStats>,
     store: Arc<EventStore>,
+    enricher: Arc<dyn RuntimeEnricher>,
 ) -> Result<()> {
     let map_name = probe.ring_buffer_map().to_string();
 
@@ -54,7 +56,16 @@ pub fn spawn_reader(
     let probe_name = probe.name().to_string();
 
     tokio::task::spawn_blocking(move || {
-        drain_loop(ring_buf, probe, &cluster, tx, stats, &probe_name, store);
+        drain_loop(
+            ring_buf,
+            probe,
+            &cluster,
+            tx,
+            stats,
+            &probe_name,
+            store,
+            enricher,
+        );
     });
 
     Ok(())
@@ -68,6 +79,7 @@ fn drain_loop(
     stats: Arc<ProbeStats>,
     probe_name: &str,
     store: Arc<EventStore>,
+    enricher: Arc<dyn RuntimeEnricher>,
 ) {
     let sample_rate = probe.sample_rate();
     let do_sampling = sample_rate < 1.0;
@@ -98,6 +110,7 @@ fn drain_loop(
             match probe.to_evidence(raw, cluster) {
                 Ok(evidence) => {
                     for record in evidence.records {
+                        let record = bind_record(record, enricher.as_ref());
                         // The local debug store keeps the lean occurrence shape used by
                         // IPC stream/watch. Durable sinks project D6 metadata later via
                         // EvidenceBatch::into_occurrences().

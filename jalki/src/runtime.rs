@@ -7,16 +7,21 @@ use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
     EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind, ProbeMetadata, ProducerMetadata,
+    RetryBuffer, RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
+use crate::enrich::{NoopEnricher, RuntimeEnricher};
 use crate::knowledge::KnowledgeBase;
 use crate::loader;
 use crate::metrics::{Metrics, SinkLabel};
 use crate::probe::Probe;
 use crate::probes::generated::GeneratedProbeReader;
-use crate::probes::{tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit};
+use crate::probes::{
+    process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
+    tcp_retransmit::TcpRetransmit,
+};
 use crate::reader::{self, ProbeStats};
 use crate::registry::ProbeRegistry;
 use crate::store::EventStore;
@@ -27,6 +32,7 @@ pub struct Runtime {
     sink: Option<Box<dyn EvidenceSink>>,
     ebpf_path: String,
     cluster: String,
+    enricher: Arc<dyn RuntimeEnricher>,
 }
 
 impl Runtime {
@@ -39,6 +45,7 @@ impl Runtime {
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".into()),
+            enricher: Arc::new(NoopEnricher),
         }
     }
 
@@ -54,6 +61,11 @@ impl Runtime {
 
     pub fn sink_to(mut self, sink: Box<dyn EvidenceSink>) -> Self {
         self.sink = Some(sink);
+        self
+    }
+
+    pub fn enrich_with(mut self, enricher: Arc<dyn RuntimeEnricher>) -> Self {
+        self.enricher = enricher;
         self
     }
 
@@ -98,6 +110,7 @@ impl Runtime {
                 tx.clone(),
                 stats.clone(),
                 store.clone(),
+                self.enricher.clone(),
             )?;
             registry.register_startup_probe(probe.clone(), stats.clone());
             stats_map.push((probe.name().to_string(), stats));
@@ -113,6 +126,7 @@ impl Runtime {
             kb: kb.clone(),
             tx: tx.clone(),
             cluster: self.cluster.clone(),
+            enricher: self.enricher.clone(),
         });
 
         // Spawn self-observability: periodically emit drops/errors as evidence.
@@ -134,7 +148,8 @@ impl Runtime {
         // Drop the original sender so the channel closes when all readers stop.
         drop(tx);
 
-        // Sink loop: one EvidenceBatch per ring-buffer drain cycle.
+        // Sink loop: one EvidenceBatch per ring-buffer drain cycle, with a
+        // bounded retry buffer for transient downstream failures.
         let sink = self
             .sink
             .unwrap_or_else(|| Box::new(jalki_evidence::StdoutSink::new()));
@@ -142,20 +157,42 @@ impl Runtime {
         let producer_for_sink = producer.clone();
 
         let sink_handle = tokio::spawn(async move {
+            let mut retry_buffer = RetryBuffer::new(RetryBufferConfig::default());
             while let Some(records) = rx.recv().await {
                 if records.is_empty() {
                     continue;
                 }
 
+                let now_ms = current_time_ms();
+                for gap in retry_buffer.drop_expired(now_ms) {
+                    retry_buffer.enqueue(gap.into_batch(producer_for_sink.clone()), now_ms);
+                }
+
                 let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
-                if let Err(e) = sink.append_batch(batch).await {
-                    error!(sink = sink.name(), error = %e, "evidence sink append failed");
-                    metrics_clone
-                        .sink_errors
-                        .get_or_create(&SinkLabel {
-                            sink: sink.name().into(),
-                        })
-                        .inc();
+                for gap in retry_buffer.enqueue(batch, now_ms) {
+                    retry_buffer.enqueue(gap.into_batch(producer_for_sink.clone()), now_ms);
+                }
+
+                flush_retry_buffer(
+                    sink.as_ref(),
+                    &mut retry_buffer,
+                    &metrics_clone,
+                    &producer_for_sink,
+                )
+                .await;
+            }
+
+            while !retry_buffer.is_empty() {
+                let before = retry_buffer.len_batches();
+                flush_retry_buffer(
+                    sink.as_ref(),
+                    &mut retry_buffer,
+                    &metrics_clone,
+                    &producer_for_sink,
+                )
+                .await;
+                if retry_buffer.len_batches() == before {
+                    break;
                 }
             }
 
@@ -190,6 +227,7 @@ pub struct DaemonHandle {
     pub kb: Arc<KnowledgeBase>,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
     pub cluster: String,
+    enricher: Arc<dyn RuntimeEnricher>,
 }
 
 impl DaemonHandle {
@@ -200,6 +238,7 @@ impl DaemonHandle {
     pub async fn deploy_probe(&self, function: &str, _sample_rate: f64) -> Result<String> {
         // Fast path: pre-compiled probes.
         let pre_compiled: Option<Arc<dyn Probe>> = match function {
+            "sched_process_exec" | "process_exec" => Some(Arc::new(ProcessExec::new())),
             "tcp_connect" => Some(Arc::new(TcpConnect::new())),
             "tcp_close" => Some(Arc::new(TcpClose::new())),
             "tcp_retransmit_skb" => Some(Arc::new(TcpRetransmit::new())),
@@ -215,6 +254,7 @@ impl DaemonHandle {
                 &self.cluster,
                 self.tx.clone(),
                 &self.store,
+                self.enricher.clone(),
             )?;
             return Ok(probe_id.to_string());
         }
@@ -297,6 +337,7 @@ impl DaemonHandle {
             &self.cluster,
             self.tx.clone(),
             &self.store,
+            self.enricher.clone(),
         )?;
 
         // Keep the generated Ebpf object alive (it owns the loaded programs).
@@ -317,6 +358,79 @@ fn producer_metadata(cluster: &str) -> ProducerMetadata {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
     ProducerMetadata::new(cluster, node_id, kernel_release)
+}
+
+async fn flush_retry_buffer(
+    sink: &dyn EvidenceSink,
+    retry_buffer: &mut RetryBuffer,
+    metrics: &Metrics,
+    producer: &ProducerMetadata,
+) {
+    while let Some(batch) = retry_buffer.front().cloned() {
+        match sink.append_batch(batch).await {
+            Ok(_) => {
+                retry_buffer.pop_delivered();
+            }
+            Err(err) if RetryBuffer::should_retry(&err) => {
+                record_sink_error(metrics, sink.name());
+                warn!(
+                    sink = sink.name(),
+                    error = %err,
+                    queued_batches = retry_buffer.len_batches(),
+                    queued_records = retry_buffer.len_records(),
+                    "evidence sink append failed; retrying later"
+                );
+                break;
+            }
+            Err(err) => {
+                record_sink_error(metrics, sink.name());
+                error!(
+                    sink = sink.name(),
+                    error = %err,
+                    "evidence sink append failed permanently; dropping batch"
+                );
+                let dropped = retry_buffer.pop_delivered();
+                if let Some(dropped) = dropped {
+                    let gap = jalki_evidence::GapReport {
+                        cause: terminal_gap_cause(&err).into(),
+                        dropped_records: dropped.len(),
+                        gap_start_ns: dropped.observed_at_min,
+                        gap_end_ns: dropped.observed_at_max,
+                    };
+                    retry_buffer.enqueue(gap.into_batch(producer.clone()), current_time_ms());
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn record_sink_error(metrics: &Metrics, sink: &str) {
+    metrics
+        .sink_errors
+        .get_or_create(&SinkLabel { sink: sink.into() })
+        .inc();
+}
+
+fn terminal_gap_cause(error: &SinkError) -> &'static str {
+    match error {
+        SinkError::InvalidRecord { .. } => "sink_invalid_record",
+        SinkError::Rejected { .. } => "sink_rejected",
+        SinkError::Unauthorized { .. } => "sink_unauthorized",
+        SinkError::Misconfigured { .. } => "sink_misconfigured",
+        SinkError::PartialFailure { .. } => "sink_partial_failure",
+        SinkError::Unsupported { .. } => "sink_unsupported",
+        SinkError::Unavailable { .. }
+        | SinkError::Timeout { .. }
+        | SinkError::Backpressure { .. } => "sink_retryable_failure",
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Map knowledge base field names to BTF field paths.
@@ -423,6 +537,7 @@ fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
             kernel_function: "jalki_self_observability".into(),
         },
         occurrence,
+        binding: None,
     }
 }
 

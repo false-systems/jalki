@@ -1,4 +1,6 @@
-use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel};
+use aya_ebpf::helpers::{
+    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+};
 use aya_ebpf::programs::FExitContext;
 
 use jalki_common::TcpCloseEvent;
@@ -35,10 +37,10 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
 
     // Ports: skc_dport at offset 12, skc_num at offset 14.
     // Known issue: skc_num is cleared before tcp_close fexit fires.
-    let dst_port: u16 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }.map_err(|e| e as i64)?;
-    let src_port: u16 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }.map_err(|e| e as i64)?;
+    let dst_port: u16 = unsafe { bpf_probe_read_kernel((sk as *const u8).add(12) as *const u16) }
+        .map_err(|e| e as i64)?;
+    let src_port: u16 = unsafe { bpf_probe_read_kernel((sk as *const u8).add(14) as *const u16) }
+        .map_err(|e| e as i64)?;
 
     // Read bytes_sent/received from tcp_sock.
     // struct sock *sk can be cast to struct tcp_sock * — tcp_sock embeds sock.
@@ -48,11 +50,9 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
     // These offsets WILL differ on other kernel versions.
     // TODO: pass offsets via BPF map populated at load time from BTF.
     let bytes_sent: u64 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1608) as *const u64) }
-            .unwrap_or(0);
+        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1608) as *const u64) }.unwrap_or(0);
     let bytes_received: u64 =
-        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1808) as *const u64) }
-            .unwrap_or(0);
+        unsafe { bpf_probe_read_kernel((sk as *const u8).add(1808) as *const u64) }.unwrap_or(0);
 
     // v0.1: duration requires stashing the connection start timestamp in a
     // BPF hashmap keyed by socket pointer at fentry/tcp_connect, then reading
@@ -76,6 +76,9 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         bytes_sent,
         bytes_received,
         duration_ns,
+        // SAFETY: helper reads the current task's cgroup id and does not
+        // dereference program-provided pointers.
+        cgroup_id: unsafe { bpf_get_current_cgroup_id() },
         comm,
         netns,
         _pad2: 0,
