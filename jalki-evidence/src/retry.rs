@@ -46,6 +46,8 @@ impl GapReport {
             producer,
             vec![EvidenceRecord {
                 observed_at_ns: self.gap_end_ns,
+                pid: 0,
+                cgroup_id: 0,
                 probe: ProbeMetadata {
                     probe_id: "jalki_agent".into(),
                     probe_version: "1".into(),
@@ -178,6 +180,8 @@ mod tests {
     fn record(observed_at_ns: u64) -> EvidenceRecord {
         EvidenceRecord {
             observed_at_ns,
+            pid: 0,
+            cgroup_id: 0,
             probe: ProbeMetadata {
                 probe_id: "tcp_connect".into(),
                 probe_version: "1".into(),

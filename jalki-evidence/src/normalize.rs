@@ -33,6 +33,8 @@ impl KernelEvent {
     pub fn normalize(&self, probe: ProbeMetadata, cluster: &str) -> NormalizedEvidence {
         NormalizedEvidence::single(EvidenceRecord {
             observed_at_ns: self.observed_at_ns(),
+            pid: self.pid(),
+            cgroup_id: self.cgroup_id(),
             probe,
             occurrence: self.to_occurrence(cluster),
             binding: None,
@@ -60,7 +62,7 @@ impl ProcessExecEvent {
 
         occ.process_data = Some(ProcessEventData {
             pid: self.pid,
-            ppid: Some(self.ppid),
+            ppid: (self.ppid != 0).then_some(self.ppid),
             command: self.filename.clone(),
             args: None,
             uid: self.uid,
@@ -366,6 +368,16 @@ mod tests {
     }
 
     #[test]
+    fn exec_omits_unresolved_parent_pid() {
+        let mut event = exec_event(0);
+        event.ppid = 0;
+
+        let occ = event.to_occurrence("prod");
+
+        assert_eq!(occ.process_data.unwrap().ppid, None);
+    }
+
+    #[test]
     fn exec_failure_sets_outcome_without_interpretation() {
         let occ = exec_event(-13).to_occurrence("prod");
         assert_eq!(occ.outcome, Some(Outcome::Failure));
@@ -534,6 +546,8 @@ mod tests {
         assert_eq!(r.observed_at_ns, 123_456_789);
         assert_eq!(r.probe.probe_id, "tcp_retransmit");
         assert_eq!(r.probe.kernel_function, "tcp_retransmit_skb");
+        assert_eq!(r.pid, 9999);
+        assert_eq!(r.cgroup_id, 44);
         assert_eq!(
             r.occurrence.occurrence_type.as_str(),
             "kernel.tcp.retransmit"

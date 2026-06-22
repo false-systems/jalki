@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
@@ -15,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::enrich::{NoopEnricher, RuntimeEnricher};
 use crate::knowledge::KnowledgeBase;
 use crate::loader;
-use crate::metrics::{Metrics, SinkLabel};
+use crate::metrics::{Metrics, SinkLabel, UnboundDropLabel};
 use crate::probe::Probe;
 use crate::probes::generated::GeneratedProbeReader;
 use crate::probes::{
@@ -155,15 +156,20 @@ impl Runtime {
             .unwrap_or_else(|| Box::new(jalki_evidence::StdoutSink::new()));
         let metrics_clone = metrics.clone();
         let producer_for_sink = producer.clone();
+        let enricher_for_metrics = self.enricher.clone();
 
         let sink_handle = tokio::spawn(async move {
             let mut retry_buffer = RetryBuffer::new(RetryBufferConfig::default());
+            let retry_clock_start = Instant::now();
             while let Some(records) = rx.recv().await {
                 if records.is_empty() {
                     continue;
                 }
 
-                let now_ms = current_time_ms();
+                record_unbound_drops(&metrics_clone, &records);
+                refresh_binding_cache_metrics(&metrics_clone, enricher_for_metrics.as_ref());
+
+                let now_ms = elapsed_ms(retry_clock_start);
                 for gap in retry_buffer.drop_expired(now_ms) {
                     retry_buffer.enqueue(gap.into_batch(producer_for_sink.clone()), now_ms);
                 }
@@ -178,6 +184,7 @@ impl Runtime {
                     &mut retry_buffer,
                     &metrics_clone,
                     &producer_for_sink,
+                    retry_clock_start,
                 )
                 .await;
             }
@@ -189,6 +196,7 @@ impl Runtime {
                     &mut retry_buffer,
                     &metrics_clone,
                     &producer_for_sink,
+                    retry_clock_start,
                 )
                 .await;
                 if retry_buffer.len_batches() == before {
@@ -365,6 +373,7 @@ async fn flush_retry_buffer(
     retry_buffer: &mut RetryBuffer,
     metrics: &Metrics,
     producer: &ProducerMetadata,
+    retry_clock_start: Instant,
 ) {
     while let Some(batch) = retry_buffer.front().cloned() {
         match sink.append_batch(batch).await {
@@ -397,7 +406,10 @@ async fn flush_retry_buffer(
                         gap_start_ns: dropped.observed_at_min,
                         gap_end_ns: dropped.observed_at_max,
                     };
-                    retry_buffer.enqueue(gap.into_batch(producer.clone()), current_time_ms());
+                    retry_buffer.enqueue(
+                        gap.into_batch(producer.clone()),
+                        elapsed_ms(retry_clock_start),
+                    );
                 }
                 break;
             }
@@ -410,6 +422,26 @@ fn record_sink_error(metrics: &Metrics, sink: &str) {
         .sink_errors
         .get_or_create(&SinkLabel { sink: sink.into() })
         .inc();
+}
+
+fn record_unbound_drops(metrics: &Metrics, records: &[EvidenceRecord]) {
+    for record in records {
+        if let Some(reason) = record.plane_b_drop_reason() {
+            metrics
+                .unbound_dropped_total
+                .get_or_create(&UnboundDropLabel {
+                    reason: reason.as_str().into(),
+                })
+                .inc();
+        }
+    }
+}
+
+fn refresh_binding_cache_metrics(metrics: &Metrics, enricher: &dyn RuntimeEnricher) {
+    if let Some(stats) = enricher.binding_cache_stats() {
+        metrics.binding_cache_entries.set(stats.entries as i64);
+        metrics.binding_cache_hit_ratio.set(stats.hit_ratio);
+    }
 }
 
 fn terminal_gap_cause(error: &SinkError) -> &'static str {
@@ -426,11 +458,8 @@ fn terminal_gap_cause(error: &SinkError) -> &'static str {
     }
 }
 
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 /// Map knowledge base field names to BTF field paths.
@@ -529,6 +558,8 @@ async fn emit_self_observability(
 fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
     EvidenceRecord {
         observed_at_ns: 0,
+        pid: 0,
+        cgroup_id: 0,
         probe: ProbeMetadata {
             probe_id: "jalki_self".into(),
             probe_version: "1".into(),
