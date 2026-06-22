@@ -4,17 +4,19 @@
 //! pieces that can be tested on any host: parsing cgroup/container identifiers
 //! and converting resolved pod/container metadata into `RuntimeBinding`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jalki_evidence::{BindingProvenance, RuntimeBinding, UnboundReason};
 use thiserror::Error;
 
 const CONTAINER_ID_LEN: usize = 64;
 const ARC_RUN_ID_LABEL: &str = "actions.github.com/run-id";
+const DEFAULT_BINDING_CACHE_MAX_CONTAINERS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerRuntime {
@@ -61,6 +63,21 @@ pub enum ResolveCgroupError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum ResolveProcCgroupError {
+    #[error("invalid pid 0 for proc cgroup lookup")]
+    InvalidPid,
+    #[error("failed to read proc cgroup file at {path}: {source}")]
+    Io { path: PathBuf, source: io::Error },
+    #[error("no cgroup path in {0}")]
+    NoCgroupPath(PathBuf),
+    #[error("no container id was present in {path}: {source}")]
+    Unbound {
+        path: PathBuf,
+        source: ParseContainerError,
+    },
+}
+
 /// Parse a container id out of common cgroup path forms.
 ///
 /// Supported examples:
@@ -70,8 +87,6 @@ pub enum ResolveCgroupError {
 /// - `.../docker-<64hex>.scope`
 /// - `.../docker/<64hex>`
 pub fn parse_container_ref(path: &str) -> Result<ContainerRef, ParseContainerError> {
-    let mut last_invalid = None;
-
     for segment in path.rsplit('/') {
         let segment = segment.trim();
         if segment.is_empty() {
@@ -85,10 +100,7 @@ pub fn parse_container_ref(path: &str) -> Result<ContainerRef, ParseContainerErr
         ] {
             if let Some(rest) = segment.strip_prefix(prefix) {
                 let id = rest.strip_suffix(".scope").unwrap_or(rest);
-                return validate_container_id(id, runtime).map_err(|err| {
-                    last_invalid = Some(err.to_string());
-                    err
-                });
+                return validate_container_id(id, runtime);
             }
         }
 
@@ -105,10 +117,52 @@ pub fn parse_container_ref(path: &str) -> Result<ContainerRef, ParseContainerErr
         }
     }
 
-    if let Some(reason) = last_invalid {
-        Err(ParseContainerError::InvalidContainerId(reason))
+    Err(ParseContainerError::NoContainerId)
+}
+
+/// Resolve a container id through `/proc/<pid>/cgroup`.
+///
+/// This is the hot-path resolver for live events because it reads one small
+/// file for the event's process instead of scanning cgroupfs by inode.
+pub fn resolve_container_ref_from_procfs(
+    proc_root: impl AsRef<Path>,
+    pid: u32,
+) -> Result<ContainerRef, ResolveProcCgroupError> {
+    if pid == 0 {
+        return Err(ResolveProcCgroupError::InvalidPid);
+    }
+
+    let path = proc_root.as_ref().join(pid.to_string()).join("cgroup");
+    let contents = fs::read_to_string(&path).map_err(|source| ResolveProcCgroupError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    let mut saw_path = false;
+    let mut first_error = None;
+    for line in contents.lines() {
+        if let Some((_, cgroup_path)) = line.rsplit_once(':') {
+            if cgroup_path.is_empty() {
+                continue;
+            }
+            saw_path = true;
+            match parse_container_ref(cgroup_path) {
+                Ok(container) => return Ok(container),
+                Err(source) if first_error.is_none() => first_error = Some(source),
+                Err(_) => {}
+            }
+        }
+    }
+
+    if let Some(source) = first_error {
+        Err(ResolveProcCgroupError::Unbound { path, source })
+    } else if saw_path {
+        Err(ResolveProcCgroupError::Unbound {
+            path,
+            source: ParseContainerError::NoContainerId,
+        })
     } else {
-        Err(ParseContainerError::NoContainerId)
+        Err(ResolveProcCgroupError::NoCgroupPath(path))
     }
 }
 
@@ -289,25 +343,44 @@ impl Binding {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BindingCache {
     by_container_id: HashMap<String, PodMetadata>,
     by_pod_uid: HashMap<String, Vec<String>>,
+    insertion_order: VecDeque<String>,
+    max_containers: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl BindingCache {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_containers(DEFAULT_BINDING_CACHE_MAX_CONTAINERS)
+    }
+
+    pub fn with_max_containers(max_containers: usize) -> Self {
+        Self {
+            by_container_id: HashMap::new(),
+            by_pod_uid: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            max_containers,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
     }
 
     pub fn upsert(&mut self, container_id: impl Into<String>, metadata: PodMetadata) {
-        self.by_container_id
-            .insert(container_id.into().to_ascii_lowercase(), metadata);
+        self.insert_container(container_id.into(), metadata);
+        self.evict_to_capacity();
     }
 
     pub fn remove(&mut self, container_id: &str) -> Option<PodMetadata> {
-        self.by_container_id
-            .remove(&container_id.to_ascii_lowercase())
+        let container_id = container_id.to_ascii_lowercase();
+        let removed = self.by_container_id.remove(&container_id);
+        if removed.is_some() {
+            self.remove_from_pod_index(&container_id);
+        }
+        removed
     }
 
     pub fn apply_pod_snapshot(&mut self, pod: PodSnapshot) -> CacheUpdate {
@@ -318,8 +391,7 @@ impl BindingCache {
         for container in pod.containers {
             match parse_k8s_container_id(&container.container_id) {
                 Ok(container_ref) => {
-                    self.by_container_id
-                        .insert(container_ref.id.clone(), metadata.clone());
+                    self.insert_container(container_ref.id.clone(), metadata.clone());
                     container_ids.push(container_ref.id);
                     update.upserted += 1;
                 }
@@ -332,6 +404,7 @@ impl BindingCache {
         if !container_ids.is_empty() {
             self.by_pod_uid.insert(pod.pod_uid, container_ids);
         }
+        update.removed += self.evict_to_capacity();
 
         update
     }
@@ -350,14 +423,20 @@ impl BindingCache {
 
     pub fn bind_container(&self, container_id: &str, provenance: BindingProvenance) -> Binding {
         match self.by_container_id.get(&container_id.to_ascii_lowercase()) {
-            Some(metadata) => Binding::Bound {
-                container_id: container_id.to_ascii_lowercase(),
-                metadata: metadata.clone(),
-                provenance,
-            },
-            None => Binding::Unbound {
-                reason: UnboundReason::CacheMiss,
-            },
+            Some(metadata) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Binding::Bound {
+                    container_id: container_id.to_ascii_lowercase(),
+                    metadata: metadata.clone(),
+                    provenance,
+                }
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                Binding::Unbound {
+                    reason: UnboundReason::CacheMiss,
+                }
+            }
         }
     }
 
@@ -371,6 +450,78 @@ impl BindingCache {
 
     pub fn is_empty(&self) -> bool {
         self.by_container_id.is_empty()
+    }
+
+    pub fn max_containers(&self) -> usize {
+        self.max_containers
+    }
+
+    pub fn hit_count(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    pub fn miss_count(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    pub fn hit_ratio(&self) -> f64 {
+        let hits = self.hit_count();
+        let total = hits + self.miss_count();
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    fn insert_container(&mut self, container_id: String, metadata: PodMetadata) {
+        let container_id = container_id.to_ascii_lowercase();
+        let is_new = !self.by_container_id.contains_key(&container_id);
+        self.by_container_id.insert(container_id.clone(), metadata);
+        if is_new {
+            self.insertion_order.push_back(container_id);
+        }
+    }
+
+    fn evict_to_capacity(&mut self) -> usize {
+        if self.max_containers == 0 {
+            let removed = self.by_container_id.len();
+            self.by_container_id.clear();
+            self.by_pod_uid.clear();
+            self.insertion_order.clear();
+            return removed;
+        }
+
+        let mut removed = 0;
+        while self.by_container_id.len() > self.max_containers {
+            let Some(container_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self.by_container_id.remove(&container_id).is_some() {
+                self.remove_from_pod_index(&container_id);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn remove_from_pod_index(&mut self, container_id: &str) {
+        let mut empty_pods = Vec::new();
+        for (pod_uid, container_ids) in &mut self.by_pod_uid {
+            container_ids.retain(|id| id != container_id);
+            if container_ids.is_empty() {
+                empty_pods.push(pod_uid.clone());
+            }
+        }
+        for pod_uid in empty_pods {
+            self.by_pod_uid.remove(&pod_uid);
+        }
+    }
+}
+
+impl Default for BindingCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -481,6 +632,42 @@ mod tests {
     }
 
     #[test]
+    fn resolves_proc_cgroup_to_container_id() {
+        let root = temp_root();
+        let proc_dir = root.join("1234");
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(
+            proc_dir.join("cgroup"),
+            format!("0::/kubepods.slice/pod123/cri-containerd-{ID}.scope\n"),
+        )
+        .unwrap();
+
+        let resolved = resolve_container_ref_from_procfs(&root, 1234).unwrap();
+
+        assert_eq!(resolved.runtime, ContainerRuntime::Containerd);
+        assert_eq!(resolved.id, ID);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn proc_cgroup_scans_all_controller_lines() {
+        let root = temp_root();
+        let proc_dir = root.join("1234");
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(
+            proc_dir.join("cgroup"),
+            format!("8:cpu:/user.slice/session.scope\n2:memory:/docker/{ID}\n"),
+        )
+        .unwrap();
+
+        let resolved = resolve_container_ref_from_procfs(&root, 1234).unwrap();
+
+        assert_eq!(resolved.runtime, ContainerRuntime::Docker);
+        assert_eq!(resolved.id, ID);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unresolved_cgroup_inode_is_not_found() {
         let root = temp_root();
         let err = resolve_container_ref_from_cgroupfs(&root, u64::MAX).unwrap_err();
@@ -531,6 +718,55 @@ mod tests {
                 reason: UnboundReason::CacheMiss
             }
         );
+        assert_eq!(cache.miss_count(), 1);
+    }
+
+    #[test]
+    fn binding_cache_records_hits_and_hit_ratio() {
+        let mut cache = BindingCache::new();
+        cache.upsert(ID, metadata());
+
+        assert!(matches!(
+            cache.bind_container(ID, BindingProvenance::Observed),
+            Binding::Bound { .. }
+        ));
+        assert!(matches!(
+            cache.bind_container(UPPER_ID, BindingProvenance::Observed),
+            Binding::Bound { .. }
+        ));
+        assert!(matches!(
+            cache.bind_container(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                BindingProvenance::Observed
+            ),
+            Binding::Unbound { .. }
+        ));
+
+        assert_eq!(cache.hit_count(), 2);
+        assert_eq!(cache.miss_count(), 1);
+        assert!((cache.hit_ratio() - (2.0 / 3.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn binding_cache_evicts_oldest_entry_when_bounded() {
+        let mut cache = BindingCache::with_max_containers(1);
+        let new_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        cache.upsert(ID, metadata());
+        cache.upsert(new_id, metadata());
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.max_containers(), 1);
+        assert!(matches!(
+            cache.bind_container(ID, BindingProvenance::Observed),
+            Binding::Unbound {
+                reason: UnboundReason::CacheMiss
+            }
+        ));
+        assert!(matches!(
+            cache.bind_container(new_id, BindingProvenance::Observed),
+            Binding::Bound { .. }
+        ));
     }
 
     #[test]

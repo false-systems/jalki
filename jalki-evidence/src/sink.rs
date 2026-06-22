@@ -135,10 +135,10 @@ fn encode_plane_b_ndjson(
     batch: EvidenceBatch,
     sink_name: &str,
 ) -> Result<(Vec<u8>, usize, usize), SinkError> {
-    let original_count = batch.len();
-    let occurrences = batch.into_plane_b_occurrences();
+    let projection = batch.into_plane_b_projection();
+    let dropped_unbound = projection.dropped_unbound.values().sum();
+    let occurrences = projection.occurrences;
     let accepted_count = occurrences.len();
-    let rejected_count = original_count.saturating_sub(accepted_count);
     let mut bytes = Vec::new();
 
     for occ in occurrences {
@@ -150,7 +150,7 @@ fn encode_plane_b_ndjson(
         bytes.push(b'\n');
     }
 
-    Ok((bytes, accepted_count, rejected_count))
+    Ok((bytes, accepted_count, dropped_unbound))
 }
 
 #[async_trait]
@@ -575,6 +575,8 @@ mod tests {
     fn record(observed_at_ns: u64) -> EvidenceRecord {
         EvidenceRecord {
             observed_at_ns,
+            pid: 0,
+            cgroup_id: 0,
             probe: ProbeMetadata {
                 probe_id: "tcp_connect".into(),
                 probe_version: "1".into(),

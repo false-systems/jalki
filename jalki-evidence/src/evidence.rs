@@ -117,7 +117,7 @@ impl BindingProvenance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnboundReason {
     HostProcess,
     CacheMiss,
@@ -144,6 +144,8 @@ impl UnboundReason {
 #[derive(Debug, Clone)]
 pub struct EvidenceRecord {
     pub observed_at_ns: u64,
+    pub pid: u32,
+    pub cgroup_id: u64,
     pub probe: ProbeMetadata,
     pub occurrence: Occurrence,
     pub binding: Option<RuntimeBinding>,
@@ -153,6 +155,18 @@ impl EvidenceRecord {
     pub fn with_runtime_binding(mut self, binding: RuntimeBinding) -> Self {
         self.binding = Some(binding);
         self
+    }
+
+    pub fn plane_b_drop_reason(&self) -> Option<UnboundReason> {
+        if self.is_agent_record() {
+            return None;
+        }
+
+        match self.binding.as_ref() {
+            Some(binding) if binding.strong_binding() => None,
+            Some(RuntimeBinding::Unbound { reason }) => Some(*reason),
+            Some(RuntimeBinding::Bound { .. }) | None => Some(UnboundReason::Unknown),
+        }
     }
 
     /// Project into a single `Occurrence` carrying the full ADR-0001 D6 metadata
@@ -194,21 +208,20 @@ impl EvidenceRecord {
     /// Unlike Plane A, this projection refuses unbound evidence and strips local
     /// interpretation fields before the occurrence can be sent to Vartio.
     pub fn into_plane_b_occurrence(self, producer: &ProducerMetadata) -> Option<Occurrence> {
-        let is_agent_record = self
-            .occurrence
-            .occurrence_type
-            .as_str()
-            .starts_with("jalki.agent.");
-        if !is_agent_record {
-            let binding = self.binding.as_ref()?;
-            if !binding.strong_binding() {
-                return None;
-            }
+        if let Some(_reason) = self.plane_b_drop_reason() {
+            return None;
         }
 
         let mut occ = self.into_occurrence_with_metadata(producer);
         neutralize_for_plane_b(&mut occ);
         Some(occ)
+    }
+
+    fn is_agent_record(&self) -> bool {
+        self.occurrence
+            .occurrence_type
+            .as_str()
+            .starts_with("jalki.agent.")
     }
 }
 
@@ -313,6 +326,12 @@ pub struct EvidenceBatch {
     pub records: Vec<EvidenceRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PlaneBProjection {
+    pub occurrences: Vec<Occurrence>,
+    pub dropped_unbound: BTreeMap<UnboundReason, usize>,
+}
+
 impl EvidenceBatch {
     /// Build a batch, deriving the observed-time window from the records and
     /// generating a fresh batch id. An empty batch gets a zero window.
@@ -356,11 +375,28 @@ impl EvidenceBatch {
 
     /// Project strongly bound, neutral Plane-B records only.
     pub fn into_plane_b_occurrences(self) -> Vec<Occurrence> {
+        self.into_plane_b_projection().occurrences
+    }
+
+    pub fn into_plane_b_projection(self) -> PlaneBProjection {
         let producer = self.producer;
-        self.records
-            .into_iter()
-            .filter_map(|r| r.into_plane_b_occurrence(&producer))
-            .collect()
+        let mut occurrences = Vec::new();
+        let mut dropped_unbound = BTreeMap::new();
+
+        for record in self.records {
+            if let Some(reason) = record.plane_b_drop_reason() {
+                *dropped_unbound.entry(reason).or_insert(0) += 1;
+                continue;
+            }
+            if let Some(occurrence) = record.into_plane_b_occurrence(&producer) {
+                occurrences.push(occurrence);
+            }
+        }
+
+        PlaneBProjection {
+            occurrences,
+            dropped_unbound,
+        }
     }
 }
 
@@ -371,6 +407,8 @@ mod tests {
     fn record(observed_at_ns: u64) -> EvidenceRecord {
         EvidenceRecord {
             observed_at_ns,
+            pid: 0,
+            cgroup_id: 0,
             probe: ProbeMetadata {
                 probe_id: "tcp_retransmit".into(),
                 probe_version: "1".into(),

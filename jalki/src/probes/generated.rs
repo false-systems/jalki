@@ -264,6 +264,8 @@ impl Probe for GeneratedProbeReader {
 
         Ok(NormalizedEvidence::single(EvidenceRecord {
             observed_at_ns,
+            pid,
+            cgroup_id: 0,
             probe: self.probe_metadata(),
             occurrence: occ,
             binding: None,
