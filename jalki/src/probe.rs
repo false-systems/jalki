@@ -25,8 +25,16 @@ impl From<jalki_evidence::DecodeError> for ProbeError {
 /// How a probe attaches to a kernel function.
 #[derive(Debug, Clone)]
 pub enum Attachment {
-    Fentry { function: &'static str },
-    Fexit { function: &'static str },
+    Fentry {
+        function: &'static str,
+    },
+    Fexit {
+        function: &'static str,
+    },
+    Tracepoint {
+        category: &'static str,
+        name: &'static str,
+    },
 }
 
 impl Attachment {
@@ -34,12 +42,14 @@ impl Attachment {
         match self {
             Attachment::Fentry { .. } => HookKind::Fentry,
             Attachment::Fexit { .. } => HookKind::Fexit,
+            Attachment::Tracepoint { .. } => HookKind::Tracepoint,
         }
     }
 
     pub fn function(&self) -> &'static str {
         match self {
             Attachment::Fentry { function } | Attachment::Fexit { function } => function,
+            Attachment::Tracepoint { name, .. } => name,
         }
     }
 }

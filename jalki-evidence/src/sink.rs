@@ -131,6 +131,180 @@ fn encode_ndjson(batch: EvidenceBatch, sink_name: &str) -> Result<(Vec<u8>, usiz
     Ok((bytes, count))
 }
 
+fn encode_plane_b_ndjson(
+    batch: EvidenceBatch,
+    sink_name: &str,
+) -> Result<(Vec<u8>, usize, usize), SinkError> {
+    let original_count = batch.len();
+    let occurrences = batch.into_plane_b_occurrences();
+    let accepted_count = occurrences.len();
+    let rejected_count = original_count.saturating_sub(accepted_count);
+    let mut bytes = Vec::new();
+
+    for occ in occurrences {
+        let json = serde_json::to_vec(&occ).map_err(|e| SinkError::InvalidRecord {
+            sink: sink_name.into(),
+            message: e.to_string(),
+        })?;
+        bytes.extend_from_slice(&json);
+        bytes.push(b'\n');
+    }
+
+    Ok((bytes, accepted_count, rejected_count))
+}
+
+#[async_trait]
+pub trait PipelineClient: Send + Sync {
+    async fn post_ndjson(&self, body: Vec<u8>) -> Result<PipelineResponse, PipelineError>;
+
+    async fn health(&self) -> HealthStatus;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineResponse {
+    pub accepted_count: usize,
+    pub rejected_count: usize,
+    pub checkpoint: Option<Checkpoint>,
+    pub warnings: Vec<String>,
+}
+
+impl PipelineResponse {
+    pub fn accepted(accepted_count: usize) -> Self {
+        Self {
+            accepted_count,
+            rejected_count: 0,
+            checkpoint: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum PipelineError {
+    #[error("pipeline unavailable: {0}")]
+    Unavailable(String),
+    #[error("pipeline timed out: {0}")]
+    Timeout(String),
+    #[error("pipeline backpressure: {0}")]
+    Backpressure(String),
+    #[error("pipeline unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("pipeline rejected batch: {0}")]
+    Rejected(String),
+    #[error("pipeline invalid record: {0}")]
+    InvalidRecord(String),
+    #[error("pipeline misconfigured: {0}")]
+    Misconfigured(String),
+}
+
+/// Neutral Plane-B sink for the Polku/Vartio pipeline.
+///
+/// This sink deliberately owns only the stable projection and error mapping. The
+/// concrete Polku/Vartio wire lives behind [`PipelineClient`] so the transport
+/// can change without changing evidence semantics.
+pub struct PipelineSink<C> {
+    client: C,
+    name: String,
+}
+
+impl<C> PipelineSink<C> {
+    pub fn new(client: C) -> Self {
+        Self {
+            client,
+            name: "pipeline".into(),
+        }
+    }
+
+    pub fn with_name(client: C, name: impl Into<String>) -> Self {
+        Self {
+            client,
+            name: name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl<C> EvidenceSink for PipelineSink<C>
+where
+    C: PipelineClient,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
+        let (body, projected_count, dropped_unbound) = encode_plane_b_ndjson(batch, self.name())?;
+        let response = self
+            .client
+            .post_ndjson(body)
+            .await
+            .map_err(|err| pipeline_error_to_sink_error(self.name(), err))?;
+
+        let mut warnings = response.warnings;
+        if dropped_unbound > 0 {
+            warnings.push(format!(
+                "dropped {dropped_unbound} unbound record(s) from Plane B"
+            ));
+        }
+
+        let accepted_count = response.accepted_count.min(projected_count);
+        let rejected_count = response.rejected_count + dropped_unbound;
+        if response.rejected_count > 0 {
+            return Err(SinkError::PartialFailure {
+                sink: self.name().into(),
+                accepted_count,
+                rejected_count,
+                message: "pipeline rejected some projected records".into(),
+            });
+        }
+
+        Ok(AppendResult {
+            accepted_count,
+            rejected_count,
+            sink_name: self.name().into(),
+            watermark: response.checkpoint,
+            warnings,
+        })
+    }
+
+    async fn health(&self) -> HealthStatus {
+        self.client.health().await
+    }
+}
+
+fn pipeline_error_to_sink_error(sink: &str, err: PipelineError) -> SinkError {
+    match err {
+        PipelineError::Unavailable(message) => SinkError::Unavailable {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::Timeout(message) => SinkError::Timeout {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::Backpressure(message) => SinkError::Backpressure {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::Unauthorized(message) => SinkError::Unauthorized {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::Rejected(message) => SinkError::Rejected {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::InvalidRecord(message) => SinkError::InvalidRecord {
+            sink: sink.into(),
+            message,
+        },
+        PipelineError::Misconfigured(message) => SinkError::Misconfigured {
+            sink: sink.into(),
+            message,
+        },
+    }
+}
+
 /// Emits batches as newline-delimited JSON to stdout.
 pub struct StdoutSink;
 
@@ -391,7 +565,10 @@ impl EvidenceSink for FakeSink {
 mod tests {
     use false_protocol::Occurrence;
 
-    use crate::{EvidenceRecord, HookKind, ProbeMetadata, ProducerMetadata};
+    use crate::{
+        BindingProvenance, EvidenceRecord, HookKind, ProbeMetadata, ProducerMetadata,
+        RuntimeBinding, UnboundReason,
+    };
 
     use super::*;
 
@@ -407,6 +584,7 @@ mod tests {
             },
             occurrence: Occurrence::new("jalki/tcp_connect", "kernel.tcp.connect")
                 .in_cluster("prod"),
+            binding: None,
         }
     }
 
@@ -415,6 +593,17 @@ mod tests {
             ProducerMetadata::new("prod", "node-1", "6.17.0"),
             vec![record(123)],
         )
+    }
+
+    fn bound_record(observed_at_ns: u64) -> EvidenceRecord {
+        record(observed_at_ns).with_runtime_binding(RuntimeBinding::Bound {
+            container_id: "container-1".into(),
+            pod_uid: Some("pod-1".into()),
+            namespace: Some("default".into()),
+            service_account: None,
+            labels: Default::default(),
+            provenance: BindingProvenance::Observed,
+        })
     }
 
     fn variant_names() -> Vec<&'static str> {
@@ -615,5 +804,90 @@ mod tests {
         assert_eq!(primary_handle.batches().len(), 1);
         assert_eq!(secondary_a_handle.batches().len(), 1);
         assert_eq!(secondary_b_handle.batches().len(), 1);
+    }
+
+    #[derive(Clone)]
+    struct FakePipelineClient {
+        response: Arc<Mutex<Result<PipelineResponse, PipelineError>>>,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl FakePipelineClient {
+        fn new(response: Result<PipelineResponse, PipelineError>) -> Self {
+            Self {
+                response: Arc::new(Mutex::new(response)),
+                bodies: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn bodies(&self) -> Vec<Vec<u8>> {
+            self.bodies
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait]
+    impl PipelineClient for FakePipelineClient {
+        async fn post_ndjson(&self, body: Vec<u8>) -> Result<PipelineResponse, PipelineError> {
+            if let Ok(mut guard) = self.bodies.lock() {
+                guard.push(body);
+            }
+            self.response
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_else(|_| Err(PipelineError::Unavailable("lock poisoned".into())))
+        }
+
+        async fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_sink_posts_only_bound_neutral_records() {
+        let client = FakePipelineClient::new(Ok(PipelineResponse::accepted(1)));
+        let handle = client.clone();
+        let sink = PipelineSink::new(client);
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![
+                bound_record(1),
+                record(2).with_runtime_binding(RuntimeBinding::Unbound {
+                    reason: UnboundReason::HostProcess,
+                }),
+            ],
+        );
+
+        let result = sink.append_batch(batch).await.unwrap();
+
+        assert_eq!(result.accepted_count, 1);
+        assert_eq!(result.rejected_count, 1);
+        assert_eq!(result.warnings.len(), 1);
+        let bodies = handle.bodies();
+        assert_eq!(bodies.len(), 1);
+        let text = String::from_utf8(bodies[0].clone()).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(value["severity"], "info");
+        assert_eq!(value["labels"]["k8s_pod_uid"], "pod-1");
+        assert!(value.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_sink_maps_backpressure_precisely() {
+        let sink = PipelineSink::new(FakePipelineClient::new(Err(PipelineError::Backpressure(
+            "slow down".into(),
+        ))));
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![bound_record(1)],
+        );
+
+        let err = sink.append_batch(batch).await.unwrap_err();
+
+        assert!(matches!(err, SinkError::Backpressure { .. }));
     }
 }

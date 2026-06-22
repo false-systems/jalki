@@ -10,16 +10,20 @@
 pub mod event;
 pub mod evidence;
 pub mod normalize;
+pub mod retry;
 pub mod sink;
 
 pub use event::{
-    DecodeError, KernelEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent, TcpState,
+    DecodeError, KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent,
+    TcpState,
 };
 pub use evidence::{
-    EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata, ProducerMetadata,
+    BindingProvenance, EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata,
+    ProducerMetadata, RuntimeBinding, UnboundReason,
 };
 pub use normalize::errno_name;
+pub use retry::{GapReport, RetryBuffer, RetryBufferConfig};
 pub use sink::{
-    AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, SinkError,
-    StdoutSink,
+    AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, PipelineClient,
+    PipelineError, PipelineResponse, PipelineSink, SinkError, StdoutSink,
 };

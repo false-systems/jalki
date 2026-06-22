@@ -6,13 +6,16 @@
 //! on the [`EvidenceBatch`]; fields constant per probe, plus the observed time,
 //! live on each [`EvidenceRecord`]. A sink projects both onto the final record.
 
-use false_protocol::Occurrence;
+use std::collections::BTreeMap;
+
+use false_protocol::{Occurrence, Severity};
 
 /// How a probe attaches to the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
     Fentry,
     Fexit,
+    Tracepoint,
     Lsm,
 }
 
@@ -21,6 +24,7 @@ impl HookKind {
         match self {
             HookKind::Fentry => "fentry",
             HookKind::Fexit => "fexit",
+            HookKind::Tracepoint => "tracepoint",
             HookKind::Lsm => "lsm",
         }
     }
@@ -65,6 +69,73 @@ pub struct ProbeMetadata {
     pub kernel_function: String,
 }
 
+/// Binding from a kernel event to the runtime object that caused it.
+///
+/// Plane B requires a strong binding (`pod_uid` or `container_id`) before an
+/// event is forwarded to Vartio. Plane A may still retain unbound events for
+/// local debugging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeBinding {
+    Bound {
+        container_id: String,
+        pod_uid: Option<String>,
+        namespace: Option<String>,
+        service_account: Option<String>,
+        labels: BTreeMap<String, String>,
+        provenance: BindingProvenance,
+    },
+    Unbound {
+        reason: UnboundReason,
+    },
+}
+
+impl RuntimeBinding {
+    pub fn strong_binding(&self) -> bool {
+        match self {
+            RuntimeBinding::Bound {
+                container_id,
+                pod_uid,
+                ..
+            } => !container_id.is_empty() || pod_uid.as_deref().is_some_and(|v| !v.is_empty()),
+            RuntimeBinding::Unbound { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingProvenance {
+    Observed,
+    DerivedFromCache,
+}
+
+impl BindingProvenance {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BindingProvenance::Observed => "observed",
+            BindingProvenance::DerivedFromCache => "derived",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnboundReason {
+    HostProcess,
+    CacheMiss,
+    NoCgroup,
+    Unknown,
+}
+
+impl UnboundReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnboundReason::HostProcess => "host_process",
+            UnboundReason::CacheMiss => "cache_miss",
+            UnboundReason::NoCgroup => "no_cgroup",
+            UnboundReason::Unknown => "unknown",
+        }
+    }
+}
+
 /// A single normalized record, stamped with observed-time and probe metadata.
 ///
 /// `observed_at_ns` is the kernel's monotonic timestamp (CLOCK_BOOTTIME-domain),
@@ -75,9 +146,15 @@ pub struct EvidenceRecord {
     pub observed_at_ns: u64,
     pub probe: ProbeMetadata,
     pub occurrence: Occurrence,
+    pub binding: Option<RuntimeBinding>,
 }
 
 impl EvidenceRecord {
+    pub fn with_runtime_binding(mut self, binding: RuntimeBinding) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
     /// Project into a single `Occurrence` carrying the full ADR-0001 D6 metadata
     /// set, with the agent-constant fields supplied by the batch's
     /// [`ProducerMetadata`].
@@ -96,6 +173,7 @@ impl EvidenceRecord {
     /// uses `Runtime.cluster` for both) to avoid divergence.
     pub fn into_occurrence_with_metadata(self, producer: &ProducerMetadata) -> Occurrence {
         let mut occ = self.occurrence;
+        apply_runtime_binding(&mut occ, self.binding.as_ref());
         let labels = &mut occ.labels;
         labels.insert("producer".into(), producer.producer.clone());
         labels.insert("producer_version".into(), producer.producer_version.clone());
@@ -109,6 +187,101 @@ impl EvidenceRecord {
         labels.insert("kernel_function".into(), self.probe.kernel_function);
         labels.insert("observed_at_ns".into(), self.observed_at_ns.to_string());
         occ
+    }
+
+    /// Project this record for the neutral Plane B path.
+    ///
+    /// Unlike Plane A, this projection refuses unbound evidence and strips local
+    /// interpretation fields before the occurrence can be sent to Vartio.
+    pub fn into_plane_b_occurrence(self, producer: &ProducerMetadata) -> Option<Occurrence> {
+        let is_agent_record = self
+            .occurrence
+            .occurrence_type
+            .as_str()
+            .starts_with("jalki.agent.");
+        if !is_agent_record {
+            let binding = self.binding.as_ref()?;
+            if !binding.strong_binding() {
+                return None;
+            }
+        }
+
+        let mut occ = self.into_occurrence_with_metadata(producer);
+        neutralize_for_plane_b(&mut occ);
+        Some(occ)
+    }
+}
+
+fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>) {
+    match binding {
+        Some(RuntimeBinding::Bound {
+            container_id,
+            pod_uid,
+            namespace,
+            service_account,
+            labels,
+            provenance,
+        }) => {
+            if !container_id.is_empty() {
+                occ.labels
+                    .insert("k8s_container_id".into(), container_id.clone());
+                push_unique(
+                    &mut occ.correlation_keys,
+                    format!("k8s_container_id:{container_id}"),
+                );
+            }
+            if let Some(pod_uid) = pod_uid.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels.insert("k8s_pod_uid".into(), pod_uid.clone());
+                push_unique(&mut occ.correlation_keys, format!("k8s_pod_uid:{pod_uid}"));
+            }
+            if let Some(namespace) = namespace.as_ref().filter(|v| !v.is_empty()) {
+                occ.namespace = Some(namespace.clone());
+                occ.labels.insert("k8s_namespace".into(), namespace.clone());
+                push_unique(
+                    &mut occ.correlation_keys,
+                    format!("k8s_namespace:{namespace}"),
+                );
+            }
+            if let Some(service_account) = service_account.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels
+                    .insert("k8s_service_account".into(), service_account.clone());
+            }
+            if let Some(run_id) = labels.get("actions.github.com/run-id") {
+                occ.labels.insert("github_run_id".into(), run_id.clone());
+                push_unique(&mut occ.correlation_keys, format!("github_run_id:{run_id}"));
+            }
+            occ.labels
+                .insert("evidence_level".into(), provenance.as_str().into());
+        }
+        Some(RuntimeBinding::Unbound { reason }) => {
+            occ.labels
+                .insert("runtime_binding".into(), "unbound".into());
+            occ.labels
+                .insert("unbound_reason".into(), reason.as_str().into());
+        }
+        None => {}
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn neutralize_for_plane_b(occ: &mut Occurrence) {
+    occ.severity = Severity::Info;
+    occ.error = None;
+    occ.reasoning = None;
+    occ.history = None;
+
+    if let Some(network) = &occ.network_data {
+        occ.labels
+            .insert("resource_ref_kind".into(), "network_endpoint".into());
+        occ.labels.insert(
+            "resource_ref_id".into(),
+            format!("{}:{}", network.dst_ip, network.dst_port),
+        );
     }
 }
 
@@ -180,6 +353,15 @@ impl EvidenceBatch {
             .map(|r| r.into_occurrence_with_metadata(&producer))
             .collect()
     }
+
+    /// Project strongly bound, neutral Plane-B records only.
+    pub fn into_plane_b_occurrences(self) -> Vec<Occurrence> {
+        let producer = self.producer;
+        self.records
+            .into_iter()
+            .filter_map(|r| r.into_plane_b_occurrence(&producer))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +379,7 @@ mod tests {
                 kernel_function: "tcp_retransmit_skb".into(),
             },
             occurrence: Occurrence::new("jalki/test", "kernel.test"),
+            binding: None,
         }
     }
 
@@ -261,5 +444,74 @@ mod tests {
         assert_eq!(get("kernel_function"), Some("tcp_retransmit_skb"));
         // observed time travels with the record
         assert_eq!(get("observed_at_ns"), Some("42"));
+    }
+
+    #[test]
+    fn plane_b_projection_drops_unbound_records() {
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![record(42).with_runtime_binding(RuntimeBinding::Unbound {
+                reason: UnboundReason::HostProcess,
+            })],
+        );
+
+        assert!(batch.into_plane_b_occurrences().is_empty());
+    }
+
+    #[test]
+    fn plane_b_projection_allows_agent_gap_without_binding() {
+        let mut record = record(42);
+        record.occurrence = Occurrence::new("jalki/agent", "jalki.agent.gap");
+
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![record],
+        );
+        let occ = batch.into_plane_b_occurrences().pop().unwrap();
+
+        assert_eq!(occ.occurrence_type.as_str(), "jalki.agent.gap");
+        assert_eq!(occ.severity, Severity::Info);
+        assert!(occ.error.is_none());
+    }
+
+    #[test]
+    fn plane_b_projection_adds_binding_and_strips_interpretation() {
+        let mut labels = BTreeMap::new();
+        labels.insert("actions.github.com/run-id".into(), "123456".into());
+        let mut record = record(42).with_runtime_binding(RuntimeBinding::Bound {
+            container_id: "container-1".into(),
+            pod_uid: Some("pod-1".into()),
+            namespace: Some("default".into()),
+            service_account: Some("builder".into()),
+            labels,
+            provenance: BindingProvenance::Observed,
+        });
+        record.occurrence.severity = Severity::Critical;
+        record.occurrence.error = Some(Default::default());
+
+        let batch = EvidenceBatch::new(
+            ProducerMetadata::new("prod", "node-1", "6.17.0"),
+            vec![record],
+        );
+        let occ = batch.into_plane_b_occurrences().pop().unwrap();
+
+        assert_eq!(occ.severity, Severity::Info);
+        assert!(occ.error.is_none());
+        assert_eq!(
+            occ.labels.get("k8s_container_id").map(String::as_str),
+            Some("container-1")
+        );
+        assert_eq!(
+            occ.labels.get("k8s_pod_uid").map(String::as_str),
+            Some("pod-1")
+        );
+        assert_eq!(
+            occ.labels.get("github_run_id").map(String::as_str),
+            Some("123456")
+        );
+        assert!(occ
+            .correlation_keys
+            .iter()
+            .any(|key| key == "k8s_pod_uid:pod-1"));
     }
 }

@@ -64,6 +64,7 @@ mod tests {
             bytes_sent: 1024,
             bytes_received: 2048,
             duration_ns,
+            cgroup_id: 0,
             comm,
             netns: 0,
             _pad2: 0,

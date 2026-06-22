@@ -266,6 +266,7 @@ impl Probe for GeneratedProbeReader {
             observed_at_ns,
             probe: self.probe_metadata(),
             occurrence: occ,
+            binding: None,
         }))
     }
 }

@@ -31,7 +31,7 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 
 ### 2.1 `kernel.process.exec`
 
-**Source mechanism:** fexit on `bprm_execve` (preferred) or `tracepoint:sched/sched_process_exec`.
+**Source mechanism:** `tracepoint:sched/sched_process_exec` for successful exec path capture.
 
 **Required payload fields:**
 

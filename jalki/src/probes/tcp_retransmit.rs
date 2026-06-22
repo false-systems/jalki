@@ -64,9 +64,11 @@ mod tests {
             addr_family: 2,
             state,
             _pad1: 0,
+            _pad2: 0,
+            cgroup_id: 0,
             comm,
             netns: 0,
-            _pad2: 0,
+            _pad3: 0,
         };
         let ptr = &event as *const RawEvent as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<RawEvent>()) }.to_vec()
