@@ -1,5 +1,7 @@
 # Probe Definitions
 
+> **⚠ SUPERSEDED IN PART by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** Jälki no longer writes to Ahti and **keeps its knowledge base / probe intelligence local** (Plane A). "Definitions, templates, and question-mappings live in Ahti, written by `jalki-control`" is superseded — there is no `jalki-control`-to-Ahti write path. The probe-plan-template, sampling-policy, and capability-snapshot *concepts* survive but live **locally on the agent**.
+
 This document specifies how Jälki represents the **reusable structures** that drive an agent: probe plan templates, kernel hook handles, sampling policies, capability requirements, output schemas, and the question→plan mappings the agent's question-answering surface needs.
 
 The headline rule:

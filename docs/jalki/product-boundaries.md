@@ -1,5 +1,7 @@
 # Product Boundaries
 
+> **⚠ AMENDED by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** §1.3 (emit Ahti records / authenticate to Ahti) and §1.5 (question surface reads Ahti) are **superseded**: `jälki → Polku → Vartio → Ahti`, Jälki never writes Ahti, and `ask` is a kept *local* product. §2.2/§2.3/§2.5 were amended by ADR-0001 (interpretation reversal) and ADR-0002 scopes that interpretation to Plane A only. **Still in force:** no datastore (§2.1), no enforcement (§2.4), no silent loss (§2.8), no Actor attribution (§2.3).
+
 This document specifies what Jälki **does** and what Jälki **must not do**. Every other Jälki design document is constrained by this one.
 
 When in doubt, the rule is:

@@ -4,17 +4,18 @@ You are working in the jälki repository — a programmable fentry/fexit framewo
 
 ## What jälki is
 
-jälki is to kernel functions what POLKU is to gRPC — a programmable framework. You implement one Rust trait, jälki handles BTF loading, fentry/fexit attachment, ring buffer management, self-filtering, serialization, and emission. FALSE Protocol Occurrences out.
+jälki is to kernel functions what POLKU is to gRPC — a programmable framework. You implement one Rust trait, jälki handles BTF loading, fentry/fexit attachment, ring buffer management, self-filtering, serialization, and emission through the `EvidenceSink` seam. FALSE Protocol Occurrences out.
 
 ```
 your probe (Rust trait or Python decorator)
     ↓
-jälki framework
+jälki framework → normalize → EvidenceSink
     ↓
-FALSE Protocol Occurrence JSON
-    ↓
-stdout / file / gRPC (POLKU) / SDK
+  ├─ stdout / file / composite      (direct / dev)
+  └─ Polku → Vartio → Ahti          (pipeline; Vartio interprets + writes Ahti)
 ```
+
+jälki runs two planes off one engine: a direct/interpreted surface (`ask`/MCP/SDK/KB) and a neutral pipeline that ships evidence to Vartio via Polku. jälki does **not** write to Ahti directly. See `docs/jalki/adr/0002-evidence-through-polku-to-vartio.md`.
 
 The three built-in TCP probes are batteries-included. They are not what jälki *is*.
 
@@ -142,8 +143,8 @@ impl Probe for MyProbe {
         &[Attachment::Fentry { function: "some_kernel_function" }]
     }
     fn ring_buffer_map(&self) -> &str { "MY_EVENTS" }
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
-        // convert raw bytes → FALSE Protocol Occurrence
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        // decode raw bytes → typed KernelEvent (to_evidence / normalize are defaults)
     }
 }
 ```

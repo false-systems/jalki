@@ -1,5 +1,7 @@
 # Local Agent State
 
+> **⚠ AMENDED by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** Jälki no longer writes to Ahti (`jälki → Polku → Vartio → Ahti`). "What must reach Ahti" (§2), producer identity / auth-to-Ahti (§3), and `agent_profile`-as-Ahti-`entity_version` (§9) are **superseded** — the destination is Polku→Vartio, not Ahti. **The enrichment (§6), gap/retry (§5), and time (§4) content survives** — and ADR-0002 §D5 makes the `cgroup → container → pod` enrichment a **hard requirement** (Vartio drops unbound evidence).
+
 This document specifies what may live on a Jälki agent locally, what **must** reach Ahti, how the agent behaves when Ahti is unreachable, how time is normalized, and how producer identity is bound.
 
 The headline rule (recap):

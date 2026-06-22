@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "false-protocol",
     "jalki-common",
     "jalki-evidence",
     "jalki",
@@ -38,8 +39,9 @@ clap = { version = "4", features = ["derive", "env"] }
 aya = "0.13"
 aya-log = "0.2"
 
-# FALSE Protocol
-false-protocol = { path = "../ahti/false-protocol" }
+# FALSE Protocol — vendored in-repo (was `../ahti/false-protocol`, which Ahti deleted
+# in its v1 datastore-only cleanup; recovered from ahti@7bd55c8^ to keep jälki self-contained).
+false-protocol = { path = "false-protocol" }
 
 # Metrics
 prometheus-client = "0.22"

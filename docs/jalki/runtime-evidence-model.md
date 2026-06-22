@@ -1,5 +1,7 @@
 # Runtime Evidence Model
 
+> **⚠ AMENDED by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** Jälki no longer writes to Ahti (`jälki → Polku → Vartio → Ahti`). The **payload field shapes** below survive as the evidence Jälki emits to Vartio, but every "**Ahti binding**" line and the "entity_version / relationship_claim records Jälki writes" are **superseded** — Vartio derives those when it interprets. Plane-B evidence must be **neutral** (no severity / root-cause); see ADR-0002 §D4.
+
 This document defines the core evidence types Jälki agents produce, with source mechanism, required and optional fields, Ahti binding, and the entity / relationship records each evidence type can support.
 
 The vocabulary used here is normative. Every name and every field shape **MUST** be backed by a Jälki-owned `definition` record in the `jalki` namespace (see [`ahti-record-mapping.md`](./ahti-record-mapping.md) §5 and [`probe-definitions.md`](./probe-definitions.md)).

@@ -1,0 +1,67 @@
+name: Agent task
+description: Structured task contract for agent-assisted implementation.
+title: "[agent] "
+labels:
+  - agent-task
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true after this task is complete?
+      placeholder: Prevent long-running queries from consuming unbounded resources.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What files, behaviors, or surfaces are in scope?
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What must not be changed as part of this task?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete checks for completion.
+      placeholder: |
+        - Existing tests pass.
+        - New timeout tests pass.
+        - Timeout returns a typed error.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Verification commands
+      description: Commands the agent should run or explain why it could not run.
+      placeholder: |
+        cargo test -p jalki-sdk-meta
+        cargo test --manifest-path eval/oracle/Cargo.toml
+    validations:
+      required: true
+  - type: textarea
+    id: docs
+    attributes:
+      label: Required docs and context
+      description: Architecture docs, specs, or related issues the agent must read.
+      placeholder: |
+        - AGENTS.md
+        - CLAUDE.md
+        - docs/jalki/v0-scope.md
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and constraints
+      description: Security, privacy, API, generated-file, or platform caveats.
+    validations:
+      required: false

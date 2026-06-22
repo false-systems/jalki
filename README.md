@@ -70,7 +70,7 @@ The kernel knew the answer all along. 35 retransmits in ESTABLISHED state on the
    │  loader     → attach probes via BTF metadata    │
    │  reader     → drain ring buffers → EventStore   │
    │  probes     → raw bytes → FALSE Protocol JSON   │
-   │  emitters   → stdout / file / gRPC              │
+   │  sinks      → stdout / file / composite         │
    │  IPC server → /run/jalki/jalki.sock             │
    │  metrics    → Prometheus :9090                  │
    └────────────────────┬───────────────────────────┘
@@ -100,7 +100,7 @@ cargo run -p xtask -- build-ebpf --release
 cargo build --release -p jalki
 
 # Terminal 1: start the daemon (needs root for eBPF)
-sudo ./target/release/jalki --emit stdout --cluster dev
+sudo ./target/release/jalki --sink stdout --cluster dev
 
 # Terminal 2: ask a question
 ./target/release/jalki ask "why are connections failing"
@@ -188,8 +188,9 @@ impl Probe for MyProbe {
         &[Attachment::Fentry { function: "some_kernel_function" }]
     }
     fn ring_buffer_map(&self) -> &str { "MY_EVENTS" }
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError> {
-        // convert raw ring buffer bytes to a FALSE Protocol Occurrence
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
+        // decode raw ring buffer bytes into a typed KernelEvent
+        // (to_evidence / normalization are provided defaults)
     }
 }
 ```
@@ -306,7 +307,7 @@ cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
 - **src_port 0 on tcp_close events** — the kernel clears `skc_num` before `tcp_close` returns, so fexit sees 0. This is correct kernel behavior. Use the `tcp_connect` event's `src_port` and correlate by 4-tuple to get the full picture.
 - **IPv4 only** — IPv6 in v0.2.
 - **bytes_sent/bytes_received emit 0** — requires `tcp_sock` offset walking not yet implemented.
-- **gRPC emitter is a stub** — use stdout or file.
+- **Durable pipeline sink not built yet** — only `stdout` / `file` / `composite` evidence sinks exist; the `Polku → Vartio` delivery sink (see `docs/jalki/adr/0002-evidence-through-polku-to-vartio.md`) is upcoming work.
 - **Privileged required** — `CAP_BPF` + `CAP_PERFMON` at minimum.
 
 ---
