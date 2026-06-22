@@ -4,22 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is jälki
 
-jälki is an Ahti producer for kernel and runtime evidence. It has four pieces:
+jälki is a programmable eBPF **fentry/fexit framework** for kernel and runtime evidence: hook any kernel function by implementing one Rust trait, and get structured FALSE Protocol records out. It is the kernel-observation layer of False Systems.
 
-- **SDK** — `jalki-sdk-meta` (source of truth) plus language SDKs (`jalki-sdk-python`, future Go/Rust). Defines types and the wire protocol.
-- **API** — daemon IPC over `/run/jalki/jalki.sock`, MCP server, and the producer contract with Ahti.
-- **Logic** — the `Probe` trait, eBPF programs, BTF resolution, ring buffer management, self-filtering, and the embedded knowledge base. Turns raw kernel signals into validated evidence.
-- **Ahti** — where evidence lives durably. Jälki MUST NOT keep a parallel datastore.
+Two value planes run off one capture engine:
 
-The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults — the logic layer makes writing *any* fentry/fexit probe a matter of implementing one trait.
+- **Direct / interpreted** — the `ask`/`watch`/`stream`/`list` CLI, the MCP server, the Python SDK, and an embedded knowledge base that *interprets* raw signals (e.g. "ESTABLISHED-state retransmit ⇒ network problem, not application"). For humans and agents debugging *now*.
+- **Neutral evidence** — capture → normalize → `EvidenceSink`. Today's sinks are `stdout`/`file`/`composite`; the durable destination (the False Systems causality pipeline) is under active redesign — see **Design docs** below.
 
-Current code implements logic + SDK + local API. The Ahti producer path is the v0 work in `docs/jalki/v0-scope.md`.
+The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults; the framework makes writing *any* fentry/fexit probe a matter of implementing the `Probe` trait.
+
+> ⚠ **Do not trust the "jälki is an Ahti producer" framing in `docs/jalki/`.** That May-2026 pass had jälki writing directly to Ahti; that premise has been reversed (see Design docs). jälki does not write to Ahti directly.
 
 ## Crate Structure
 
 ```
 jalki/
+├── false-protocol/   # vendored FALSE Protocol types (Occurrence, Severity, …) — was ../ahti/false-protocol
 ├── jalki-common/     # no_std shared types — kernel + userspace
+├── jalki-evidence/   # aya-free: typed KernelEvent, normalization, EvidenceBatch, EvidenceSink
 ├── jalki-ebpf/       # eBPF programs — NOT a workspace member (separate build target)
 ├── jalki/            # userspace daemon + library
 ├── jalki-codegen/    # runtime BPF program generation from BTF (no C, no clang)
@@ -33,11 +35,31 @@ jalki/
 └── eval/oracle/      # standalone contract test suite — NOT in workspace
 ```
 
-Workspace members: `jalki-common`, `jalki`, `jalki-codegen`, `jalki-mcp`, `jalki-sdk-meta`, `xtask`.
+Workspace members: `false-protocol`, `jalki-common`, `jalki-evidence`, `jalki`, `jalki-codegen`, `jalki-mcp`, `jalki-sdk-meta`, `xtask`.
 
 Non-workspace (built separately): `jalki-ebpf`, `jalki-sdk-python`, `eval/oracle`.
 
-External dependency: `false-protocol` is a path dependency from `../ahti/false-protocol`.
+`false-protocol` is **vendored in-repo** (`false-protocol/`). It was a path dep on `../ahti/false-protocol`, which Ahti deleted in its v1 datastore-only cleanup; it was recovered from `ahti@7bd55c8^` and vendored so jälki is self-contained. `jalki-evidence`/`jalki` depend on it via `workspace = true`.
+
+## Architecture: the capture pipeline
+
+The end-to-end data path is the thing that spans crates — trace it once and the layout makes sense:
+
+```
+kernel fn returns → #[fexit]/#[fentry] eBPF program (jalki-ebpf)
+  → writes #[repr(C)] event to a per-probe 4MB ring buffer
+  → Reader drains on a blocking thread, applies sample_rate          (jalki/src/reader.rs)
+  → Probe::decode_event → KernelEvent (typed)                        (jalki-evidence/src/event.rs)
+  → KernelEvent::normalize → EvidenceRecord{ Occurrence }            (jalki-evidence/src/normalize.rs)
+  → record cloned into in-memory EventStore (for IPC/CLI queries)    (jalki/src/store.rs)
+  → batched over an mpsc channel
+  → Runtime sink loop wraps in EvidenceBatch → EvidenceSink::append_batch  (jalki/src/runtime.rs)
+```
+
+- `Runtime` (builder) assembles the daemon: load eBPF + attach via BTF (`loader.rs`), spawn one `Reader` per probe, build `DaemonHandle`, serve IPC, run the sink loop + Prometheus on `:9090`.
+- `DaemonHandle::deploy_probe` is the runtime-attach path: precompiled probes take a fast path; otherwise `jalki-codegen` generates BPF bytecode from BTF and attaches it as a `GeneratedProbeReader`.
+- **Self-filter**: jälki's own PID is inserted into the `PID_FILTER` BPF map *before* attach, so its own syscalls never enter the ring buffers.
+- The map name ↔ probe binding is declarative (`Probe::ring_buffer_map()`), so the loader/reader are probe-agnostic — adding a probe needs no loader change.
 
 ## Build & Run
 
@@ -94,6 +116,17 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
 - `#[repr(C)]` event structs: `TcpConnectEvent`, `TcpCloseEvent`, `TcpRetransmitEvent`
 - Feature `userspace` enables `aya::Pod` impls
 - Size tests lock down the BPF ABI — do not change struct sizes without updating tests
+
+### jalki-evidence
+
+- **aya-free by design** — uses a *direct* path dep on `jalki-common` (no `userspace`/aya feature) so it compiles and unit-tests on macOS, unlike `jalki`/`jalki-codegen`/`jalki-mcp`. (Currently blocked from building only by the unresolved `false-protocol` dep — see Known Constraints.)
+- The capture→output layer between raw bytes and durable output:
+  - `event.rs` — typed `KernelEvent` + `from_bytes` decode of the `#[repr(C)]` structs.
+  - `normalize.rs` — `KernelEvent` → FALSE Protocol `Occurrence` (one event may yield several `EvidenceRecord`s).
+  - `evidence.rs` — `EvidenceRecord`/`EvidenceBatch`, `ProducerMetadata`/`ProbeMetadata`; `into_occurrences()` projects metadata into `Occurrence.labels` at sink time.
+  - `sink.rs` — the `EvidenceSink` trait (replaced the old `Emitter`) + `StdoutSink`/`FileSink`/`CompositeSink`.
+- `SinkError` deliberately distinguishes retryable (`Unavailable`/`Timeout`/`Backpressure`) from terminal (`Rejected`/`Unauthorized`/`InvalidRecord`) — sinks **MUST NOT** collapse them into one opaque error.
+- `observed_at` (kernel CLOCK_BOOTTIME) and ingest time are never conflated.
 
 ### jalki-ebpf
 
@@ -157,7 +190,7 @@ Four steps, in order:
 
 1. **Define the event struct** in `jalki-common/src/events.rs` — `#[repr(C)]`, pad to 8-byte alignment, add size test, add `aya::Pod` impl under `#[cfg(feature = "userspace")]`
 2. **Write the eBPF program** in `jalki-ebpf/src/` — register ring buffer map, check `PID_FILTER`, wire up in `main.rs`
-3. **Implement the `Probe` trait** in `jalki/src/probes/` — convert raw ring buffer bytes to FALSE Protocol `Occurrence`. `program_name()` must exactly match the `#[fentry]`/`#[fexit]` function name in `jalki-ebpf`.
+3. **Implement the `Probe` trait** in `jalki/src/probes/` — the only required method is `decode_event` (raw bytes → `KernelEvent`); `to_evidence`/`probe_metadata` are provided defaults that normalize via `jalki-evidence`. Add the matching `KernelEvent` variant + its `normalize` in `jalki-evidence`. `program_name()` must exactly match the `#[fentry]`/`#[fexit]` function name in `jalki-ebpf`.
 4. **Add a knowledge base entry** in `knowledge/{layer}.json` (existing layers: `tcp`, `fs`, `memory`, `process`, `sched`). The oracle validates the entry on the next test run. Do not add KB entries you are not certain about — wrong interpretations mislead agents.
 
 ### fentry vs fexit
@@ -173,7 +206,9 @@ pub trait Probe: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn program_name(&self) -> &str;         // must match #[fentry]/#[fexit] fn name in jalki-ebpf
     fn ring_buffer_map(&self) -> &str;
-    fn to_occurrence(&self, raw: &[u8], cluster: &str) -> Result<Occurrence, ProbeError>;
+    fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError>;   // only required conversion
+    // provided defaults: probe_version, family, probe_metadata, sample_rate (1.0),
+    // and to_evidence (decode_event + KernelEvent::normalize → NormalizedEvidence)
     fn sample_rate(&self) -> f64 { 1.0 }
 }
 
@@ -200,10 +235,17 @@ pub trait EvidenceSink: Send + Sync {
 - **src_port 0 on tcp_close** — kernel clears `skc_num` before `tcp_close` returns. Correlate by 4-tuple with `tcp_connect` events.
 - **tcp_sock offsets hardcoded** — bytes_sent (1608) and bytes_received (1808) verified on kernel 6.19.9.
 - **Self-filter** — jälki's own PID is always excluded. This is correct behavior, not a bug.
+- **`false-protocol` is vendored** (`false-protocol/`), recovered from `ahti@7bd55c8^` after Ahti deleted its copy. Note Polku's `false-protocol` crate is a *different, incompatible* shape (nested `context`, `data: Value`, no `NetworkEventData`/`ProcessEventData`/`labels`/`new_id`) — do **not** repoint to it without rewriting `jalki-evidence/normalize.rs`.
 
 ## Design docs
 
-`docs/jalki/` contains a 7-document design pass (May 2026) that reframes jälki as a producer for Ahti — the agent stops being its own product surface, evidence becomes Ahti records, and Lähde/Vartio interpret. **Design-only, no code yet.** Read these before making architectural changes; the fentry/fexit framework is preserved but the output, storage, and CLI/MCP boundaries change.
+`docs/jalki/` contains a May-2026 design pass plus `adr/0001`. **⚠ Partially stale — under active reconciliation.** That pass framed jälki as a *direct Ahti producer* (jälki authenticates to Ahti and writes records to the `jalki` namespace). That premise has been reversed:
+
+- Evidence routes **`jälki → Polku → Vartio → Ahti`**. jälki does **not** write to Ahti directly; Vartio interprets the evidence (normalize → chains → decisions) and writes the product records to Ahti.
+- jälki **keeps** its product surface (`ask`/MCP/SDK/KB/interpretation) — the old plan to demote `ask` to a Lähde shim and move the KB out of the binary is dropped.
+- ADR-0001's interpretation reversal ("jälki MAY interpret") still holds; its D2 routing (`PolkuSink`/`AhtiSink` → Ahti) does not.
+
+Until a superseding ADR lands, treat the storage/routing claims in these docs as wrong. The fentry/fexit framework, the `Probe` trait, and the eBPF crates are accurate and preserved.
 
 - `docs/jalki/README.md` — start here, document map and the "design sentence to preserve"
 - `docs/jalki/product-boundaries.md` — what jälki MUST and MUST NOT do

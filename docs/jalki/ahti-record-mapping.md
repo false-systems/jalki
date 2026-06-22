@@ -1,5 +1,7 @@
 # Ahti Record Mapping
 
+> **⚠ SUPERSEDED for Jälki by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** This entire document describes how Jälki writes Ahti records. **Jälki no longer writes to Ahti** — evidence flows `jälki → Polku → Vartio → Ahti`, and **Vartio** performs every Ahti write. Treat this as historical, or as a reference for the *Vartio-side* write mapping — not as Jälki's contract.
+
 This document maps every Jälki concept to one of Ahti's eight record kinds, using Ahti's actual field names (cf. `ahti/docs/record-kinds.md`, `ahti/docs/schema-registry.md`, `ahti/docs/auth-producers.md`).
 
 The headline rule: **Jälki invents no record kinds.** Every durable thing Jälki writes is one of the eight Ahti kinds, with `payload` validated by a Jälki-owned `definition` in the `jalki` namespace.

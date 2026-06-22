@@ -1,0 +1,15 @@
+[package]
+name = "false-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "FALSE Protocol — Functional AI-native Semantic Events shared by all False Systems tools"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ulid = { version = "1", features = ["serde"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
