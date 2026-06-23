@@ -62,13 +62,13 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 **Plane B occurrence type:** `kernel.process.exec` — **implemented** via `tracepoint:sched/sched_process_exec`. Emitted neutral to Polku→Vartio; `ppid` is omitted when unresolved; argv is carried only as `argv_hash`.
 
-**Entity records derived:** `entity_version` of `entity_type = process` with `logical_key = process/<node_id>/<pid>/<start_time_ns>`. The `kernel.process.exec` occurrence is cited in `lineage_refs` of the entity_version.
+**Vartio can derive (entity):** a `process` `entity_version` keyed `process/<node_id>/<pid>/<start_time_ns>`, linking it to this `kernel.process.exec` occurrence as supporting evidence.
 
-**Relationship records derived:**
+**Vartio can derive (relationships):**
 
 - `process_in_cgroup` (when `cgroup_id` resolves to a known `cgroup` entity).
 - `process_in_container` (when `container_id` resolves).
-- `container_in_pod` (when both `container_id` and `pod_uid` are present, written once per container lifetime).
+- `container_in_pod` (when both `container_id` and `pod_uid` are present; once per container lifetime).
 
 **Sensitive content note:** raw `argv` may contain secrets. Default agent profile **MUST** emit `argv_hash` only. Operators may opt in to raw `argv` per profile, with awareness that the record will be subject to operator-managed redaction.
 
@@ -97,7 +97,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 **Plane B occurrence type:** `kernel.process.fork`. *Planned — not yet implemented.*
 
-**Entity records derived:** none on fork alone. The new process entity is created on the subsequent `kernel.process.exec` (which may never come if the child execs directly into a thread; in that case the entity is created from `sched_process_exec`).
+**Vartio can derive (entity):** none on fork alone. The new process entity is created on the subsequent `kernel.process.exec` (which may never come if the child execs directly into a thread; in that case the entity is created from `sched_process_exec`).
 
 ---
 
@@ -125,7 +125,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 **Plane B occurrence type:** `kernel.process.exit`. *Planned — not yet implemented.*
 
-**Entity records derived:** terminal `entity_version` for the process, payload includes `terminated_at = event_time` and `exit_code`.
+**Vartio can derive (entity):** terminal `entity_version` for the process, payload includes `terminated_at = event_time` and `exit_code`.
 
 ---
 
@@ -164,7 +164,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 **Known constraint:** `destination_ip = 0.0.0.0` on Cilium-managed connections when the destination has not yet been resolved at fexit. This is **not** a bug — see top-level `CLAUDE.md` "Known Constraints". Jälki **SHOULD** still emit the record (the agent must not silently drop it); downstream consumers handle the missing destination.
 
-**Relationship records derived:**
+**Vartio can derive (relationships):**
 
 - `process_connected_to_endpoint` from the `process` entity → an endpoint `reference` (`external_uri = tcp-endpoint://<dst_ip>:<dst_port>`). The relationship is **mechanical** ("this process attempted this connect"), not interpretive ("this process is the payments API"). v0 may defer this and emit only the `occurrence`.
 
@@ -249,7 +249,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 **Scope guard:** the default agent profile **MUST NOT** capture every open. The agent profile **MUST** declare which path patterns are captured. Blanket capture is operationally infeasible and is forbidden by default — see [`local-agent-state.md`](./local-agent-state.md) §sampling.
 
-**Relationship records derived:** `process_opened_file` from `process` entity → the `kernel.file.open` occurrence (or a `file_path` reference if the path is hot enough to warrant a stable handle).
+**Vartio can derive (relationships):** `process_opened_file` from `process` entity → the `kernel.file.open` occurrence (or a `file_path` reference if the path is hot enough to warrant a stable handle).
 
 ---
 
