@@ -379,6 +379,9 @@ impl BindingCache {
         let removed = self.by_container_id.remove(&container_id);
         if removed.is_some() {
             self.remove_from_pod_index(&container_id);
+            // Purge from the FIFO index too, or it accumulates tombstones for
+            // every removed container even while `by_container_id` stays bounded.
+            self.insertion_order.retain(|id| id != &container_id);
         }
         removed
     }
@@ -412,11 +415,15 @@ impl BindingCache {
     pub fn remove_pod(&mut self, pod_uid: &str) -> CacheUpdate {
         let mut update = CacheUpdate::default();
         if let Some(container_ids) = self.by_pod_uid.remove(pod_uid) {
-            for container_id in container_ids {
-                if self.by_container_id.remove(&container_id).is_some() {
+            for container_id in &container_ids {
+                if self.by_container_id.remove(container_id).is_some() {
                     update.removed += 1;
                 }
             }
+            // Purge removed ids from the FIFO index so it cannot grow unbounded
+            // under churn that stays under the capacity cap.
+            self.insertion_order
+                .retain(|id| !container_ids.contains(id));
         }
         update
     }
@@ -825,6 +832,35 @@ mod tests {
         assert_eq!(update.removed, 1);
         assert!(cache.is_empty());
         assert_eq!(cache.pod_count(), 0);
+        // The FIFO index must not keep a tombstone for the removed container.
+        assert_eq!(cache.insertion_order.len(), 0);
+    }
+
+    #[test]
+    fn remove_purges_insertion_order() {
+        let mut cache = BindingCache::new();
+        cache.upsert(ID, metadata());
+        assert_eq!(cache.insertion_order.len(), 1);
+
+        cache.remove(ID);
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.insertion_order.len(), 0);
+    }
+
+    #[test]
+    fn churn_under_cap_does_not_leak_insertion_order() {
+        // Add + remove the same pod's container repeatedly, always staying under
+        // the capacity cap. Without purging on removal the FIFO index would grow
+        // one tombstone per cycle (the bug this guards against).
+        let mut cache = BindingCache::with_max_containers(1024);
+        for _ in 0..100 {
+            cache.apply_pod_snapshot(pod_snapshot());
+            cache.remove_pod("pod-uid-1");
+        }
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.insertion_order.len(), 0);
     }
 
     #[test]
