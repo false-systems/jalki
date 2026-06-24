@@ -10,10 +10,11 @@ use tracing_subscriber::EnvFilter;
 use jalki::enrich::CachedEnricher;
 use jalki::kube_watch;
 use jalki::probes::{
-    process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
+    file_open::FileOpen, process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
     tcp_retransmit::TcpRetransmit,
 };
 use jalki::runtime::Runtime;
+use jalki::sensitive_paths;
 
 mod cli;
 
@@ -69,6 +70,15 @@ struct Cli {
         global = true
     )]
     cgroup_root: String,
+
+    /// Sensitive path pattern for kernel.file.open capture. Repeatable; comma-separated values are accepted.
+    #[arg(
+        long,
+        env = "JALKI_SENSITIVE_PATHS",
+        value_delimiter = ',',
+        global = true
+    )]
+    sensitive_path: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -175,9 +185,11 @@ async fn main() -> Result<()> {
 async fn run_daemon(cli: Cli) -> Result<()> {
     let mut runtime = Runtime::new(&cli.ebpf_path)
         .attach(ProcessExec::new())
+        .attach(FileOpen::new())
         .attach(TcpConnect::new())
         .attach(TcpClose::new())
-        .attach(TcpRetransmit::new());
+        .attach(TcpRetransmit::new())
+        .sensitive_paths(sensitive_paths::parse_sensitive_paths(&cli.sensitive_path));
 
     if let Some(cluster) = cli.cluster.clone() {
         runtime = runtime.cluster(cluster);

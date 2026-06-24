@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::enrich::{bind_record, RuntimeEnricher};
 use crate::probe::Probe;
+use crate::sensitive_paths::SensitivePathMatcher;
 use crate::store::EventStore;
 
 /// Per-probe drop counter, exposed for metrics.
@@ -43,6 +44,7 @@ pub fn spawn_reader(
     stats: Arc<ProbeStats>,
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
+    sensitive_path_matcher: Arc<SensitivePathMatcher>,
 ) -> Result<()> {
     let map_name = probe.ring_buffer_map().to_string();
 
@@ -65,6 +67,7 @@ pub fn spawn_reader(
             &probe_name,
             store,
             enricher,
+            sensitive_path_matcher,
         );
     });
 
@@ -80,6 +83,7 @@ fn drain_loop(
     probe_name: &str,
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
+    sensitive_path_matcher: Arc<SensitivePathMatcher>,
 ) {
     let sample_rate = probe.sample_rate();
     let do_sampling = sample_rate < 1.0;
@@ -110,6 +114,11 @@ fn drain_loop(
             match probe.to_evidence(raw, cluster) {
                 Ok(evidence) => {
                     for record in evidence.records {
+                        if !record_matches_sensitive_paths(&record, sensitive_path_matcher.as_ref())
+                        {
+                            stats.events_sampled_out.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let record = bind_record(record, enricher.as_ref());
                         // The local debug store keeps the lean occurrence shape used by
                         // IPC stream/watch. Durable sinks project D6 metadata later via
@@ -135,4 +144,19 @@ fn drain_loop(
         // TODO: wire up epoll via ring_buf fd for zero-latency wakeup.
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+fn record_matches_sensitive_paths(
+    record: &EvidenceRecord,
+    sensitive_path_matcher: &SensitivePathMatcher,
+) -> bool {
+    if record.occurrence.occurrence_type.as_str() != "kernel.file.open" {
+        return true;
+    }
+
+    record
+        .occurrence
+        .labels
+        .get("resource_ref_id")
+        .is_some_and(|path| sensitive_path_matcher.is_match(path))
 }

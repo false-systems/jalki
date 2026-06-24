@@ -14,8 +14,8 @@ pub mod retry;
 pub mod sink;
 
 pub use event::{
-    DecodeError, KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent,
-    TcpState,
+    DecodeError, FileOpenEvent, KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent,
+    TcpRetransmitEvent, TcpState,
 };
 pub use evidence::{
     BindingProvenance, EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata,

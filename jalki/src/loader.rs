@@ -8,13 +8,18 @@ use tracing::{info, warn};
 
 use crate::filter;
 use crate::probe::{Attachment, Probe};
+use crate::sensitive_paths;
 
 /// Load the eBPF object and attach probes described by their trait metadata.
 ///
 /// The loader is probe-agnostic. It reads `program_name()` and `attachments()`
 /// from each probe to find and attach the right eBPF programs. No hardcoded
 /// program names — add a new probe, implement the trait, it just works.
-pub fn load_and_attach(ebpf_path: &Path, probes: &[Arc<dyn Probe>]) -> Result<Ebpf> {
+pub fn load_and_attach(
+    ebpf_path: &Path,
+    probes: &[Arc<dyn Probe>],
+    sensitive_paths: &[String],
+) -> Result<Ebpf> {
     let data = std::fs::read(ebpf_path)
         .with_context(|| format!("failed to read eBPF object at {}", ebpf_path.display()))?;
 
@@ -27,6 +32,7 @@ pub fn load_and_attach(ebpf_path: &Path, probes: &[Arc<dyn Probe>]) -> Result<Eb
 
     // Populate self-filter before attaching probes.
     filter::populate_pid_filter(&mut ebpf)?;
+    sensitive_paths::populate_sensitive_prefixes(&mut ebpf, sensitive_paths)?;
 
     let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
 

@@ -5,6 +5,24 @@ pub const AF_INET6: u16 = 10;
 /// Maximum executable path bytes captured for process.exec.
 pub const PROCESS_EXEC_FILENAME_LEN: usize = 256;
 
+/// Maximum path bytes captured for file.open.
+pub const FILE_OPEN_PATH_LEN: usize = 256;
+
+/// Maximum sensitive path prefixes accepted by the in-kernel file.open gate.
+pub const MAX_SENSITIVE_PREFIXES: u32 = 16;
+
+/// Maximum prefix bytes in the in-kernel sensitive path gate.
+pub const SENSITIVE_PREFIX_LEN: usize = 128;
+
+/// One configured sensitive path prefix for the in-kernel file.open gate.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SensitivePrefix {
+    pub len: u32,
+    pub _pad1: u32,
+    pub bytes: [u8; SENSITIVE_PREFIX_LEN],
+}
+
 /// Event emitted by the tcp_connect fexit probe.
 ///
 /// Captures a TCP connection attempt: 4-tuple, return code, process info.
@@ -95,6 +113,23 @@ pub struct ProcessExecEvent {
     pub argv_hash: [u8; 32],
 }
 
+/// Event emitted by the security_file_open fexit probe.
+///
+/// Captures sensitive-path opens only. `ret` is the LSM hook return value:
+/// 0 means allowed, negative errno means denied.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FileOpenEvent {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub cgroup_id: u64,
+    pub ret: i32,
+    pub flags: u32,
+    pub comm: [u8; 16],
+    pub path: [u8; FILE_OPEN_PATH_LEN],
+}
+
 /// Maximum number of PIDs in the self-filter map.
 pub const MAX_FILTERED_PIDS: u32 = 64;
 
@@ -115,6 +150,12 @@ unsafe impl aya::Pod for TcpRetransmitEvent {}
 
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for ProcessExecEvent {}
+
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for FileOpenEvent {}
+
+#[cfg(feature = "userspace")]
+unsafe impl aya::Pod for SensitivePrefix {}
 
 impl TcpConnectEvent {
     /// Read the process name as a UTF-8 string (truncated at first null).
@@ -145,6 +186,30 @@ impl ProcessExecEvent {
 
     pub fn filename_str(&self) -> &str {
         nul_terminated_str(&self.filename)
+    }
+}
+
+impl FileOpenEvent {
+    pub fn comm_str(&self) -> &str {
+        nul_terminated_str(&self.comm)
+    }
+
+    pub fn path_str(&self) -> &str {
+        nul_terminated_str(&self.path)
+    }
+
+    pub fn path_truncated(&self) -> bool {
+        !self.path.iter().any(|&b| b == 0)
+    }
+}
+
+impl SensitivePrefix {
+    pub const fn empty() -> Self {
+        Self {
+            len: 0,
+            _pad1: 0,
+            bytes: [0u8; SENSITIVE_PREFIX_LEN],
+        }
     }
 }
 
@@ -184,6 +249,17 @@ mod tests {
     }
 
     #[test]
+    fn file_open_event_size() {
+        // Stable for BPF ring buffer reads.
+        assert_eq!(mem::size_of::<FileOpenEvent>(), 304);
+    }
+
+    #[test]
+    fn sensitive_prefix_size() {
+        assert_eq!(mem::size_of::<SensitivePrefix>(), 136);
+    }
+
+    #[test]
     fn comm_str_null_terminated() {
         let mut evt = unsafe { mem::zeroed::<TcpConnectEvent>() };
         evt.comm[0] = b'n';
@@ -206,5 +282,12 @@ mod tests {
         let mut evt = unsafe { mem::zeroed::<ProcessExecEvent>() };
         evt.filename[..9].copy_from_slice(b"/bin/true");
         assert_eq!(evt.filename_str(), "/bin/true");
+    }
+
+    #[test]
+    fn file_open_path_str() {
+        let mut evt = unsafe { mem::zeroed::<FileOpenEvent>() };
+        evt.path[..11].copy_from_slice(b"/etc/shadow");
+        assert_eq!(evt.path_str(), "/etc/shadow");
     }
 }

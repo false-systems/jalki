@@ -10,7 +10,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use jalki_common::{
-    ProcessExecEvent as RawProcessExec, TcpCloseEvent as RawTcpClose,
+    FileOpenEvent as RawFileOpen, ProcessExecEvent as RawProcessExec, TcpCloseEvent as RawTcpClose,
     TcpConnectEvent as RawTcpConnect, TcpRetransmitEvent as RawTcpRetransmit, AF_INET6,
 };
 use thiserror::Error;
@@ -36,6 +36,7 @@ pub enum DecodeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelEvent {
     ProcessExec(ProcessExecEvent),
+    FileOpen(FileOpenEvent),
     TcpConnect(TcpConnectEvent),
     TcpClose(TcpCloseEvent),
     TcpRetransmit(TcpRetransmitEvent),
@@ -46,6 +47,7 @@ impl KernelEvent {
     pub fn observed_at_ns(&self) -> u64 {
         match self {
             KernelEvent::ProcessExec(e) => e.observed_at_ns,
+            KernelEvent::FileOpen(e) => e.observed_at_ns,
             KernelEvent::TcpConnect(e) => e.observed_at_ns,
             KernelEvent::TcpClose(e) => e.observed_at_ns,
             KernelEvent::TcpRetransmit(e) => e.observed_at_ns,
@@ -55,6 +57,7 @@ impl KernelEvent {
     pub fn pid(&self) -> u32 {
         match self {
             KernelEvent::ProcessExec(e) => e.pid,
+            KernelEvent::FileOpen(e) => e.pid,
             KernelEvent::TcpConnect(e) => e.pid,
             KernelEvent::TcpClose(e) => e.pid,
             KernelEvent::TcpRetransmit(e) => e.pid,
@@ -64,10 +67,47 @@ impl KernelEvent {
     pub fn cgroup_id(&self) -> u64 {
         match self {
             KernelEvent::ProcessExec(e) => e.cgroup_id,
+            KernelEvent::FileOpen(e) => e.cgroup_id,
             KernelEvent::TcpConnect(e) => e.cgroup_id,
             KernelEvent::TcpClose(e) => e.cgroup_id,
             KernelEvent::TcpRetransmit(e) => e.cgroup_id,
         }
+    }
+}
+
+/// A sensitive file open observed via security_file_open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOpenEvent {
+    pub observed_at_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub cgroup_id: u64,
+    pub ret: i32,
+    pub flags: u32,
+    pub comm: String,
+    pub path: String,
+    pub path_truncated: bool,
+}
+
+impl FileOpenEvent {
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, DecodeError> {
+        let raw = read_raw::<RawFileOpen>(raw)?;
+        Ok(Self {
+            observed_at_ns: raw.timestamp_ns,
+            pid: raw.pid,
+            uid: raw.uid,
+            cgroup_id: raw.cgroup_id,
+            ret: raw.ret,
+            flags: raw.flags,
+            comm: raw.comm_str().to_string(),
+            path: raw.path_str().to_string(),
+            path_truncated: raw.path_truncated(),
+        })
+    }
+
+    /// Whether the open was allowed by the kernel/LSM hook.
+    pub fn succeeded(&self) -> bool {
+        self.ret == 0
     }
 }
 
@@ -322,8 +362,8 @@ fn ip_from(raw: &[u8; 16], family: u16) -> IpAddr {
 mod tests {
     use super::*;
     use jalki_common::{
-        ProcessExecEvent as RawExec, TcpCloseEvent as RawClose, TcpConnectEvent as RawConnect,
-        TcpRetransmitEvent as RawRetransmit,
+        FileOpenEvent as RawFileOpen, ProcessExecEvent as RawExec, TcpCloseEvent as RawClose,
+        TcpConnectEvent as RawConnect, TcpRetransmitEvent as RawRetransmit,
     };
 
     fn raw_bytes<T: Copy>(value: &T) -> Vec<u8> {
@@ -351,6 +391,71 @@ mod tests {
         let len = b.len().min(out.len());
         out[..len].copy_from_slice(&b[..len]);
         out
+    }
+
+    fn path(s: &str) -> [u8; jalki_common::FILE_OPEN_PATH_LEN] {
+        let mut out = [0u8; jalki_common::FILE_OPEN_PATH_LEN];
+        let b = s.as_bytes();
+        let len = b.len().min(out.len());
+        out[..len].copy_from_slice(&b[..len]);
+        out
+    }
+
+    #[test]
+    fn decode_file_open_round_trip() {
+        let raw = RawFileOpen {
+            timestamp_ns: 123,
+            pid: 456,
+            uid: 1000,
+            cgroup_id: 789,
+            ret: -13,
+            flags: 42,
+            comm: comm16("cat"),
+            path: path("/etc/shadow"),
+        };
+
+        let decoded = FileOpenEvent::from_bytes(&raw_bytes(&raw)).unwrap();
+
+        assert_eq!(decoded.observed_at_ns, 123);
+        assert_eq!(decoded.pid, 456);
+        assert_eq!(decoded.uid, 1000);
+        assert_eq!(decoded.cgroup_id, 789);
+        assert_eq!(decoded.ret, -13);
+        assert_eq!(decoded.flags, 42);
+        assert_eq!(decoded.comm, "cat");
+        assert_eq!(decoded.path, "/etc/shadow");
+        assert!(!decoded.path_truncated);
+    }
+
+    #[test]
+    fn decode_file_open_marks_full_path_buffer_truncated() {
+        let raw = RawFileOpen {
+            timestamp_ns: 123,
+            pid: 456,
+            uid: 1000,
+            cgroup_id: 789,
+            ret: 0,
+            flags: 42,
+            comm: comm16("cat"),
+            path: [b'a'; jalki_common::FILE_OPEN_PATH_LEN],
+        };
+
+        let decoded = FileOpenEvent::from_bytes(&raw_bytes(&raw)).unwrap();
+
+        assert!(decoded.path_truncated);
+    }
+
+    #[test]
+    fn decode_file_open_too_short() {
+        let err = FileOpenEvent::from_bytes(&[0u8; 8]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            DecodeError::TooShort {
+                expected: 304,
+                actual: 8
+            }
+        ));
     }
 
     #[test]

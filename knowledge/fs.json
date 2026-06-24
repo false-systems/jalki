@@ -4,39 +4,33 @@
   "description": "Filesystem kernel functions for I/O observability",
   "probes": [
     {
-      "function": "vfs_open",
+      "function": "security_file_open",
       "attachment": "fexit",
-      "event_type": "kernel.fs.open",
+      "event_type": "kernel.file.open",
       "layer": "fs",
       "answers": [
-        "which files is a process opening",
-        "are file opens failing",
-        "what is accessing this path"
+        "which sensitive files is a process opening",
+        "did a process open a service account token",
+        "what process touched a watched path"
       ],
-      "keywords": ["open", "file", "access", "path", "permission denied", "no such file"],
+      "keywords": ["open", "file", "access", "path", "permission denied", "secret", "token", "ssh", "shadow"],
       "fields": [
-        { "name": "pid",      "type": "u32",   "meaning": "process opening the file",            "important": true },
-        { "name": "command",  "type": "string", "meaning": "process name",                        "important": true },
-        { "name": "filename", "type": "string", "meaning": "path being opened",                   "important": true },
-        { "name": "ret",      "type": "i32",   "meaning": "0 success, negative errno",            "important": true }
+        { "name": "pid",       "type": "u32",    "meaning": "process opening the file",           "important": true },
+        { "name": "command",   "type": "string", "meaning": "process name",                       "important": true },
+        { "name": "path",      "type": "string", "meaning": "sensitive path being opened",        "important": true },
+        { "name": "ret",       "type": "i32",    "meaning": "0 allowed, negative errno denied",   "important": true },
+        { "name": "cgroup_id", "type": "u64",    "meaning": "runtime binding key for enrichment", "important": true }
       ],
-      "use_when": "you need to see which files a process is touching. fexit gives you the return value — ENOENT means file not found, EACCES means permission denied.",
-      "not_when": "you need I/O throughput — use vfs_read/vfs_write for bytes transferred.",
+      "use_when": "you need to see sensitive-path opens such as service-account tokens, kube configs, ssh keys, or /etc/shadow. fexit gives the allow/deny return value.",
+      "not_when": "you need all file opens or I/O throughput — this probe is intentionally gated to sensitive paths only.",
       "combine_with": ["vfs_write"],
       "interpretations": [
         {
-          "pattern": "ret == -2 (ENOENT)",
-          "errno": "ENOENT",
-          "conclusion": "file not found — the path does not exist",
-          "severity": "warning",
-          "action": "check if the expected file exists. may be a missing configmap mount or wrong path."
-        },
-        {
           "pattern": "ret == -13 (EACCES)",
           "errno": "EACCES",
-          "conclusion": "permission denied — the process does not have access to this file",
-          "severity": "error",
-          "action": "check file permissions and securityContext. the container may need a different UID or fsGroup."
+          "conclusion": "permission denied — the process attempted a watched sensitive-path open that the kernel denied",
+          "severity": "warning",
+          "action": "check whether the denied open is expected for the workload identity."
         }
       ]
     },

@@ -1,13 +1,14 @@
 #![no_std]
 #![no_main]
 
+mod file_open;
 mod process_exec;
 mod tcp_close;
 mod tcp_connect;
 mod tcp_retransmit;
 
 use aya_ebpf::macros::{fentry, fexit, map, tracepoint};
-use aya_ebpf::maps::{HashMap, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::FEntryContext;
 use aya_ebpf::programs::FExitContext;
 use aya_ebpf::programs::TracePointContext;
@@ -35,6 +36,20 @@ static TCP_CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 #[map]
 static TCP_RETRANSMIT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+/// Ring buffer for FileOpenEvent (fexit/security_file_open).
+#[map]
+static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+/// Configured sensitive path prefixes for the in-kernel file.open gate.
+#[map]
+static SENSITIVE_PREFIXES: Array<jalki_common::SensitivePrefix> =
+    Array::with_max_entries(jalki_common::MAX_SENSITIVE_PREFIXES, 0);
+
+/// Per-CPU scratch event buffer for file.open path rendering.
+#[map]
+static FILE_OPEN_SCRATCH: PerCpuArray<jalki_common::FileOpenEvent> =
+    PerCpuArray::with_max_entries(1, 0);
+
 // === Probe Entrypoints ===
 
 #[tracepoint(category = "sched", name = "sched_process_exec")]
@@ -55,6 +70,11 @@ pub fn jalki_tcp_close(ctx: FExitContext) -> i32 {
 #[fentry(function = "tcp_retransmit_skb")]
 pub fn jalki_tcp_retransmit(ctx: FEntryContext) -> i32 {
     tcp_retransmit::handle(&ctx)
+}
+
+#[fexit(function = "security_file_open")]
+pub fn jalki_file_open(ctx: FExitContext) -> i32 {
+    file_open::handle(&ctx)
 }
 
 // === Shared Helpers ===
