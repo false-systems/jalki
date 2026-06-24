@@ -5,19 +5,17 @@ use aya_ebpf::helpers::{
 };
 use aya_ebpf::programs::FExitContext;
 
-use jalki_common::{FileOpenEvent, FILE_OPEN_PATH_LEN, MAX_SENSITIVE_PREFIXES};
+use jalki_common::{
+    FileOpenEvent, FILE_F_FLAGS_OFFSET, FILE_F_PATH_OFFSET, FILE_OPEN_PATH_LEN,
+    MAX_SENSITIVE_PREFIXES,
+};
 
 use crate::{is_self_filtered, FILE_OPEN_EVENTS, FILE_OPEN_SCRATCH, SENSITIVE_PREFIXES};
 
-/// Offset of `struct file.f_path` on the kernels this v0 probe targets.
-///
-/// `bpf_d_path` needs `struct path *`. Aya 0.1 does not expose CO-RE field
-/// relocation helpers, so this remains the one v0 kernel-layout assumption in
-/// the file-open probe and is validated by Lima kernel-in-the-loop tests.
-const FILE_F_PATH_OFFSET: usize = 64;
-
-/// Offset of `struct file.f_flags` on the kernels this v0 probe targets.
-const FILE_F_FLAGS_OFFSET: usize = 40;
+// `struct file` field offsets (f_path for bpf_d_path, f_flags) are compile-time
+// constants shared from `jalki_common` and verified against kernel BTF at load
+// by `jalki::file_offsets`. They must be constant: `bpf_d_path` requires a
+// verifier-known `struct path *`, which a runtime offset cannot provide.
 
 /// Handle fexit/security_file_open.
 ///
@@ -61,7 +59,7 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         path: [0u8; FILE_OPEN_PATH_LEN],
     };
 
-    let file_path = (file as *mut u8).wrapping_add(FILE_F_PATH_OFFSET) as *mut path;
+    let file_path = (file as *mut u8).wrapping_add(FILE_F_PATH_OFFSET as usize) as *mut path;
     let path_len = unsafe {
         aya_ebpf::helpers::gen::bpf_d_path(
             file_path,
@@ -87,8 +85,10 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
 
 #[inline(always)]
 fn read_file_flags(file: u64) -> u32 {
-    unsafe { bpf_probe_read_kernel((file as *const u8).add(FILE_F_FLAGS_OFFSET) as *const u32) }
-        .unwrap_or(0)
+    unsafe {
+        bpf_probe_read_kernel((file as *const u8).add(FILE_F_FLAGS_OFFSET as usize) as *const u32)
+    }
+    .unwrap_or(0)
 }
 
 #[inline(always)]

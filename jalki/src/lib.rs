@@ -1,5 +1,6 @@
 pub mod descriptor;
 pub mod enrich;
+pub mod file_offsets;
 pub mod filter;
 pub mod ipc;
 pub mod knowledge;

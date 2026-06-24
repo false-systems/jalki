@@ -33,6 +33,9 @@ pub fn load_and_attach(
     // Populate self-filter before attaching probes.
     filter::populate_pid_filter(&mut ebpf)?;
     sensitive_paths::populate_sensitive_prefixes(&mut ebpf, sensitive_paths)?;
+    // Verify the file.open probe's struct file offsets against kernel BTF
+    // (warns loudly on mismatch; the eBPF probe uses the compiled constants).
+    crate::file_offsets::check_file_offsets();
 
     let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
 

@@ -8,6 +8,17 @@ pub const PROCESS_EXEC_FILENAME_LEN: usize = 256;
 /// Maximum path bytes captured for file.open.
 pub const FILE_OPEN_PATH_LEN: usize = 256;
 
+/// `struct file` field offsets used by the file.open eBPF probe.
+///
+/// `bpf_d_path` needs a verifier-known `struct path *`, which requires a
+/// compile-time-constant offset (a runtime offset is rejected by the verifier),
+/// and this aya version does not expose CO-RE field relocation — so these are
+/// constants. `jalki::file_offsets` resolves the running kernel's real offsets
+/// from BTF at startup and logs loudly if they differ, so a layout mismatch is
+/// diagnosable instead of a silent no-op.
+pub const FILE_F_PATH_OFFSET: u32 = 64;
+pub const FILE_F_FLAGS_OFFSET: u32 = 40;
+
 /// Maximum sensitive path prefixes accepted by the in-kernel file.open gate.
 pub const MAX_SENSITIVE_PREFIXES: u32 = 16;
 
