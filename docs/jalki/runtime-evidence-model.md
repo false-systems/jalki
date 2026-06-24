@@ -1,18 +1,18 @@
 # Runtime Evidence Model
 
-> **⚠ AMENDED by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22).** Jälki no longer writes to Ahti (`jälki → Polku → Vartio → Ahti`). The **payload field shapes** below survive as the evidence Jälki emits to Vartio, but every "**Ahti binding**" line and the "entity_version / relationship_claim records Jälki writes" are **superseded** — Vartio derives those when it interprets. Plane-B evidence must be **neutral** (no severity / root-cause); see ADR-0002 §D4.
+> **Reconciled to [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-23).** Topology is `jälki → Polku → Vartio → Ahti`: Jälki emits **neutral** FALSE Protocol occurrences to a pipeline sink. It does **not** write to Ahti, and does **not** write `entity_version`/`relationship_claim` records — Vartio derives those when it interprets. The payload shapes below are the contract for Jälki's emitted evidence (`jalki-evidence::normalize` builds them; `VartioCore.Importer.Jalki` maps them). `process.exec`, `tcp.connect`, `tcp.close`, `tcp.retransmit` are **implemented**; the rest are planned.
 
-This document defines the core evidence types Jälki agents produce, with source mechanism, required and optional fields, Ahti binding, and the entity / relationship records each evidence type can support.
+This document defines the core evidence types Jälki agents produce: source mechanism, required/optional payload fields, the Plane-B occurrence they map to, and the entities/relationships Vartio can derive from them.
 
-The vocabulary used here is normative. Every name and every field shape **MUST** be backed by a Jälki-owned `definition` record in the `jalki` namespace (see [`ahti-record-mapping.md`](./ahti-record-mapping.md) §5 and [`probe-definitions.md`](./probe-definitions.md)).
+The vocabulary is normative. Field shapes are encoded by `jalki-evidence` on emit and validated by the Vartio importer on ingest — not by an Ahti `definition` written by Jälki.
 
 ## 0. Common envelope (recap)
 
-Every record discussed below carries the Ahti envelope fields described in [`ahti-record-mapping.md`](./ahti-record-mapping.md) §0:
+Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_container_id` / `k8s_namespace`, optional `github_run_id`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B.
 
-- `record_kind`, `namespace = "jalki"`, `producer_id`, `evidence_level`, `retention_class`, `event_time`, `schema_ref`, optional `source_ref`, `evidence_refs`, `lineage_refs`.
+- `observed_at` (kernel CLOCK_BOOTTIME) is preserved; ingest time is never set by Jälki.
 
-This document only specifies the **payload** shape per evidence type, plus the entity and relationship records each can support.
+This document specifies the **payload** shape per evidence type, plus what Vartio can derive from each.
 
 ## 1. Source mechanism — fentry vs fexit vs tracepoint
 
@@ -25,7 +25,7 @@ For every evidence type below, the **source mechanism** field constrains how the
 | **tracepoint** | Stable kernel-defined trace point; preferred when one exists (e.g. `sched/sched_switch`). |
 | **kprobe / kretprobe** | Only when no fentry/fexit/tracepoint covers the function and the symbol is non-trace-safe. Document why. |
 
-The mechanism is recorded on the **probe plan template** (see [`probe-definitions.md`](./probe-definitions.md)), not on every event. Per-event records do **NOT** carry the mechanism — it is implied by `occurrence_type` and the linked `definition`.
+The mechanism is recorded on the probe metadata and projected into each occurrence as `hook_kind` / `kernel_function` labels. That makes the capture path explicit even before Vartio maps the event into its downstream record shape.
 
 ## 2. Evidence type catalogue
 
@@ -60,15 +60,15 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `clock_source` | string | e.g. `CLOCK_BOOTTIME+wall_offset` |
 | `clock_skew_estimate_ms` | i32 | |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.process.exec`, `schema_ref → jalki/jalki-control/definition/kernel.process.exec.v1`.
+**Plane B occurrence type:** `kernel.process.exec` — **implemented** via `tracepoint:sched/sched_process_exec`. Emitted neutral to Polku→Vartio; `ppid` is omitted when unresolved; argv is carried only as `argv_hash`.
 
-**Entity records derived:** `entity_version` of `entity_type = process` with `logical_key = process/<node_id>/<pid>/<start_time_ns>`. The `kernel.process.exec` occurrence is cited in `lineage_refs` of the entity_version.
+**Vartio can derive (entity):** a `process` `entity_version` keyed `process/<node_id>/<pid>/<start_time_ns>`, linking it to this `kernel.process.exec` occurrence as supporting evidence.
 
-**Relationship records derived:**
+**Vartio can derive (relationships):**
 
 - `process_in_cgroup` (when `cgroup_id` resolves to a known `cgroup` entity).
 - `process_in_container` (when `container_id` resolves).
-- `container_in_pod` (when both `container_id` and `pod_uid` are present, written once per container lifetime).
+- `container_in_pod` (when both `container_id` and `pod_uid` are present; once per container lifetime).
 
 **Sensitive content note:** raw `argv` may contain secrets. Default agent profile **MUST** emit `argv_hash` only. Operators may opt in to raw `argv` per profile, with awareness that the record will be subject to operator-managed redaction.
 
@@ -95,9 +95,9 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `parent_comm` | string | |
 | `cgroup_id` | u64 | |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.process.fork`.
+**Plane B occurrence type:** `kernel.process.fork`. *Planned — not yet implemented.*
 
-**Entity records derived:** none on fork alone. The new process entity is created on the subsequent `kernel.process.exec` (which may never come if the child execs directly into a thread; in that case the entity is created from `sched_process_exec`).
+**Vartio can derive (entity):** none on fork alone. The new process entity is created on the subsequent `kernel.process.exec` (which may never come if the child execs directly into a thread; in that case the entity is created from `sched_process_exec`).
 
 ---
 
@@ -123,9 +123,9 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `cgroup_id` | u64 | |
 | `signal` | i32 | Termination signal if killed |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.process.exit`.
+**Plane B occurrence type:** `kernel.process.exit`. *Planned — not yet implemented.*
 
-**Entity records derived:** terminal `entity_version` for the process, payload includes `terminated_at = event_time` and `exit_code`.
+**Vartio can derive (entity):** terminal `entity_version` for the process, payload includes `terminated_at = event_time` and `exit_code`.
 
 ---
 
@@ -160,11 +160,11 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `result` | string | `"success" | "failure"` |
 | `errno` | i32 | Present on failure |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.network.connect`.
+**Plane B occurrence type:** `kernel.network.connect` / current implementation name `kernel.tcp.connect`.
 
 **Known constraint:** `destination_ip = 0.0.0.0` on Cilium-managed connections when the destination has not yet been resolved at fexit. This is **not** a bug — see top-level `CLAUDE.md` "Known Constraints". Jälki **SHOULD** still emit the record (the agent must not silently drop it); downstream consumers handle the missing destination.
 
-**Relationship records derived:**
+**Vartio can derive (relationships):**
 
 - `process_connected_to_endpoint` from the `process` entity → an endpoint `reference` (`external_uri = tcp-endpoint://<dst_ip>:<dst_port>`). The relationship is **mechanical** ("this process attempted this connect"), not interpretive ("this process is the payments API"). v0 may defer this and emit only the `occurrence`.
 
@@ -178,7 +178,7 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 
 **Required payload fields (accept):** `node_id`, `pid`, `protocol`, `local_port`, `peer_ip`, `peer_port`, `kernel_time_ns`, `agent_recv_time`. Optional: `local_ip`, `cgroup_id`, `container_id`, `pod_uid`, `socket_cookie`.
 
-**Ahti binding:** two distinct `occurrence_type`s, two distinct `record_schema` definitions.
+**Plane B occurrence types:** two distinct `occurrence_type`s (`kernel.network.listen`, `kernel.network.accept`). *Planned — not yet implemented.*
 
 ---
 
@@ -210,7 +210,7 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `count` | u32 | Default `1`; agents **MAY** coalesce identical events within a small window and report `count > 1` (the agent profile declares the window) |
 | `bytes_in_flight` | u32 | If readable from `tcp_sock` |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.tcp.retransmit`.
+**Plane B occurrence type:** `kernel.tcp.retransmit` — **implemented**.
 
 **Interpretation note:** The TCP state is **observed**, not interpreted. Jälki **MUST NOT** include a field like `interpretation = "network problem"`. Lähde maps `(occurrence_type, tcp_state)` to a meaning; that mapping lives in Lähde, not in Jälki.
 
@@ -245,11 +245,11 @@ The mechanism is recorded on the **probe plan template** (see [`probe-definition
 | `errno` | i32 | On denial |
 | `sensitive_class` | string | If the path matches a configured sensitive-path policy; classifier is a `vocabulary_term` definition |
 
-**Ahti binding:** `occurrence`, `occurrence_type = kernel.file.open`.
+**Plane B occurrence type:** `kernel.file.open`. *Planned — not yet implemented.*
 
 **Scope guard:** the default agent profile **MUST NOT** capture every open. The agent profile **MUST** declare which path patterns are captured. Blanket capture is operationally infeasible and is forbidden by default — see [`local-agent-state.md`](./local-agent-state.md) §sampling.
 
-**Relationship records derived:** `process_opened_file` from `process` entity → the `kernel.file.open` occurrence (or a `file_path` reference if the path is hot enough to warrant a stable handle).
+**Vartio can derive (relationships):** `process_opened_file` from `process` entity → the `kernel.file.open` occurrence (or a `file_path` reference if the path is hot enough to warrant a stable handle).
 
 ---
 
@@ -282,7 +282,7 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 | `node_id` | string | |
 | `gap_start` | RFC3339 | Wall-clock estimate; nullable when only monotonic time is known |
 | `gap_end` | RFC3339 | |
-| `cause` | string | `"agent_offline" | "ringbuffer_overflow" | "sampling_drop" | "ahti_unreachable" | "probe_unloaded"` |
+| `cause` | string | `"agent_offline" | "ringbuffer_overflow" | "sampling_drop" | "pipeline_unreachable" | "probe_unloaded"`, plus sink-specific terminal causes such as `"sink_rejected"` |
 | `affected_probes` | string[] | `occurrence_type` values affected |
 
 **Optional payload fields:**
@@ -292,7 +292,7 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 | `estimated_events_lost` | u64 | Only when the count is known |
 | `note` | string | |
 
-**Ahti binding:** `occurrence`, `occurrence_type = jalki.agent.gap`, `evidence_level = observed`, `retention_class = long`.
+**Plane B occurrence type:** `jalki.agent.gap`, `evidence_level = observed`, `retention_class = long`.
 
 **Why this exists:** consumers **MUST** be able to distinguish "no event happened" from "Jälki was not watching". The gap record is the only honest way to do so. Jälki **MUST NOT** emit a sequence of evidence records that hides a gap.
 
@@ -300,13 +300,15 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 
 ### 2.12 `jalki.agent.lifecycle`
 
-Agent start, stop, probe attach, probe detach, capability snapshot taken. Emitted as `occurrence` records with `occurrence_type = jalki.agent.lifecycle` and a `phase` field. The `lineage_refs` on these events point to the `definition` of the probe plan template and the `reference` of the capability snapshot.
+Agent start, stop, probe attach, probe detach, capability snapshot taken. Emitted as `occurrence` records with `occurrence_type = jalki.agent.lifecycle` and a `phase` field. These are Plane-B occurrences; Vartio may attach lineage to downstream entities when it interprets them.
 
 ## 3. Entity catalogue
 
-### 3.1 Jälki-owned entities (v0)
+> **Jälki does not write `entity_version` records (ADR-0002).** Vartio derives entities from Jälki's occurrences plus the runtime binding Jälki attaches. The taxonomy below is what Jälki's evidence lets Vartio reconstruct.
 
-These entities Jälki **directly observes** and **MAY** emit as `entity_version` records:
+### 3.1 Entities derivable from Jälki evidence (v0)
+
+These are observable from the fields Jälki emits (`pid`, `cgroup_id`, and the enriched `container_id` / `pod_uid`):
 
 | `entity_type` | `logical_key` form | Source |
 |---|---|---|
@@ -317,24 +319,26 @@ These entities Jälki **directly observes** and **MAY** emit as `entity_version`
 
 ### 3.2 Entities Jälki references but does **not** own (v0)
 
-These Jälki refers to via `reference` records (using URI schemes from [`ahti-record-mapping.md`](./ahti-record-mapping.md) §6.2):
+These Jälki refers to through runtime-binding labels and resource refs (using URI schemes from [`ahti-record-mapping.md`](./ahti-record-mapping.md) §6.2 where applicable):
 
 | Concept | Why a reference, not an entity |
 |---|---|
 | `container` | Container runtime is the authoritative producer of container entities |
 | `pod` | A Kubernetes producer is the authoritative writer; Jälki references by `pod_uid` |
 
-Open question (v0): whether Jälki **MAY** emit lightweight `entity_version` records for containers when no Kubernetes producer is present. Default: no. See [`v0-scope.md`](./v0-scope.md) §open-questions.
+Open question (v0): whether Vartio should derive lightweight container entities when no Kubernetes producer is present. Default: no. See [`v0-scope.md`](./v0-scope.md) §open-questions.
 
-### 3.3 Entity write rules
+### 3.3 Entity derivation rules
 
-- Jälki **SHOULD NOT** emit an `entity_version` per occurrence; instead, emit on **lifecycle transitions** (exec, exit, significant cgroup changes).
-- Jälki **MUST** serialize entity_version writes per `logical_key` on the agent to avoid out-of-order supersedence.
-- Every entity_version **SHOULD** carry the originating occurrence in `lineage_refs`.
+- Vartio **SHOULD NOT** derive an `entity_version` per occurrence; instead, derive on lifecycle transitions (exec, exit, significant cgroup changes).
+- Vartio owns supersedence ordering for derived entities.
+- Every derived entity version **SHOULD** cite the originating occurrence in lineage.
 
 ## 4. Relationship catalogue
 
-### 4.1 Permitted in v0
+> **Vartio composes these** from the binding Jälki attaches; Jälki writes no `relationship_claim` records. Actor/ownership attribution remains Vartio's (product-boundaries §2.3).
+
+### 4.1 Mechanical relationships Vartio can derive (v0)
 
 | `relationship_type` | Source → target | Mechanism |
 |---|---|---|
@@ -349,13 +353,15 @@ Jälki **MUST NOT** emit `caused_incident`, `root_cause_of`, `actor_violated_pol
 
 ### 4.3 Relationship write cadence
 
-- Emit a relationship **once** per stable lifetime (e.g. one `process_in_container` per process lifetime).
-- Use `entity_version` updates for state that changes within a stable identity (e.g. process renaming via `prctl(PR_SET_NAME)`).
-- To express that a relationship no longer holds, write a superseding `entity_version` whose payload reflects the new state, or write a new claim with a producer-defined `revoked_at` qualifier (Ahti does not interpret revocation).
+- Vartio should emit a relationship **once** per stable lifetime (e.g. one `process_in_container` per process lifetime).
+- State changes within a stable identity become derived entity updates downstream.
+- To express that a relationship no longer holds, Vartio writes the appropriate superseding downstream record; Jälki only emits the observations.
 
-## 5. Evidence-type → Ahti record kind matrix
+## 5. Evidence-type → downstream record kind
 
-| Evidence | Ahti kind | `evidence_level` | Default `retention_class` |
+> The `occurrence` rows are what **Jälki emits** to Plane B. The `entity_version` / `relationship_claim` / `reference` rows are **derived and written by Vartio**, not Jälki — listed so the downstream shape is clear.
+
+| Evidence | Downstream record kind | `evidence_level` | Default `retention_class` |
 |---|---|---|---|
 | `kernel.process.exec` | `occurrence` | `observed` | `short` |
 | `kernel.process.fork` | `occurrence` | `observed` | `short` |
@@ -397,11 +403,11 @@ Fields with unresolved values **MUST** be omitted, not zero-padded. A missing `c
 - `kernel_time_ns` (CLOCK_BOOTTIME nanoseconds) in payload for skew-tolerant ordering on the same node.
 - `agent_recv_time` in payload for measuring agent-internal delay.
 - `clock_source`, `clock_skew_estimate_ms` in payload when relevant.
-- Ahti's `received_at` is set at ingest; Jälki does not control it.
+- Downstream ingest time is set after the pipeline receives the record; Jälki does not control it.
 
 ### 6.4 Enrichment provenance
 
-When a field is added by enrichment (e.g. `container_id` derived from `cgroup_id`), the record's `evidence_level` is **still** `observed` if the core fact is observed and the enrichment is deterministic. If the enrichment requires a non-deterministic lookup (e.g. a stale cache), set `evidence_level = derived` and add the enrichment cache `reference` to `lineage_refs`. See [`local-agent-state.md`](./local-agent-state.md) §enrichment.
+When a field is added by enrichment (e.g. `container_id` derived from `cgroup_id`), the record's `evidence_level` is **still** `observed` if the core fact is observed and the enrichment is deterministic. If the enrichment uses a cached fallback, Jälki sets `evidence_level = derived`. It does not add Ahti lineage records itself; Vartio may attach downstream lineage when it interprets the occurrence. See [`local-agent-state.md`](./local-agent-state.md) §enrichment.
 
 ## 7. Open questions specific to evidence model
 
@@ -409,7 +415,7 @@ These are propagated to [`v0-scope.md`](./v0-scope.md):
 
 - Which file-open source mechanism to standardize on (LSM `security_file_open` vs. fexit `do_filp_open`).
 - Whether to capture `argv` (raw) or only `argv_hash` by default for `kernel.process.exec`.
-- Whether Jälki **MAY** emit lightweight `container` and `pod` `entity_version` records when no Kubernetes producer is present.
+- Whether Vartio should derive lightweight `container` and `pod` `entity_version` records when no Kubernetes producer is present.
 - Whether `count`-coalesced `tcp_retransmit` occurrences are permitted in v0 and, if so, how long the coalesce window may be.
-- Whether destination endpoint `reference` records are emitted in v0 or deferred.
+- Whether destination endpoint references are derived in v0 or deferred.
 - How `socket_cookie` correlation is preserved across `network.connect` / `network.accept` / `tcp.retransmit` when not always available.
