@@ -282,7 +282,7 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 | `node_id` | string | |
 | `gap_start` | RFC3339 | Wall-clock estimate; nullable when only monotonic time is known |
 | `gap_end` | RFC3339 | |
-| `cause` | string | `"agent_offline" | "ringbuffer_overflow" | "sampling_drop" | "pipeline_unreachable" | "probe_unloaded" | sink-specific terminal causes such as `"sink_rejected"` |
+| `cause` | string | `"agent_offline" | "ringbuffer_overflow" | "sampling_drop" | "pipeline_unreachable" | "probe_unloaded"`, plus sink-specific terminal causes such as `"sink_rejected"` |
 | `affected_probes` | string[] | `occurrence_type` values affected |
 
 **Optional payload fields:**
