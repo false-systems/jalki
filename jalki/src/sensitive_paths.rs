@@ -4,6 +4,14 @@ use aya::Ebpf;
 use jalki_common::{SensitivePrefix, MAX_SENSITIVE_PREFIXES, SENSITIVE_PREFIX_LEN};
 use tracing::{info, warn};
 
+/// Default sensitive-path patterns.
+///
+/// Each pattern's *coarse prefix* (the bytes before its first wildcard) is the
+/// in-kernel gate. Patterns whose wildcard appears early — e.g. `/proc/*/environ`
+/// gates on only `/proc/`, which matches a huge volume of opens that then have to
+/// be dropped by the userspace matcher — are intentionally **not** shipped by
+/// default. Operators can add them explicitly via `--sensitive-path` /
+/// `JALKI_SENSITIVE_PATHS` when the extra ring-buffer traffic is acceptable.
 pub const DEFAULT_SENSITIVE_PATHS: &[&str] = &[
     "/var/run/secrets/",
     "/run/secrets/",
@@ -11,7 +19,6 @@ pub const DEFAULT_SENSITIVE_PATHS: &[&str] = &[
     "/etc/kubernetes/",
     "/root/.ssh/",
     "/home/*/.ssh/",
-    "/proc/*/environ",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,49 +140,41 @@ fn coarse_prefix(pattern: &str) -> &str {
     }
 }
 
+/// Wildcard match supporting `*` (matches any run, including empty) and `?`
+/// (matches one byte); every other byte is literal.
+///
+/// Iterative star-backtracking: O(pattern·value) worst case, no recursion and no
+/// exponential blowup. Patterns are operator-configured and small today; this
+/// keeps the matcher robust even if untrusted/larger patterns are ever wired in.
 fn glob_match(pattern: &[u8], value: &[u8]) -> bool {
-    glob_match_from(pattern, value, 0, 0)
-}
+    let (mut p, mut v) = (0usize, 0usize);
+    // Position of the most recent `*` in the pattern, and the value index it was
+    // matched against, so a mismatch can let that `*` absorb one more byte.
+    let mut star: Option<usize> = None;
+    let mut star_v = 0usize;
 
-fn glob_match_from(pattern: &[u8], value: &[u8], mut pi: usize, mut vi: usize) -> bool {
-    while pi < pattern.len() {
-        match pattern[pi] {
-            b'*' => {
-                while pi + 1 < pattern.len() && pattern[pi + 1] == b'*' {
-                    pi += 1;
-                }
-                if pi + 1 == pattern.len() {
-                    return true;
-                }
-                let next = pi + 1;
-                while vi <= value.len() {
-                    if glob_match_from(pattern, value, next, vi) {
-                        return true;
-                    }
-                    if vi == value.len() {
-                        break;
-                    }
-                    vi += 1;
-                }
-                return false;
-            }
-            b'?' => {
-                if vi >= value.len() {
-                    return false;
-                }
-                pi += 1;
-                vi += 1;
-            }
-            byte => {
-                if value.get(vi).copied() != Some(byte) {
-                    return false;
-                }
-                pi += 1;
-                vi += 1;
-            }
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            star_v = v;
+            p += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            star_v += 1;
+            v = star_v;
+        } else {
+            return false;
         }
     }
-    vi == value.len()
+
+    // Consume any trailing `*`s; the pattern matches iff it is fully consumed.
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 #[cfg(test)]
@@ -197,8 +196,20 @@ mod tests {
     }
 
     #[test]
-    fn glob_edge_cases_match_proc_environ_and_home_ssh() {
+    fn default_patterns_match_home_ssh_not_proc() {
         let matcher = SensitivePathMatcher::default_patterns();
+
+        assert!(matcher.is_match("/home/runner/.ssh/id_rsa"));
+        // /proc/*/environ is intentionally not a default (weak coarse-prefix gate).
+        assert!(!matcher.is_match("/proc/123/environ"));
+    }
+
+    #[test]
+    fn explicit_glob_patterns_match() {
+        let matcher = SensitivePathMatcher::new(vec![
+            "/proc/*/environ".to_string(),
+            "/home/*/.ssh/".to_string(),
+        ]);
 
         assert!(matcher.is_match("/proc/123/environ"));
         assert!(matcher.is_match("/home/runner/.ssh/id_rsa"));
