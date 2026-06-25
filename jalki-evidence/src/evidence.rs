@@ -10,6 +10,13 @@ use std::collections::BTreeMap;
 
 use false_protocol::{Occurrence, Severity};
 
+/// Version of jälki's emitted-occurrence schema — the cross-team wire contract
+/// with Polku and Vartio. Carried on every occurrence as the `schema_version`
+/// label so a real shape change is a negotiated break, not a silent one. New
+/// fields ride "present-but-zero" without a bump; only an incompatible change
+/// bumps this. (See the "present-but-zero, never silently absent" doctrine.)
+pub const SCHEMA_VERSION: &str = "1";
+
 /// How a probe attaches to the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
@@ -200,6 +207,7 @@ impl EvidenceRecord {
         labels.insert("hook_kind".into(), self.probe.hook_kind.as_str().into());
         labels.insert("kernel_function".into(), self.probe.kernel_function);
         labels.insert("observed_at_ns".into(), self.observed_at_ns.to_string());
+        labels.insert("schema_version".into(), SCHEMA_VERSION.into());
         occ
     }
 
@@ -482,6 +490,8 @@ mod tests {
         assert_eq!(get("kernel_function"), Some("tcp_retransmit_skb"));
         // observed time travels with the record
         assert_eq!(get("observed_at_ns"), Some("42"));
+        // schema version stamps every occurrence (the cross-team wire contract)
+        assert_eq!(get("schema_version"), Some(SCHEMA_VERSION));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task,
+    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
     bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::programs::TracePointContext;
@@ -7,7 +8,7 @@ use aya_ebpf::EbpfContext;
 
 use jalki_common::ProcessExecEvent;
 
-use crate::{is_self_filtered, PROCESS_EXEC_EVENTS};
+use crate::{is_self_filtered, PROCESS_EXEC_EVENTS, TASK_OFFSETS};
 
 /// sched_process_exec tracepoint payload offsets after the common trace header.
 ///
@@ -45,7 +46,7 @@ fn try_handle(ctx: &TracePointContext) -> Result<(), i64> {
     let mut event = ProcessExecEvent {
         timestamp_ns: unsafe { bpf_ktime_get_ns() },
         pid: exec_pid,
-        ppid: 0,
+        ppid: read_ppid(),
         uid,
         gid,
         // SAFETY: helper reads the current task's cgroup id and does not
@@ -76,4 +77,34 @@ fn try_handle(ctx: &TracePointContext) -> Result<(), i64> {
     let _ = PROCESS_EXEC_EVENTS.output(&event, 0);
 
     Ok(())
+}
+
+/// Best-effort parent pid via `current->real_parent->tgid`.
+///
+/// Offsets come from the BTF-resolved `TASK_OFFSETS` map (index 0 = real_parent,
+/// 1 = tgid). `bpf_probe_read_kernel` tolerates a runtime offset (unlike
+/// `bpf_d_path`), so this is portable across kernels. If BTF resolution was
+/// unavailable the offsets are 0 and we return 0 — ppid is omitted rather than
+/// read from a guessed offset (present-but-zero).
+#[inline(always)]
+fn read_ppid() -> u32 {
+    let real_parent_off = TASK_OFFSETS.get(0).copied().unwrap_or(0);
+    let tgid_off = TASK_OFFSETS.get(1).copied().unwrap_or(0);
+    if real_parent_off == 0 || tgid_off == 0 {
+        return 0;
+    }
+    // SAFETY: helper returns the current task pointer; no program-supplied
+    // pointer is dereferenced by the helper itself.
+    let task = unsafe { bpf_get_current_task() };
+    if task == 0 {
+        return 0;
+    }
+    let parent: u64 = match unsafe {
+        bpf_probe_read_kernel((task as *const u8).add(real_parent_off as usize) as *const u64)
+    } {
+        Ok(p) if p != 0 => p,
+        _ => return 0,
+    };
+    unsafe { bpf_probe_read_kernel((parent as *const u8).add(tgid_off as usize) as *const u32) }
+        .unwrap_or(0)
 }
