@@ -76,6 +76,12 @@ impl FileOpenEvent {
         occ.labels.insert("flags".into(), self.flags.to_string());
         occ.labels
             .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        // Coverage descriptor: this probe hooks the LSM `security_file_open`
+        // gate, so it witnesses successful opens and LSM-denied opens only —
+        // NOT DAC/path-lookup failures (ENOENT/EACCES from earlier in the open
+        // path). Declared as data so consumers never infer "allowed" from the
+        // absence of a denial. See issue #17.
+        occ.labels.insert("coverage".into(), "lsm_gated".into());
         occ.labels.insert("resource_ref_kind".into(), "file".into());
         occ.labels
             .insert("resource_ref_id".into(), self.path.clone());
@@ -464,6 +470,8 @@ mod tests {
             occ.labels.get("resource_ref_id"),
             Some(&"/var/run/secrets/kubernetes.io/serviceaccount/token".to_string())
         );
+        // Coverage descriptor: consumers must not infer "allowed" from absence of a denial.
+        assert_eq!(occ.labels.get("coverage"), Some(&"lsm_gated".to_string()));
         assert_eq!(occ.process_data.unwrap().command, "cat");
     }
 
