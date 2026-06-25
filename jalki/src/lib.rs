@@ -1,5 +1,6 @@
 pub mod descriptor;
 pub mod enrich;
+pub mod file_offsets;
 pub mod filter;
 pub mod ipc;
 pub mod knowledge;
@@ -10,9 +11,11 @@ pub mod probe;
 pub mod reader;
 pub mod registry;
 pub mod runtime;
+pub mod sensitive_paths;
 pub mod store;
 
 pub mod probes {
+    pub mod file_open;
     pub mod generated;
     pub mod process_exec;
     pub mod tcp_close;

@@ -11,7 +11,8 @@ use false_protocol::{
 };
 
 use crate::event::{
-    KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent, TcpRetransmitEvent,
+    FileOpenEvent, KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent,
+    TcpRetransmitEvent,
 };
 use crate::evidence::{EvidenceRecord, NormalizedEvidence, ProbeMetadata};
 
@@ -20,6 +21,7 @@ impl KernelEvent {
     pub fn to_occurrence(&self, cluster: &str) -> Occurrence {
         match self {
             KernelEvent::ProcessExec(e) => e.to_occurrence(cluster),
+            KernelEvent::FileOpen(e) => e.to_occurrence(cluster),
             KernelEvent::TcpConnect(e) => e.to_occurrence(cluster),
             KernelEvent::TcpClose(e) => e.to_occurrence(cluster),
             KernelEvent::TcpRetransmit(e) => e.to_occurrence(cluster),
@@ -39,6 +41,50 @@ impl KernelEvent {
             occurrence: self.to_occurrence(cluster),
             binding: None,
         })
+    }
+}
+
+impl FileOpenEvent {
+    pub fn to_occurrence(&self, cluster: &str) -> Occurrence {
+        let success = self.succeeded();
+        let outcome = if success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
+        let result = if success { "allowed" } else { "denied" };
+
+        let mut occ = Occurrence::new("jalki/file_open", "kernel.file.open")
+            .severity(Severity::Info)
+            .outcome(outcome)
+            .in_cluster(cluster)
+            .with_entities(vec![
+                format!("process:{}", self.pid),
+                format!("file:{}", self.path),
+            ]);
+
+        occ.process_data = Some(ProcessEventData {
+            pid: self.pid,
+            ppid: None,
+            command: self.comm.clone(),
+            args: None,
+            uid: self.uid,
+            exit_code: None,
+        });
+
+        occ.labels.insert("result".into(), result.into());
+        occ.labels.insert("flags".into(), self.flags.to_string());
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels.insert("resource_ref_kind".into(), "file".into());
+        occ.labels
+            .insert("resource_ref_id".into(), self.path.clone());
+        if self.path_truncated {
+            occ.labels.insert("path_truncated".into(), "true".into());
+        }
+
+        occ.correlation_keys = vec![format!("process:{}", self.pid)];
+        occ
     }
 }
 
@@ -340,6 +386,20 @@ mod tests {
         }
     }
 
+    fn file_open(ret: i32) -> FileOpenEvent {
+        FileOpenEvent {
+            observed_at_ns: 5,
+            pid: 4242,
+            uid: 1000,
+            cgroup_id: 77,
+            ret,
+            flags: 0,
+            comm: "cat".into(),
+            path: "/var/run/secrets/kubernetes.io/serviceaccount/token".into(),
+            path_truncated: false,
+        }
+    }
+
     #[test]
     fn exec_success_is_neutral_and_redacted() {
         let occ = exec_event(0).to_occurrence("prod");
@@ -383,6 +443,51 @@ mod tests {
         assert_eq!(occ.outcome, Some(Outcome::Failure));
         assert!(occ.error.is_none());
         assert_eq!(occ.process_data.unwrap().exit_code, Some(-13));
+    }
+
+    #[test]
+    fn file_open_occurrence_is_neutral() {
+        let occ = file_open(0).to_occurrence("prod");
+
+        assert_eq!(occ.source, "jalki/file_open");
+        assert_eq!(occ.occurrence_type.as_str(), "kernel.file.open");
+        assert_eq!(occ.severity, Severity::Info);
+        assert_eq!(occ.outcome, Some(Outcome::Success));
+        assert!(occ.error.is_none());
+        assert_eq!(occ.labels.get("result"), Some(&"allowed".to_string()));
+        assert_eq!(occ.labels.get("cgroup_id"), Some(&"77".to_string()));
+        assert_eq!(
+            occ.labels.get("resource_ref_kind"),
+            Some(&"file".to_string())
+        );
+        assert_eq!(
+            occ.labels.get("resource_ref_id"),
+            Some(&"/var/run/secrets/kubernetes.io/serviceaccount/token".to_string())
+        );
+        assert_eq!(occ.process_data.unwrap().command, "cat");
+    }
+
+    #[test]
+    fn file_open_marks_truncated_paths() {
+        let mut event = file_open(0);
+        event.path_truncated = true;
+
+        let occ = event.to_occurrence("prod");
+
+        assert_eq!(
+            occ.labels.get("path_truncated"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn file_open_denied_sets_result_denied() {
+        let occ = file_open(-13).to_occurrence("prod");
+
+        assert_eq!(occ.severity, Severity::Info);
+        assert_eq!(occ.outcome, Some(Outcome::Failure));
+        assert!(occ.error.is_none());
+        assert_eq!(occ.labels.get("result"), Some(&"denied".to_string()));
     }
 
     #[test]
@@ -502,6 +607,9 @@ mod tests {
     fn kernel_event_enum_dispatches() {
         let occ = KernelEvent::TcpConnect(connect(0)).to_occurrence("c");
         assert_eq!(occ.occurrence_type.as_str(), "kernel.tcp.connect");
+
+        let occ = KernelEvent::FileOpen(file_open(0)).to_occurrence("c");
+        assert_eq!(occ.occurrence_type.as_str(), "kernel.file.open");
     }
 
     #[test]

@@ -20,11 +20,12 @@ use crate::metrics::{Metrics, SinkLabel, UnboundDropLabel};
 use crate::probe::Probe;
 use crate::probes::generated::GeneratedProbeReader;
 use crate::probes::{
-    process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
+    file_open::FileOpen, process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
     tcp_retransmit::TcpRetransmit,
 };
 use crate::reader::{self, ProbeStats};
 use crate::registry::ProbeRegistry;
+use crate::sensitive_paths;
 use crate::store::EventStore;
 
 /// Builder for configuring and running jälki.
@@ -34,6 +35,7 @@ pub struct Runtime {
     ebpf_path: String,
     cluster: String,
     enricher: Arc<dyn RuntimeEnricher>,
+    sensitive_paths: Vec<String>,
 }
 
 impl Runtime {
@@ -47,6 +49,7 @@ impl Runtime {
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".into()),
             enricher: Arc::new(NoopEnricher),
+            sensitive_paths: sensitive_paths::default_sensitive_paths(),
         }
     }
 
@@ -70,6 +73,11 @@ impl Runtime {
         self
     }
 
+    pub fn sensitive_paths(mut self, sensitive_paths: Vec<String>) -> Self {
+        self.sensitive_paths = sensitive_paths;
+        self
+    }
+
     /// Run the jälki daemon: load eBPF, attach probes, drain events, emit.
     ///
     /// Returns a `DaemonHandle` for runtime operations (IPC, CLI).
@@ -88,7 +96,11 @@ impl Runtime {
         );
 
         // Load and attach eBPF programs — driven by probe metadata.
-        let mut ebpf = loader::load_and_attach(Path::new(&self.ebpf_path), &self.probes)?;
+        let mut ebpf = loader::load_and_attach(
+            Path::new(&self.ebpf_path),
+            &self.probes,
+            &self.sensitive_paths,
+        )?;
 
         // Load BTF for runtime probe attachment.
         let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
@@ -96,6 +108,9 @@ impl Runtime {
             .context("failed to parse BTF for codegen")?;
 
         let producer = producer_metadata(&self.cluster);
+        let sensitive_path_matcher = Arc::new(sensitive_paths::SensitivePathMatcher::new(
+            self.sensitive_paths.clone(),
+        ));
 
         // Channel: readers → sink loop.
         let (tx, mut rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
@@ -112,6 +127,7 @@ impl Runtime {
                 stats.clone(),
                 store.clone(),
                 self.enricher.clone(),
+                sensitive_path_matcher.clone(),
             )?;
             registry.register_startup_probe(probe.clone(), stats.clone());
             stats_map.push((probe.name().to_string(), stats));
@@ -128,6 +144,7 @@ impl Runtime {
             tx: tx.clone(),
             cluster: self.cluster.clone(),
             enricher: self.enricher.clone(),
+            sensitive_path_matcher: sensitive_path_matcher.clone(),
         });
 
         // Spawn self-observability: periodically emit drops/errors as evidence.
@@ -236,6 +253,7 @@ pub struct DaemonHandle {
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
     pub cluster: String,
     enricher: Arc<dyn RuntimeEnricher>,
+    sensitive_path_matcher: Arc<sensitive_paths::SensitivePathMatcher>,
 }
 
 impl DaemonHandle {
@@ -250,6 +268,7 @@ impl DaemonHandle {
             "tcp_connect" => Some(Arc::new(TcpConnect::new())),
             "tcp_close" => Some(Arc::new(TcpClose::new())),
             "tcp_retransmit_skb" => Some(Arc::new(TcpRetransmit::new())),
+            "security_file_open" | "file_open" => Some(Arc::new(FileOpen::new())),
             _ => None,
         };
 
@@ -263,6 +282,7 @@ impl DaemonHandle {
                 self.tx.clone(),
                 &self.store,
                 self.enricher.clone(),
+                self.sensitive_path_matcher.clone(),
             )?;
             return Ok(probe_id.to_string());
         }
@@ -346,6 +366,7 @@ impl DaemonHandle {
             self.tx.clone(),
             &self.store,
             self.enricher.clone(),
+            self.sensitive_path_matcher.clone(),
         )?;
 
         // Keep the generated Ebpf object alive (it owns the loaded programs).

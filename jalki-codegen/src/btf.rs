@@ -265,6 +265,21 @@ impl BtfData {
         Err(CodegenError::BtfType("empty field path".into()))
     }
 
+    /// Resolve a field's byte offset within a struct, supporting struct-typed
+    /// leaf fields (unlike [`Self::resolve_field_offset`], which only accepts
+    /// scalar leaves). Used to verify hardcoded probe offsets, e.g.
+    /// `struct file.f_path` (a `struct path`), against the running kernel's BTF.
+    pub fn field_offset(&self, struct_type_id: u32, field_path: &str) -> Result<u32, CodegenError> {
+        let mut current_id = struct_type_id;
+        let mut total_offset: u32 = 0;
+        for part in field_path.split('.') {
+            let (member_type_id, member_offset) = self.find_member_recursive(current_id, part)?;
+            total_offset += member_offset;
+            current_id = member_type_id;
+        }
+        Ok(total_offset)
+    }
+
     /// Find a named member in a struct, recursing into anonymous members.
     fn find_member_recursive(
         &self,

@@ -13,6 +13,7 @@ use tracing::info;
 use crate::enrich::RuntimeEnricher;
 use crate::probe::{Attachment, Probe};
 use crate::reader::{self, ProbeStats};
+use crate::sensitive_paths::SensitivePathMatcher;
 use crate::store::EventStore;
 
 /// Unique identifier for an attached probe instance.
@@ -77,6 +78,7 @@ impl ProbeRegistry {
         tx: mpsc::Sender<Vec<EvidenceRecord>>,
         store: &Arc<EventStore>,
         enricher: Arc<dyn RuntimeEnricher>,
+        sensitive_path_matcher: Arc<SensitivePathMatcher>,
     ) -> Result<ProbeId> {
         let function = probe
             .attachments()
@@ -146,6 +148,7 @@ impl ProbeRegistry {
             stats.clone(),
             store.clone(),
             enricher,
+            sensitive_path_matcher,
         )?;
 
         let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);

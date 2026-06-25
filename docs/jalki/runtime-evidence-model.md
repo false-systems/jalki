@@ -218,7 +218,10 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 
 ### 2.7 `kernel.file.open`
 
-**Source mechanism:** LSM hook `security_file_open` if available; otherwise fexit on `do_filp_open`. Open question (see [`v0-scope.md`](./v0-scope.md)): which to standardize for v0.
+**Source mechanism:** **Implemented** as fexit on `security_file_open`.
+This observes opens that reach the LSM hook, including LSM-denied opens; ordinary
+path lookup or DAC permission failures may fail before this hook and are not
+emitted by this v0 probe.
 
 **Required payload fields:**
 
@@ -245,7 +248,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 | `errno` | i32 | On denial |
 | `sensitive_class` | string | If the path matches a configured sensitive-path policy; classifier is a `vocabulary_term` definition |
 
-**Plane B occurrence type:** `kernel.file.open`. *Planned — not yet implemented.*
+**Plane B occurrence type:** `kernel.file.open` — **implemented**. Emitted only for configured sensitive-path patterns. Jälki applies a coarse in-kernel prefix gate before the ring buffer and a precise userspace pattern match before emission. Truncated paths are labeled with `path_truncated=true`.
 
 **Scope guard:** the default agent profile **MUST NOT** capture every open. The agent profile **MUST** declare which path patterns are captured. Blanket capture is operationally infeasible and is forbidden by default — see [`local-agent-state.md`](./local-agent-state.md) §sampling.
 
@@ -413,7 +416,7 @@ When a field is added by enrichment (e.g. `container_id` derived from `cgroup_id
 
 These are propagated to [`v0-scope.md`](./v0-scope.md):
 
-- Which file-open source mechanism to standardize on (LSM `security_file_open` vs. fexit `do_filp_open`).
+- Whether to replace the v0 file-open `struct file` field-offset reads with CO-RE/BTF field relocation helpers once the local Aya stack exposes them.
 - Whether to capture `argv` (raw) or only `argv_hash` by default for `kernel.process.exec`.
 - Whether Vartio should derive lightweight `container` and `pod` `entity_version` records when no Kubernetes producer is present.
 - Whether `count`-coalesced `tcp_retransmit` occurrences are permitted in v0 and, if so, how long the coalesce window may be.
