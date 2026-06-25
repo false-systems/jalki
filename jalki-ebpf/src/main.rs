@@ -28,6 +28,14 @@ static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0)
 #[map]
 static PROCESS_EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+/// task_struct field offsets resolved from kernel BTF at load time.
+/// Index 0 = real_parent, index 1 = tgid. Zero means BTF resolution was
+/// unavailable; the exec probe then leaves ppid = 0 (omitted) rather than read a
+/// guessed offset. Safe to use a runtime offset here — the reads go through
+/// bpf_probe_read_kernel, not bpf_d_path.
+#[map]
+static TASK_OFFSETS: Array<u32> = Array::with_max_entries(2, 0);
+
 /// Ring buffer for TcpCloseEvent (fexit/tcp_close).
 #[map]
 static TCP_CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);

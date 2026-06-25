@@ -36,6 +36,8 @@ pub fn load_and_attach(
     // Verify the file.open probe's struct file offsets against kernel BTF
     // (warns loudly on mismatch; the eBPF probe uses the compiled constants).
     crate::file_offsets::check_file_offsets();
+    // Resolve task_struct offsets from BTF so process.exec can populate ppid.
+    crate::file_offsets::populate_task_offsets(&mut ebpf)?;
 
     let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
 

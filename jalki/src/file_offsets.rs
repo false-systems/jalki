@@ -8,6 +8,9 @@
 //! absent. This guard resolves the real offsets from `/sys/kernel/btf/vmlinux` at
 //! startup and logs loudly on mismatch, turning that silence into a clear signal.
 
+use anyhow::{Context, Result};
+use aya::maps::Array;
+use aya::Ebpf;
 use jalki_common::{FILE_F_FLAGS_OFFSET, FILE_F_PATH_OFFSET};
 use tracing::{error, info, warn};
 
@@ -68,4 +71,51 @@ fn resolve() -> Result<(u32, u32), String> {
         .field_offset(file_id, "f_flags")
         .map_err(|e| format!("resolve file.f_flags: {e}"))?;
     Ok((f_path, f_flags))
+}
+
+/// Resolve `task_struct.{real_parent, tgid}` offsets from BTF into the
+/// `TASK_OFFSETS` map, so the exec probe can read `current->real_parent->tgid`
+/// for ppid. Unlike `bpf_d_path`, those reads go through `bpf_probe_read_kernel`,
+/// which accepts a runtime offset — so BTF-driven offsets are verifier-safe here.
+///
+/// Never fatal: if BTF resolution fails the map stays zero and the probe leaves
+/// ppid = 0 (omitted) rather than read a guessed offset.
+pub fn populate_task_offsets(ebpf: &mut Ebpf) -> Result<()> {
+    let mut map: Array<_, u32> = ebpf
+        .map_mut("TASK_OFFSETS")
+        .ok_or_else(|| anyhow::anyhow!("TASK_OFFSETS map not found"))?
+        .try_into()
+        .context("TASK_OFFSETS is not an Array")?;
+
+    match resolve_task_offsets() {
+        Ok((real_parent, tgid)) => {
+            map.set(0, real_parent, 0).context("set real_parent offset")?;
+            map.set(1, tgid, 0).context("set tgid offset")?;
+            info!(
+                real_parent,
+                tgid, "resolved task_struct offsets from BTF (process.exec ppid enabled)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not resolve task_struct offsets from BTF; process.exec ppid will be omitted"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_task_offsets() -> Result<(u32, u32), String> {
+    let btf = jalki_codegen::btf::BtfData::from_sys_fs().map_err(|e| format!("load BTF: {e}"))?;
+    let task_id = btf
+        .struct_by_name("task_struct")
+        .ok_or_else(|| "struct task_struct not found in BTF".to_string())?;
+    let real_parent = btf
+        .field_offset(task_id, "real_parent")
+        .map_err(|e| format!("resolve task_struct.real_parent: {e}"))?;
+    let tgid = btf
+        .field_offset(task_id, "tgid")
+        .map_err(|e| format!("resolve task_struct.tgid: {e}"))?;
+    Ok((real_parent, tgid))
 }
