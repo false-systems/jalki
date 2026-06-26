@@ -55,8 +55,12 @@ pub fn load_and_attach(
                     attach_fexit(&mut ebpf, prog_name, function, &btf)
                         .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
                 }
-                Attachment::Tracepoint { category, name } => {
-                    attach_tracepoint(&mut ebpf, prog_name, category, name)
+                Attachment::Tracepoint {
+                    program,
+                    category,
+                    name,
+                } => {
+                    attach_tracepoint(&mut ebpf, program, category, name)
                         .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
                 }
             }

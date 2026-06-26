@@ -16,6 +16,7 @@ pub mod store;
 
 pub mod probes {
     pub mod file_open;
+    pub mod file_open_attempt;
     pub mod generated;
     pub mod process_exec;
     pub mod tcp_close;

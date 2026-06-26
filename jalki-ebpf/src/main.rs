@@ -2,13 +2,14 @@
 #![no_main]
 
 mod file_open;
+mod file_open_attempt;
 mod process_exec;
 mod tcp_close;
 mod tcp_connect;
 mod tcp_retransmit;
 
 use aya_ebpf::macros::{fentry, fexit, map, tracepoint};
-use aya_ebpf::maps::{Array, HashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::FEntryContext;
 use aya_ebpf::programs::FExitContext;
 use aya_ebpf::programs::TracePointContext;
@@ -58,6 +59,27 @@ static SENSITIVE_PREFIXES: Array<jalki_common::SensitivePrefix> =
 static FILE_OPEN_SCRATCH: PerCpuArray<jalki_common::FileOpenEvent> =
     PerCpuArray::with_max_entries(1, 0);
 
+/// Ring buffer for failed-open attempts (sys_exit_open{at,at2}).
+#[map]
+static OPEN_ATTEMPT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+/// In-flight requested paths stashed at sys_enter, keyed by pid_tgid, read at
+/// sys_exit. LRU so missed exits / overflow evict automatically (bounded, no
+/// leak, no manual TTL). Value is the requested path bytes.
+#[map]
+static IN_FLIGHT_OPENS: LruHashMap<u64, [u8; jalki_common::FILE_OPEN_PATH_LEN]> =
+    LruHashMap::with_max_entries(10240, 0);
+
+/// Per-CPU scratch for reading the requested path at sys_enter.
+#[map]
+static ENTER_PATH_SCRATCH: PerCpuArray<[u8; jalki_common::FILE_OPEN_PATH_LEN]> =
+    PerCpuArray::with_max_entries(1, 0);
+
+/// Per-CPU scratch event buffer for building the open-attempt event at sys_exit.
+#[map]
+static OPEN_ATTEMPT_SCRATCH: PerCpuArray<jalki_common::FileOpenEvent> =
+    PerCpuArray::with_max_entries(1, 0);
+
 // === Probe Entrypoints ===
 
 #[tracepoint(category = "sched", name = "sched_process_exec")]
@@ -83,6 +105,26 @@ pub fn jalki_tcp_retransmit(ctx: FEntryContext) -> i32 {
 #[fexit(function = "security_file_open")]
 pub fn jalki_file_open(ctx: FExitContext) -> i32 {
     file_open::handle(&ctx)
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_openat")]
+pub fn jalki_sys_enter_openat(ctx: TracePointContext) -> i32 {
+    file_open_attempt::handle_enter(&ctx)
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_openat")]
+pub fn jalki_sys_exit_openat(ctx: TracePointContext) -> i32 {
+    file_open_attempt::handle_exit(&ctx)
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_openat2")]
+pub fn jalki_sys_enter_openat2(ctx: TracePointContext) -> i32 {
+    file_open_attempt::handle_enter(&ctx)
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_openat2")]
+pub fn jalki_sys_exit_openat2(ctx: TracePointContext) -> i32 {
+    file_open_attempt::handle_exit(&ctx)
 }
 
 // === Shared Helpers ===
