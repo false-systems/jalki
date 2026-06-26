@@ -37,6 +37,10 @@ pub enum DecodeError {
 pub enum KernelEvent {
     ProcessExec(ProcessExecEvent),
     FileOpen(FileOpenEvent),
+    /// A FAILED open(2) of a watched path. Reuses the `FileOpen` wire shape;
+    /// `ret` is the negative errno and `path` is the user-requested (unresolved)
+    /// path, not a `bpf_d_path`-resolved one.
+    FileOpenAttempt(FileOpenEvent),
     TcpConnect(TcpConnectEvent),
     TcpClose(TcpCloseEvent),
     TcpRetransmit(TcpRetransmitEvent),
@@ -48,6 +52,7 @@ impl KernelEvent {
         match self {
             KernelEvent::ProcessExec(e) => e.observed_at_ns,
             KernelEvent::FileOpen(e) => e.observed_at_ns,
+            KernelEvent::FileOpenAttempt(e) => e.observed_at_ns,
             KernelEvent::TcpConnect(e) => e.observed_at_ns,
             KernelEvent::TcpClose(e) => e.observed_at_ns,
             KernelEvent::TcpRetransmit(e) => e.observed_at_ns,
@@ -58,6 +63,7 @@ impl KernelEvent {
         match self {
             KernelEvent::ProcessExec(e) => e.pid,
             KernelEvent::FileOpen(e) => e.pid,
+            KernelEvent::FileOpenAttempt(e) => e.pid,
             KernelEvent::TcpConnect(e) => e.pid,
             KernelEvent::TcpClose(e) => e.pid,
             KernelEvent::TcpRetransmit(e) => e.pid,
@@ -68,6 +74,7 @@ impl KernelEvent {
         match self {
             KernelEvent::ProcessExec(e) => e.cgroup_id,
             KernelEvent::FileOpen(e) => e.cgroup_id,
+            KernelEvent::FileOpenAttempt(e) => e.cgroup_id,
             KernelEvent::TcpConnect(e) => e.cgroup_id,
             KernelEvent::TcpClose(e) => e.cgroup_id,
             KernelEvent::TcpRetransmit(e) => e.cgroup_id,

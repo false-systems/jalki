@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 use jalki::enrich::CachedEnricher;
 use jalki::kube_watch;
 use jalki::probes::{
-    file_open::FileOpen, process_exec::ProcessExec, tcp_close::TcpClose, tcp_connect::TcpConnect,
-    tcp_retransmit::TcpRetransmit,
+    file_open::FileOpen, file_open_attempt::FileOpenAttempt, process_exec::ProcessExec,
+    tcp_close::TcpClose, tcp_connect::TcpConnect, tcp_retransmit::TcpRetransmit,
 };
 use jalki::runtime::Runtime;
 use jalki::sensitive_paths;
@@ -186,6 +186,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     let mut runtime = Runtime::new(&cli.ebpf_path)
         .attach(ProcessExec::new())
         .attach(FileOpen::new())
+        .attach(FileOpenAttempt::new())
         .attach(TcpConnect::new())
         .attach(TcpClose::new())
         .attach(TcpRetransmit::new())
