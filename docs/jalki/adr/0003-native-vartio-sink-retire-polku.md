@@ -1,4 +1,4 @@
-# ADR-0003 — Jälki speaks Vartio's source-ingress directly; Polku retires
+# ADR-0003 — Jälki speaks Vartio's source-ingress directly; Polku leaves the deployed topology
 
 - **Status:** Proposed (Dima, 2026-07-02 — for Yair's review)
 - **Date:** 2026-07-02
@@ -16,7 +16,8 @@
   tails them back (vartio #104→#117, live-verified), and the audit of Polku's real
   footprint found **no deployment anywhere** (the cluster's `gateway` namespace is an
   nginx placeholder; the sole polku-derived artifact is the Tetragon adapter feeding
-  ~2.6M consumer-less occurrences). A hub with one producer and one consumer is
+  consumer-less occurrences — verified 5.25M on 2026-07-02, growing ~700k/day, none
+  self-expiring (see the retirement-plan doc, polku #159)). A hub with one producer and one consumer is
   machinery without a mission.
 
 ## 1. Context
@@ -74,14 +75,27 @@ loss is **observable** (drop counter + structured event carrying batch size and 
 node-local spool (upgrade to at-least-once across Vartio outages) is explicitly a
 **future ADR**, not scope here.
 
-### D4 — Polku retires stack-wide
+### D4 — Polku leaves the deployed topology (it does not retire)
 
-With D1–D3, nothing in the stack routes through Polku. Sequencing (owned in
+With D1–D3, nothing in the deployed stack routes through Polku. Sequencing (owned in
 polku #159's `docs/polku-retirement-plan.md`): Vartio `ReceiveBatch` endpoint ships →
 `VartioSink` lands here → jalki DaemonSet proves parity with the deployed Tetragon
-adapter → the Tetragon adapter and Tetragon retire, the orphan occurrences are
-reclaimed, and the polku repository is archived (read-only, with pointers). Until
-parity, the Tetragon adapter keeps running unchanged.
+adapter → the Tetragon adapter and Tetragon retire and the orphan occurrences are
+**explicitly purged** (they never expire on their own: every row carries
+`expires_at = null`, and Ahti's retention sweep checks only `expires_at` —
+`retention_class: short` is a no-op today; the derivation gap is filed against Ahti).
+Until parity, the Tetragon adapter keeps running unchanged.
+
+**Polku stays a normal repository — out of the stack, not archived.** Its in-process
+shaping layer (batch / dedup / throttle / sample) and `polku-ahti-emitter` are tested
+assets earmarked for the first high-volume direct-append adapter (OTel, CloudTrail at
+scale); that is where Polku re-enters, in-process. The line that decides when: **source
+volume, not receiver language** — BEAM handles message rate fine, and the pipeline's
+realistic ceiling is Ahti appends and network. Edge shaping exists so hundreds of
+thousands of events/sec are never shipped across the wire just to be dropped or
+deduped on the other side; and edge dedup is the *only* dedup the direct-append lane
+has (Ahti does not dedup occurrences — unlike this ADR's `ReceiveBatch` lane, where
+duplicate handling is server-side per-item).
 
 ## 3. Consequences
 
