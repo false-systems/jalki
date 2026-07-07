@@ -12,6 +12,11 @@
 //!   returns a *retryable* [`SinkError`] so the runtime sink loop retries the
 //!   whole batch; accepted/duplicate items replay safely because the per-item
 //!   `idempotency_key` is stable (`source:cluster:node:<occurrence id>`).
+//! - **permanent rejects fail the batch** (jalki #22 review): a settled
+//!   response with `rejected_count > 0` returns the terminal
+//!   [`SinkError::PartialFailure`] (matching `PipelineSink`), so the runtime
+//!   sink loop records the drop as gap evidence instead of counting the batch
+//!   as delivered.
 //! - **fail-fast identity** (polku #159 review): a batch whose producer carries
 //!   an empty cluster or node identity is refused as `Misconfigured` — the sink
 //!   never emits `jalki:::…` idempotency keys.
@@ -233,25 +238,41 @@ impl EvidenceSink for VartioSink {
             });
         }
 
+        if response.rejected_count > 0 {
+            // Permanent rejects must fail the batch (match `PipelineSink`):
+            // the runtime sink loop counts any `Ok` as delivered and records
+            // gap evidence only on `Err`, so an `Ok` here would be silent
+            // loss (ADR-0002 §D7). `PartialFailure` is terminal in the loop —
+            // the batch drops once, visibly.
+            let mut message = format!(
+                "batch {} permanently rejected {} item(s) (accepted={} duplicate={})",
+                response.batch_id,
+                response.rejected_count,
+                response.accepted_count,
+                response.duplicate_count
+            );
+            for summary in &response.error_summaries {
+                message.push_str(&format!(
+                    "; reason={} count={}",
+                    summary.reason, summary.count
+                ));
+            }
+            self.set_health(HealthStatus::Degraded {
+                reason: format!("batch {} permanent item rejects", response.batch_id),
+            });
+            return Err(SinkError::PartialFailure {
+                sink: SINK_NAME.to_string(),
+                accepted_count: (response.accepted_count + response.duplicate_count) as usize,
+                rejected_count: response.rejected_count as usize,
+                message,
+            });
+        }
+
         if response.duplicate_count > 0 {
             warnings.push(format!(
                 "{} duplicate item(s) (idempotent no-op)",
                 response.duplicate_count
             ));
-        }
-        for summary in &response.error_summaries {
-            warnings.push(format!(
-                "rejected reason={} count={}",
-                summary.reason, summary.count
-            ));
-        }
-        if response.rejected_count > 0 {
-            tracing::warn!(
-                sink = SINK_NAME,
-                batch_id = %response.batch_id,
-                rejected = response.rejected_count,
-                "vartio permanently rejected items in batch"
-            );
         }
 
         self.set_health(HealthStatus::Healthy);
