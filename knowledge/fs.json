@@ -51,8 +51,8 @@
         { "name": "ret",      "type": "i64",   "meaning": "bytes written or errno",      "important": true }
       ],
       "use_when": "you need per-process write throughput. high frequency — use sampling.",
-      "not_when": "you just need to know if a file was accessed — use vfs_open.",
-      "combine_with": ["vfs_open"],
+      "not_when": "you just need to know if a sensitive file was accessed — use security_file_open.",
+      "combine_with": ["security_file_open"],
       "interpretations": [
         {
           "pattern": "high bytes per call from one process",
@@ -79,8 +79,8 @@
         { "name": "ret",     "type": "i64",   "meaning": "bytes read or negative errno", "important": true }
       ],
       "use_when": "you need per-process read throughput. high frequency — use sampling. pair with vfs_write for complete I/O picture.",
-      "not_when": "you just need to know if a file was accessed — use vfs_open.",
-      "combine_with": ["vfs_write", "vfs_open"],
+      "not_when": "you just need to know if a sensitive file was accessed — use security_file_open.",
+      "combine_with": ["vfs_write", "security_file_open"],
       "interpretations": [
         {
           "pattern": "high bytes per call from one process",
@@ -111,9 +111,9 @@
         { "name": "pid",     "type": "u32",   "meaning": "process closing the fd",  "important": true },
         { "name": "command", "type": "string", "meaning": "process name",            "important": true }
       ],
-      "use_when": "you want to track file descriptor lifecycle. combine with vfs_open to detect fd leaks — opens without corresponding closes.",
+      "use_when": "you want to track file descriptor lifecycle. combine with security_file_open to detect fd leaks — opens without corresponding closes.",
       "not_when": "you need I/O throughput — use vfs_read/vfs_write.",
-      "combine_with": ["vfs_open"],
+      "combine_with": ["security_file_open"],
       "interpretations": [
         {
           "pattern": "close rate much lower than open rate for same process",
