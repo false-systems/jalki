@@ -1,0 +1,64 @@
+repo:
+  name: jalki
+  role: >-
+    Programmable eBPF fentry/fexit framework for kernel and runtime evidence —
+    the kernel-observation layer of False Systems. Two planes off one capture
+    engine: Plane A direct/interpreted (ask/watch/stream/list CLI, MCP server,
+    Python SDK, embedded knowledge base) for humans and agents debugging now;
+    Plane B neutral evidence (capture → normalize → EvidenceSink → Polku →
+    Vartio → Ahti) for the causality pipeline.
+  not:
+  - a datastore (Ahti stores; jälki persists nothing)
+  - an Ahti producer (jälki never authenticates to or writes Ahti — Vartio does)
+  - an interpreter on Plane B (Vartio interprets; jälki interprets on Plane A only)
+  - an enforcement layer (that is syvä)
+  - a k8s observer (that is TAPIO)
+  - an event transport (that is Polku; jälki owns only the sink seam)
+  - an Actor-attribution engine (pod binding is free; actor/subject attribution is Vartio's)
+context:
+  default_budget: 8000
+  important_docs:
+  - CLAUDE.md
+  - README.md
+  - AGENTS.md
+  - docs/jalki/README.md
+  read_first:
+  - docs/jalki/adr/0002-evidence-through-polku-to-vartio.md
+  - docs/jalki/product-boundaries.md
+  - docs/jalki/runtime-evidence-model.md
+  safe_to_ignore:
+  - target/
+  - jalki-ebpf/target/
+  - eval/oracle/target/
+  - jalki-sdk-python/.venv/
+validation:
+  # This host is macOS: aya crates (jalki, jalki-codegen, jalki-mcp) do not
+  # compile here — full workspace builds run in the Lima VM `ubuntu` with a
+  # VM-local CARGO_TARGET_DIR. The fast/strict sets below are the macOS-safe
+  # subset from CLAUDE.md.
+  replace_inferred: true
+  fast:
+  - cargo test -p jalki-common -p jalki-evidence -p jalki-sdk-meta
+  - cargo test --manifest-path eval/oracle/Cargo.toml
+  strict:
+  - cargo fmt --check
+  - cargo clippy -p false-protocol -p jalki-common -p jalki-evidence -p jalki-sdk-meta -p xtask -- -D warnings
+  full:
+  # Linux/Lima only:
+  - cargo test --workspace
+  privileged:
+  # Kernel-in-the-loop (Lima, root / CAP_BPF+CAP_PERFMON): build eBPF first,
+  # then run the daemon against a live kernel.
+  - cargo run -p xtask -- build-ebpf
+boundaries:
+- Evidence routes jälki → Polku → Vartio → Ahti; no AhtiSink, no Ahti credentials, ever (ADR-0002 D1).
+- Interpretation is firewalled to Plane A; Plane B occurrences stay neutral — no product severity, no why_it_matters/possible_causes (ADR-0002 D4).
+- Plane B evidence must be strongly bound (pod_uid or container_id via node-local cgroup enrichment); unbound events are excluded with a metric, never emitted as noise (ADR-0002 D5).
+- No silent loss — overflow/outage/restart emits jalki.agent.gap; the retry buffer is bounded and observable (ADR-0002 D7).
+- jalki-common stays no_std with a mandatory size test per event struct (BPF ABI lock); jalki-evidence stays aya-free so it builds on macOS.
+- The oracle (eval/oracle) tests requirements from data files — when a case fails, fix the system or the data, never the test; never modify the oracle as a side effect of a system change.
+- Never ship raw argv or secret-bearing payloads (argv_hash only); observed_at (kernel CLOCK_BOOTTIME) is never conflated with ingest time.
+- No .unwrap() in userspace code; tracing not println! in libraries; document why each eBPF unsafe block is correct.
+- Wrong KB entries mislead agents — add knowledge/ entries only when certain; the oracle validates them.
+- Architectural changes need a design doc/ADR (MUST/SHOULD/MAY discipline) and sign-off before implementation.
+- Conventional commits; one concern per PR; keep PRs small.
