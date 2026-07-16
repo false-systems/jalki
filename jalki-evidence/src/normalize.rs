@@ -22,6 +22,7 @@ impl KernelEvent {
         match self {
             KernelEvent::ProcessExec(e) => e.to_occurrence(cluster),
             KernelEvent::FileOpen(e) => e.to_occurrence(cluster),
+            KernelEvent::FileOpenAttempt(e) => e.to_open_attempt_occurrence(cluster),
             KernelEvent::TcpConnect(e) => e.to_occurrence(cluster),
             KernelEvent::TcpClose(e) => e.to_occurrence(cluster),
             KernelEvent::TcpRetransmit(e) => e.to_occurrence(cluster),
@@ -85,6 +86,47 @@ impl FileOpenEvent {
         occ.labels.insert("resource_ref_kind".into(), "file".into());
         occ.labels
             .insert("resource_ref_id".into(), self.path.clone());
+        if self.path_truncated {
+            occ.labels.insert("path_truncated".into(), "true".into());
+        }
+
+        occ.correlation_keys = vec![format!("process:{}", self.pid)];
+        occ
+    }
+
+    /// Project a FAILED open as a `kernel.file.open_attempt` occurrence.
+    ///
+    /// Deliberately distinct from `to_occurrence`: this carries the
+    /// **user-requested** (unresolved) path under `requested_path` — NOT
+    /// `resource_ref_id`, which on `kernel.file.open` is the resolved file
+    /// identity. `path_resolution=unresolved` and `result=failed` make the
+    /// distinction explicit so consumers never treat an attempted string as an
+    /// opened file. Neutral (severity Info); meaning is Vartio's job.
+    pub fn to_open_attempt_occurrence(&self, cluster: &str) -> Occurrence {
+        let mut occ = Occurrence::new("jalki/file_open_attempt", "kernel.file.open_attempt")
+            .severity(Severity::Info)
+            .outcome(Outcome::Failure)
+            .in_cluster(cluster)
+            .with_entities(vec![format!("process:{}", self.pid)]);
+
+        occ.process_data = Some(ProcessEventData {
+            pid: self.pid,
+            ppid: None,
+            command: self.comm.clone(),
+            args: None,
+            uid: self.uid,
+            exit_code: None,
+        });
+
+        occ.labels.insert("result".into(), "failed".into());
+        occ.labels.insert("errno".into(), errno_name(self.ret));
+        occ.labels.insert("errno_num".into(), self.ret.to_string());
+        occ.labels
+            .insert("cgroup_id".into(), self.cgroup_id.to_string());
+        occ.labels
+            .insert("requested_path".into(), self.path.clone());
+        occ.labels
+            .insert("path_resolution".into(), "unresolved".into());
         if self.path_truncated {
             occ.labels.insert("path_truncated".into(), "true".into());
         }
@@ -332,10 +374,19 @@ impl TcpRetransmitEvent {
 /// Map a kernel errno (negative return) to its symbolic name.
 pub fn errno_name(ret: i32) -> String {
     match -ret {
+        // network (tcp.connect)
         111 => "ECONNREFUSED".into(),
         110 => "ETIMEDOUT".into(),
         113 => "EHOSTUNREACH".into(),
         101 => "ENETUNREACH".into(),
+        // file (file.open / file.open_attempt)
+        1 => "EPERM".into(),
+        2 => "ENOENT".into(),
+        6 => "ENXIO".into(),
+        13 => "EACCES".into(),
+        20 => "ENOTDIR".into(),
+        21 => "EISDIR".into(),
+        40 => "ELOOP".into(),
         _ => format!("E{}", -ret),
     }
 }
@@ -496,6 +547,31 @@ mod tests {
         assert_eq!(occ.outcome, Some(Outcome::Failure));
         assert!(occ.error.is_none());
         assert_eq!(occ.labels.get("result"), Some(&"denied".to_string()));
+    }
+
+    #[test]
+    fn file_open_attempt_carries_requested_path_not_resolved() {
+        let mut ev = file_open(-2); // ENOENT
+        ev.path = "/var/run/secrets/missing".into();
+
+        let occ = ev.to_open_attempt_occurrence("prod");
+
+        assert_eq!(occ.source, "jalki/file_open_attempt");
+        assert_eq!(occ.occurrence_type.as_str(), "kernel.file.open_attempt");
+        assert_eq!(occ.severity, Severity::Info);
+        assert_eq!(occ.outcome, Some(Outcome::Failure));
+        assert!(occ.error.is_none());
+        assert_eq!(occ.labels.get("result"), Some(&"failed".to_string()));
+        assert_eq!(
+            occ.labels.get("path_resolution"),
+            Some(&"unresolved".to_string())
+        );
+        assert_eq!(
+            occ.labels.get("requested_path"),
+            Some(&"/var/run/secrets/missing".to_string())
+        );
+        // Must NOT claim a resolved file identity — that's kernel.file.open only.
+        assert!(occ.labels.get("resource_ref_id").is_none());
     }
 
     #[test]

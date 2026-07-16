@@ -10,6 +10,7 @@ impl ProcessExec {
     pub fn new() -> Self {
         Self {
             attachments: vec![Attachment::Tracepoint {
+                program: "jalki_process_exec",
                 category: "sched",
                 name: "sched_process_exec",
             }],

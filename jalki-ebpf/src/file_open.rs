@@ -92,7 +92,7 @@ fn read_file_flags(file: u64) -> u32 {
 }
 
 #[inline(always)]
-fn matches_sensitive_prefix(path: &[u8; FILE_OPEN_PATH_LEN]) -> bool {
+pub(crate) fn matches_sensitive_prefix(path: &[u8; FILE_OPEN_PATH_LEN]) -> bool {
     let mut index = 0;
     while index < MAX_SENSITIVE_PREFIXES {
         if let Some(prefix) = SENSITIVE_PREFIXES.get(index) {

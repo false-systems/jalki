@@ -123,10 +123,14 @@ impl ProbeRegistry {
                     prog.attach()
                         .with_context(|| format!("failed to attach fexit/{function}"))?;
                 }
-                Attachment::Tracepoint { category, name } => {
+                Attachment::Tracepoint {
+                    program,
+                    category,
+                    name,
+                } => {
                     let prog: &mut TracePoint = ebpf
-                        .program_mut(prog_name)
-                        .ok_or_else(|| anyhow::anyhow!("program {prog_name} not found"))?
+                        .program_mut(program)
+                        .ok_or_else(|| anyhow::anyhow!("program {program} not found"))?
                         .try_into()
                         .context("not a tracepoint")?;
                     prog.load()

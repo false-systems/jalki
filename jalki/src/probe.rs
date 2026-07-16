@@ -32,6 +32,10 @@ pub enum Attachment {
         function: &'static str,
     },
     Tracepoint {
+        /// eBPF program name for this specific tracepoint. Carried per-attachment
+        /// so one probe can attach several distinct programs (e.g. the
+        /// enter+exit pair for openat/openat2), not just `program_name()`.
+        program: &'static str,
         category: &'static str,
         name: &'static str,
     },

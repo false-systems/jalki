@@ -5,4 +5,5 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
-
+.toimija/*
+!.toimija/repo.yaml

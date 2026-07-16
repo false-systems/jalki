@@ -250,6 +250,8 @@ emitted by this v0 probe.
 
 **Plane B occurrence type:** `kernel.file.open` — **implemented**. Emitted only for configured sensitive-path patterns. Jälki applies a coarse in-kernel prefix gate before the ring buffer and a precise userspace pattern match before emission. Truncated paths are labeled with `path_truncated=true`.
 
+**Companion — `kernel.file.open_attempt` (implemented):** because `security_file_open` only witnesses successful + LSM-denied opens (see `coverage=lsm_gated`), **failed** opens (DAC/`ENOENT`/etc.) of watched **absolute** paths are captured separately via `sys_enter`/`sys_exit` on `openat`/`openat2`: the requested path is stashed at enter (bounded LRU in-flight map) and emitted on a negative return. It carries `requested_path` / `errno` / `result=failed` / `path_resolution=unresolved` — **not** `resource_ref_id` (that string is *requested*, not a resolved file identity). Relative paths are a documented no-match in v0.1.
+
 **Scope guard:** the default agent profile **MUST NOT** capture every open. The agent profile **MUST** declare which path patterns are captured. Blanket capture is operationally infeasible and is forbidden by default — see [`local-agent-state.md`](./local-agent-state.md) §sampling.
 
 **Vartio can derive (relationships):** `process_opened_file` from `process` entity → the `kernel.file.open` occurrence (or a `file_path` reference if the path is hot enough to warrant a stable handle).
