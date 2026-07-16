@@ -1,0 +1,33 @@
+[package]
+name = "jalki-vartio-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Plane-B transport: an `EvidenceSink` that delivers jälki evidence to
+# Vartio's `SourceIngress.ReceiveBatch` (ADR-0003). aya-free — builds and tests
+# everywhere jalki-evidence does. Ported from polku #159's VartioEmitter.
+
+[dependencies]
+jalki-evidence = { path = "../jalki-evidence" }
+false-protocol = { workspace = true }
+
+# gRPC stack — pinned to the combination the vendored codegen was generated and
+# tested with (0.14.6 raises MSRV; see polku #159 lineage).
+tonic = { version = "=0.14.5", features = ["transport"] }
+tonic-prost = "=0.14.5"
+prost = "0.14"
+prost-types = "0.14"
+
+async-trait = "0.1"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-prost-build = "=0.14.5"

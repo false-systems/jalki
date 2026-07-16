@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package vartio.source_ingress.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Tetragon -> Vartio (and future source adapters) batch ingress contract.
+//
+// Vartio owns this contract; downstream emitters (e.g. polku's Tetragon source
+// adapter) vendor a copy, the same way they vendor `ahti_append.proto`. This is
+// a CONTRACT artifact: the gRPC server that implements `SourceIngress` lives in
+// the adapter layer (vartio_runtime / vartio_ahti_client), never in the pure
+// `vartio_core` library, and is a separate build step. The file is checked in
+// here so it stays versioned with the runtime that will serve it.
+//
+// Conventions mirror `apps/vartio_ahti_client/proto/ahti_append.proto`:
+//   * `bytes payload` carries the record body as UTF-8 JSON. JSON *value*
+//     semantics are preserved (int/float distinction, i64/u64 precision); it is
+//     NOT transcoded through protobuf Struct/Value, which would coerce numbers
+//     to f64. It does NOT preserve lexical bytes (whitespace, key order).
+//   * `google.protobuf.Timestamp` for all times.
+//
+// Each item maps 1:1 onto `VartioCore.ProviderEvidence`.
+
+service SourceIngress {
+  // Bursty source/runtime evidence in batches. All-or-retry: any retryable item
+  // failure makes the whole batch retryable; accepted and duplicate items replay
+  // safely because per-item idempotency is stable. This is retry-with-idempotency,
+  // not transactional rollback — some items may be accepted before a transient
+  // failure, and return DUPLICATE on the whole-batch retry.
+  rpc ReceiveBatch(ProviderEvidenceBatch) returns (ReceiveBatchResponse);
+}
+
+// One batch = one (source_key, provider, namespace) from one adapter/node.
+message ProviderEvidenceBatch {
+  string source_key = 1; // e.g. "tetragon"        -> ProviderEvidence.source_key
+  string provider = 2;   // e.g. "tetragon"        -> ProviderEvidence.provider
+  string namespace = 3;  // e.g. "vartio-tetragon" (Ahti adapter namespace)
+  string batch_id = 4;   // adapter-generated; response/log correlation (-> delivery_id)
+  string adapter_id = 5; // -> ProviderEvidence.source_context.adapter_id
+  string cluster_id = 6; // -> source_context.cluster_id (+ idempotency scope)
+  string node_id = 7;    // -> source_context.node_id    (+ idempotency scope)
+  google.protobuf.Timestamp ingested_at = 8; // adapter send time; server stamps received_at
+  repeated ProviderEvidenceItem items = 9;
+}
+
+message ProviderEvidenceItem {
+  // Source-scoped execution identity: source_key + cluster_id + node_id + exec_id
+  // (or a canonical globally-unique equivalent). Vartio dedups on this at ingress;
+  // the importer derives the durable Ahti logical_key from the normalized event.
+  string idempotency_key = 1;
+  string occurrence_type = 2; // e.g. "tetragon.process_exec"
+  google.protobuf.Timestamp observed_at = 3;
+
+  // Provider-native record body as UTF-8 JSON bytes. MUST be source-redacted at
+  // the node: process.arguments stripped and replaced with argv_hash. Raw argv
+  // MUST NOT cross the wire.
+  bytes payload = 4;
+
+  // Optional context as UTF-8 JSON object bytes. HARD CONSTRAINT: Vartio's
+  // ProviderEvidence validation rejects the whole item if metadata or
+  // trust_context contains a key matching authorization / *token* / *secret* /
+  // *signature* / raw_body / body. Strip secrets at the adapter.
+  bytes metadata = 5;
+  bytes trust_context = 6;
+}
+
+enum ItemStatus {
+  ITEM_STATUS_UNSPECIFIED = 0;
+  ITEM_STATUS_ACCEPTED = 1;
+  ITEM_STATUS_DUPLICATE = 2; // idempotent no-op; never an error
+  ITEM_STATUS_REJECTED = 3;
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  // permanent — do not retry the item
+  REJECT_REASON_UNAUTHORIZED = 1;       // authn/trust failure
+  REJECT_REASON_UNTRUSTED_SOURCE = 2;
+  REJECT_REASON_MALFORMED_PAYLOAD = 3;
+  REJECT_REASON_UNSUPPORTED_EVENT = 4;  // unknown occurrence_type / namespace
+  REJECT_REASON_VALIDATION_FAILED = 5;  // structural / missing field / secret-key rejected
+  // retryable — transient
+  REJECT_REASON_APPEND_FAILED = 6;      // Ahti append/transport unavailable
+  REJECT_REASON_READBACK_FAILED = 7;
+  REJECT_REASON_INTERNAL = 8;
+}
+
+message ItemResult {
+  string idempotency_key = 1;
+  ItemStatus status = 2;
+  RejectReason reason = 3; // set when status = ITEM_STATUS_REJECTED
+  bool retryable = 4;      // per-item: true for transient reasons
+  string detail = 5;       // human-readable; no secrets / no raw payload
+}
+
+message ReasonSummary {
+  RejectReason reason = 1;
+  uint32 count = 2;
+}
+
+message ReceiveBatchResponse {
+  string batch_id = 1;
+  uint32 accepted_count = 2;
+  uint32 duplicate_count = 3;
+  uint32 rejected_count = 4;
+  repeated ItemResult items = 5;          // MAY be omitted for large all-accepted batches
+  repeated ReasonSummary error_summaries = 6;
+  // Batch-level retry signal: true if ANY item failed with a retryable reason.
+  // The emitter returns Err and retries the whole batch; accepted/duplicate items
+  // replay safely via idempotency_key.
+  bool retryable = 7;
+}
