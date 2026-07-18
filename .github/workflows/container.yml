@@ -36,11 +36,12 @@ permissions:
 jobs:
   image:
     name: Build + (on main/tags) publish
-    # arm64-native to match the cluster workers; arc-arm64 runners carry the
-    # Docker-in-Docker sidecar, so buildx works self-hosted. The eBPF object
-    # (bpfel-unknown-none) is arch-independent bytecode, but the daemon binary
-    # is arm64.
-    runs-on: arc-arm64
+    # arm64-native to match the cluster workers. jälki is a PUBLIC repo, so the
+    # org's self-hosted arc-arm64 runners deliberately don't serve it (fork PRs
+    # must never reach our infra) — GitHub-hosted arm64 runners are free for
+    # public repos instead. The eBPF object (bpfel-unknown-none) is
+    # arch-independent bytecode, but the daemon binary is arm64.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
