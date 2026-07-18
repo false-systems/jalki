@@ -176,7 +176,15 @@ impl Runtime {
         let enricher_for_metrics = self.enricher.clone();
 
         let sink_handle = tokio::spawn(async move {
-            let mut retry_buffer = RetryBuffer::new(RetryBufferConfig::default());
+            let retry_config = RetryBufferConfig::from_env();
+            info!(
+                max_records = retry_config.max_records,
+                max_batches = retry_config.max_batches,
+                max_age_ms = retry_config.max_age_ms,
+                "retry buffer bounded (sheds oldest as gap evidence past these; \
+                 tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS}})"
+            );
+            let mut retry_buffer = RetryBuffer::new(retry_config);
             let retry_clock_start = Instant::now();
             while let Some(records) = rx.recv().await {
                 if records.is_empty() {
