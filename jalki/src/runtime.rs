@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -36,6 +37,12 @@ pub struct Runtime {
     cluster: String,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_paths: Vec<String>,
+    /// When set, only evidence bound to one of these Kubernetes namespaces is
+    /// delivered to the sink — the source-side volume control that keeps jälki
+    /// from shipping the whole-node firehose. `None` = deliver all (bound)
+    /// evidence. Applies to the evidence-sink path only; the local CLI/IPC
+    /// query surface still sees everything.
+    namespace_allowlist: Option<HashSet<String>>,
 }
 
 impl Runtime {
@@ -50,6 +57,7 @@ impl Runtime {
                 .unwrap_or_else(|| "unknown".into()),
             enricher: Arc::new(NoopEnricher),
             sensitive_paths: sensitive_paths::default_sensitive_paths(),
+            namespace_allowlist: None,
         }
     }
 
@@ -75,6 +83,20 @@ impl Runtime {
 
     pub fn sensitive_paths(mut self, sensitive_paths: Vec<String>) -> Self {
         self.sensitive_paths = sensitive_paths;
+        self
+    }
+
+    /// Restrict sink delivery to evidence bound to these Kubernetes namespaces.
+    /// Empty = no restriction (deliver all bound evidence). This is the
+    /// source-side volume control (mirrors the tetragon-adapter's namespace
+    /// allow-list); it scopes only the sink path, not the local CLI query view.
+    pub fn namespace_allowlist(mut self, namespaces: Vec<String>) -> Self {
+        let set: HashSet<String> = namespaces
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.namespace_allowlist = (!set.is_empty()).then_some(set);
         self
     }
 
@@ -174,6 +196,7 @@ impl Runtime {
         let metrics_clone = metrics.clone();
         let producer_for_sink = producer.clone();
         let enricher_for_metrics = self.enricher.clone();
+        let namespace_allowlist = self.namespace_allowlist.clone();
 
         let sink_handle = tokio::spawn(async move {
             let retry_config = RetryBufferConfig::from_env();
@@ -184,15 +207,42 @@ impl Runtime {
                 "retry buffer bounded (sheds oldest as gap evidence past these; \
                  tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS}})"
             );
+            match &namespace_allowlist {
+                Some(ns) => info!(
+                    namespaces = ?ns,
+                    "namespace allow-list active: only bound evidence in these \
+                     namespaces is delivered to the sink"
+                ),
+                None => info!(
+                    "no namespace allow-list: delivering all bound evidence \
+                     (set JALKI_NAMESPACES to scope the whole-node firehose)"
+                ),
+            }
             let mut retry_buffer = RetryBuffer::new(retry_config);
             let retry_clock_start = Instant::now();
-            while let Some(records) = rx.recv().await {
+            while let Some(mut records) = rx.recv().await {
                 if records.is_empty() {
                     continue;
                 }
 
                 record_unbound_drops(&metrics_clone, &records);
                 refresh_binding_cache_metrics(&metrics_clone, enricher_for_metrics.as_ref());
+
+                // Source-side volume control: keep only evidence bound to an
+                // allowed namespace. Out-of-scope namespaces are deliberately
+                // not observed here (a scope, not a loss — no gap evidence),
+                // mirroring the tetragon-adapter's namespace filter.
+                if let Some(allow) = &namespace_allowlist {
+                    let before = records.len();
+                    records.retain(|r| r.bound_namespace().is_some_and(|ns| allow.contains(ns)));
+                    let dropped = before - records.len();
+                    if dropped > 0 {
+                        tracing::debug!(dropped, "records filtered by namespace allow-list");
+                    }
+                    if records.is_empty() {
+                        continue;
+                    }
+                }
 
                 let now_ms = elapsed_ms(retry_clock_start);
                 for gap in retry_buffer.drop_expired(now_ms) {

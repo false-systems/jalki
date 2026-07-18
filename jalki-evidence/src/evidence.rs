@@ -164,6 +164,16 @@ impl EvidenceRecord {
         self
     }
 
+    /// The Kubernetes namespace this record is bound to, if strongly bound.
+    /// `None` for unbound / host records — used by the daemon's namespace
+    /// allow-list to scope which evidence leaves the node.
+    pub fn bound_namespace(&self) -> Option<&str> {
+        match self.binding.as_ref() {
+            Some(RuntimeBinding::Bound { namespace, .. }) => namespace.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn plane_b_drop_reason(&self) -> Option<UnboundReason> {
         if self.is_agent_record() {
             return None;
@@ -411,6 +421,27 @@ impl EvidenceBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_namespace_reads_the_binding() {
+        let base = record(0);
+        assert_eq!(base.bound_namespace(), None, "no binding → None");
+
+        let bound = record(0).with_runtime_binding(RuntimeBinding::Bound {
+            container_id: "c".into(),
+            pod_uid: Some("p".into()),
+            namespace: Some("workloads".into()),
+            service_account: None,
+            labels: std::collections::BTreeMap::new(),
+            provenance: BindingProvenance::Observed,
+        });
+        assert_eq!(bound.bound_namespace(), Some("workloads"));
+
+        let unbound = record(0).with_runtime_binding(RuntimeBinding::Unbound {
+            reason: UnboundReason::HostProcess,
+        });
+        assert_eq!(unbound.bound_namespace(), None, "unbound → None");
+    }
 
     fn record(observed_at_ns: u64) -> EvidenceRecord {
         EvidenceRecord {

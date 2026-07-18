@@ -72,6 +72,14 @@ struct Cli {
     #[arg(long, env = "JALKI_K8S_ENRICHMENT", global = true)]
     k8s_enrichment: bool,
 
+    /// Namespace allow-list for sink delivery. Repeatable; comma-separated
+    /// values accepted. When set, only evidence bound to one of these
+    /// Kubernetes namespaces reaches the sink — the source-side volume control
+    /// that keeps jälki from shipping the whole-node firehose. Empty = deliver
+    /// all bound evidence. The local CLI query surface is unaffected.
+    #[arg(long = "namespace", env = "JALKI_NAMESPACES", value_delimiter = ',', global = true)]
+    namespaces: Vec<String>,
+
     /// Kubernetes node name for pod watches. Defaults to the host name.
     #[arg(long, env = "JALKI_NODE_NAME", global = true)]
     node_name: Option<String>,
@@ -210,7 +218,8 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         .attach(TcpConnect::new())
         .attach(TcpClose::new())
         .attach(TcpRetransmit::new())
-        .sensitive_paths(sensitive_paths::parse_sensitive_paths(&cli.sensitive_path));
+        .sensitive_paths(sensitive_paths::parse_sensitive_paths(&cli.sensitive_path))
+        .namespace_allowlist(cli.namespaces.clone());
 
     if let Some(cluster) = cli.cluster.clone() {
         runtime = runtime.cluster(cluster);
