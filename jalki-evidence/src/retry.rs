@@ -13,12 +13,40 @@ pub struct RetryBufferConfig {
 
 impl Default for RetryBufferConfig {
     fn default() -> Self {
+        // Memory-sane baseline: the buffer holds evidence in RAM while a sink is
+        // unavailable and sheds oldest (with gap evidence) past these bounds, so
+        // they cap the process's memory under a downstream outage. The old
+        // 1_000_000-record default was ~GBs — it OOMKilled the DaemonSet before
+        // the cap ever engaged. ~100k records is a few hundred MB; size to the
+        // deployment via `from_env`.
         Self {
-            max_records: 1_000_000,
-            max_batches: 8192,
-            max_age_ms: 600_000,
+            max_records: 100_000,
+            max_batches: 2_048,
+            max_age_ms: 300_000,
         }
     }
+}
+
+impl RetryBufferConfig {
+    /// Bounds from `JALKI_RETRY_MAX_{RECORDS,BATCHES,AGE_MS}`, each falling back
+    /// to the memory-sane default. These bound the daemon's memory while a
+    /// downstream sink (e.g. Vartio) is unavailable — set them to the pod's
+    /// memory limit so a transient outage sheds gap evidence instead of OOMing.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            max_records: env_parse("JALKI_RETRY_MAX_RECORDS", d.max_records),
+            max_batches: env_parse("JALKI_RETRY_MAX_BATCHES", d.max_batches),
+            max_age_ms: env_parse("JALKI_RETRY_MAX_AGE_MS", d.max_age_ms),
+        }
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,5 +303,32 @@ mod tests {
             occ.labels.get("dropped_records").map(String::as_str),
             Some("3")
         );
+    }
+
+    #[test]
+    fn default_config_is_memory_sane() {
+        // Guards against a reintroduced GB-scale default (the OOM footgun).
+        let d = RetryBufferConfig::default();
+        assert!(
+            d.max_records <= 200_000,
+            "default too large: {}",
+            d.max_records
+        );
+    }
+
+    #[test]
+    fn from_env_reads_overrides_and_falls_back() {
+        // Serialized via a unique key to avoid cross-test env races.
+        let key = "JALKI_RETRY_MAX_RECORDS";
+        // SAFETY: single-threaded test-local env mutation, restored below.
+        unsafe { std::env::set_var(key, "1234") };
+        assert_eq!(RetryBufferConfig::from_env().max_records, 1234);
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(
+            RetryBufferConfig::from_env().max_records,
+            RetryBufferConfig::default().max_records,
+            "garbage falls back to the default"
+        );
+        unsafe { std::env::remove_var(key) };
     }
 }
