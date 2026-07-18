@@ -18,6 +18,7 @@ jalki-common = { workspace = true }
 jalki-evidence = { path = "../jalki-evidence" }
 jalki-enrich = { path = "../jalki-enrich" }
 jalki-codegen = { path = "../jalki-codegen" }
+jalki-vartio-sink = { path = "../jalki-vartio-sink" }
 false-protocol = { workspace = true }
 aya = { workspace = true }
 aya-log = { workspace = true }

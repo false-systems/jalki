@@ -36,7 +36,7 @@ struct Cli {
     )]
     ebpf_path: String,
 
-    /// Primary evidence sink: "stdout", "file", or a file path.
+    /// Primary evidence sink: "stdout", "file", "vartio", or a file path.
     #[arg(
         long,
         alias = "emit",
@@ -46,9 +46,23 @@ struct Cli {
     )]
     sink: String,
 
-    /// Additional best-effort evidence sink: "stdout", "file", or a file path.
+    /// Additional best-effort evidence sink: "stdout", "file", "vartio", or a file path.
     #[arg(long, env = "JALKI_ALSO_SINK", global = true)]
     also_sink: Vec<String>,
+
+    /// Vartio source-ingress gRPC endpoint for `--sink vartio`
+    /// (e.g. http://vartio.vartio.svc:50061).
+    #[arg(long, env = "JALKI_VARTIO_ENDPOINT", global = true)]
+    vartio_endpoint: Option<String>,
+
+    /// Adapter identity reported to Vartio for `--sink vartio`.
+    #[arg(
+        long,
+        env = "JALKI_VARTIO_ADAPTER_ID",
+        default_value = "jalki",
+        global = true
+    )]
+    vartio_adapter_id: String,
 
     /// Cluster name for FALSE Protocol Occurrences.
     #[arg(long, env = "JALKI_CLUSTER", global = true)]
@@ -200,7 +214,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         runtime = configure_k8s_enrichment(runtime, &cli).await?;
     }
 
-    let sink = build_sink(&cli.sink, &cli.also_sink);
+    let sink = build_sink(&cli).await?;
     runtime = runtime.sink_to(sink);
 
     runtime.run().await
@@ -231,23 +245,42 @@ fn default_node_name() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn build_sink(primary: &str, secondaries: &[String]) -> Box<dyn EvidenceSink> {
-    let primary = sink_from_spec(primary);
-    if secondaries.is_empty() {
-        primary
+async fn build_sink(cli: &Cli) -> Result<Box<dyn EvidenceSink>> {
+    let primary = sink_from_spec(&cli.sink, cli).await?;
+    if cli.also_sink.is_empty() {
+        Ok(primary)
     } else {
-        let secondaries = secondaries
-            .iter()
-            .map(|spec| sink_from_spec(spec))
-            .collect();
-        Box::new(CompositeSink::new(primary, secondaries))
+        let mut secondaries = Vec::with_capacity(cli.also_sink.len());
+        for spec in &cli.also_sink {
+            secondaries.push(sink_from_spec(spec, cli).await?);
+        }
+        Ok(Box::new(CompositeSink::new(primary, secondaries)))
     }
 }
 
-fn sink_from_spec(spec: &str) -> Box<dyn EvidenceSink> {
-    match spec {
+async fn sink_from_spec(spec: &str, cli: &Cli) -> Result<Box<dyn EvidenceSink>> {
+    Ok(match spec {
         "stdout" => Box::new(StdoutSink::new()),
         "file" => Box::new(FileSink::new(PathBuf::from("jalki-events.ndjson"))),
+        "vartio" => Box::new(build_vartio_sink(cli).await?),
         other => Box::new(FileSink::new(PathBuf::from(other))),
+    })
+}
+
+/// The ADR-0003/0004 Plane-B transport. Endpoint + adapter id come from flags
+/// or env; the ingress bearer token (ADR-0004 D1-a) comes from
+/// `VARTIO_INGRESS_TOKEN` only — env from a Secret, never argv, never logged.
+async fn build_vartio_sink(cli: &Cli) -> Result<jalki_vartio_sink::VartioSink> {
+    let endpoint = cli
+        .vartio_endpoint
+        .clone()
+        .context("--sink vartio requires --vartio-endpoint (or JALKI_VARTIO_ENDPOINT)")?;
+    let mut cfg =
+        jalki_vartio_sink::VartioSinkConfig::new(endpoint, cli.vartio_adapter_id.clone());
+    if let Ok(token) = std::env::var("VARTIO_INGRESS_TOKEN") {
+        cfg = cfg.with_ingress_token(token);
     }
+    jalki_vartio_sink::VartioSink::connect(cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("vartio sink connect failed: {e}"))
 }
