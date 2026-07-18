@@ -1108,6 +1108,7 @@ dependencies = [
  "jalki-common",
  "jalki-enrich",
  "jalki-evidence",
+ "jalki-vartio-sink",
  "k8s-openapi",
  "kube",
  "prometheus-client",

@@ -8,6 +8,11 @@
 //! - **Plane-B projection at the door**: `EvidenceBatch::into_plane_b_projection`
 //!   supplies neutral, strongly-bound occurrences (ADR-0002 §D4/§D5). Unbound
 //!   drops never leave the node; they surface in `AppendResult::warnings`.
+//! - **Native wire shape** (ADR-0004 D2-a): each item's payload is Vartio's
+//!   native runtime map ([`native::native_runtime_item`]) — neutral *content*,
+//!   native *shape* — matching what `Importer.Jalki` consumes.
+//! - **Bearer auth** (ADR-0004 D1-a): `VartioSinkConfig::with_ingress_token`
+//!   attaches `authorization: Bearer <t>`; the receiver is fail-closed.
 //! - **all-or-retry**: a transport failure or a batch-level `retryable` response
 //!   returns a *retryable* [`SinkError`] so the runtime sink loop retries the
 //!   whole batch; accepted/duplicate items replay safely because the per-item
@@ -29,6 +34,8 @@ pub mod proto {
     #![allow(missing_docs)]
     include!("proto/vartio.source_ingress.v1.rs");
 }
+
+pub mod native;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -57,6 +64,13 @@ pub struct VartioSinkConfig {
     pub namespace: String,
     /// Identity of this adapter instance (per-deployment).
     pub adapter_id: String,
+    /// Bearer token for the source-ingress endpoint (ADR-0004 D1-a).
+    ///
+    /// The receiver is fail-closed: it mandates `authorization: Bearer <t>` on
+    /// every call. `None` is only viable against unauthenticated test
+    /// receivers. The daemon sources this from `VARTIO_INGRESS_TOKEN`; it must
+    /// never be logged.
+    pub ingress_token: Option<String>,
     pub timeout: Duration,
 }
 
@@ -68,8 +82,16 @@ impl VartioSinkConfig {
             provider: "jalki".to_string(),
             namespace: "vartio-jalki".to_string(),
             adapter_id: adapter_id.into(),
+            ingress_token: None,
             timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Attach the source-ingress bearer token (ADR-0004 D1-a).
+    pub fn with_ingress_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.ingress_token = (!token.is_empty()).then_some(token);
+        self
     }
 
     fn validate(&self) -> Result<(), SinkError> {
@@ -175,9 +197,13 @@ impl EvidenceSink for VartioSink {
                 seconds: occ.timestamp.timestamp(),
                 nanos: occ.timestamp.timestamp_subsec_nanos().min(999_999_999) as i32,
             };
-            let payload = serde_json::to_vec(occ).map_err(|e| SinkError::InvalidRecord {
-                sink: SINK_NAME.to_string(),
-                message: e.to_string(),
+            // ADR-0004 D2-a: the wire payload is Vartio's native runtime map,
+            // not the FALSE Occurrence wrapper. Neutral content, native shape.
+            let payload = serde_json::to_vec(&native::native_runtime_item(occ)).map_err(|e| {
+                SinkError::InvalidRecord {
+                    sink: SINK_NAME.to_string(),
+                    message: e.to_string(),
+                }
             })?;
             items.push(ProviderEvidenceItem {
                 idempotency_key: self.idempotency_key(
@@ -206,10 +232,25 @@ impl EvidenceSink for VartioSink {
             items,
         };
 
+        // ADR-0004 D1-a: present the ingress bearer token when configured. The
+        // token value itself must never reach logs or error messages.
+        let mut request = Request::new(wire_batch);
+        if let Some(token) = &self.cfg.ingress_token {
+            let bearer =
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|_| SinkError::Misconfigured {
+                        sink: SINK_NAME.to_string(),
+                        message: "ingress token contains characters invalid in an http header"
+                            .to_string(),
+                    })?;
+            request.metadata_mut().insert("authorization", bearer);
+        }
+
         let response = self
             .client
             .clone()
-            .receive_batch(Request::new(wire_batch))
+            .receive_batch(request)
             .await
             .map_err(|status| {
                 let err = classify_status(&status);
