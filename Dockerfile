@@ -1,53 +1,30 @@
-# Build context must include ../ahti/false-protocol.
-# Run from parent directory: docker build -f jalki/Dockerfile -t jalki .
+# jälki — eBPF daemon image (daemon + MCP server + SDK codegen + eBPF object).
 #
-# Stage 1: Build eBPF programs + userspace binaries
-FROM rust:1.87-bookworm AS builder
+# Build from the repo root (false-protocol is vendored in-repo, so the root is
+# a self-contained context):
+#
+#   docker build -t ghcr.io/false-systems/jalki .
+#
+# Stage 1: build the eBPF object (nightly + rust-src for build-std against
+# bpfel-unknown-none), then the userspace binaries on stable.
+FROM rust:1.97-bookworm AS builder
 
-# Install nightly for eBPF compilation + build deps.
-RUN rustup install nightly-2025-03-01 \
-    && rustup component add rust-src --toolchain nightly-2025-03-01 \
-    && rustup target add bpfel-unknown-none --toolchain nightly-2025-03-01
+# xtask invokes `cargo +nightly` for the eBPF build; rust-src is required for
+# build-std against the bpfel-unknown-none target, and bpf-linker does the
+# final BPF link (installed before COPY so the layer caches).
+RUN rustup toolchain install nightly --component rust-src \
+    && cargo install bpf-linker --locked
 
 WORKDIR /build
-
-# Copy workspace manifests first for dependency caching.
-COPY Cargo.toml Cargo.lock ./
-COPY jalki-common/Cargo.toml jalki-common/Cargo.toml
-COPY jalki/Cargo.toml jalki/Cargo.toml
-COPY jalki-codegen/Cargo.toml jalki-codegen/Cargo.toml
-COPY jalki-mcp/Cargo.toml jalki-mcp/Cargo.toml
-COPY jalki-sdk-meta/Cargo.toml jalki-sdk-meta/Cargo.toml
-COPY xtask/Cargo.toml xtask/Cargo.toml
-COPY jalki-ebpf/Cargo.toml jalki-ebpf/Cargo.toml
-
-# Stub out sources for dependency pre-build.
-RUN mkdir -p jalki-common/src jalki/src jalki-codegen/src jalki-mcp/src \
-    jalki-sdk-meta/src xtask/src jalki-ebpf/src \
-    && echo '#![no_std]' > jalki-common/src/lib.rs \
-    && echo 'fn main() {}' > jalki/src/main.rs \
-    && touch jalki/src/lib.rs \
-    && touch jalki-codegen/src/lib.rs \
-    && echo 'fn main() {}' > jalki-mcp/src/main.rs \
-    && echo 'fn main() {}' > jalki-sdk-meta/src/main.rs \
-    && touch jalki-sdk-meta/src/lib.rs \
-    && echo 'fn main() {}' > xtask/src/main.rs \
-    && echo '#![no_std] #![no_main]' > jalki-ebpf/src/main.rs
-
-# Copy real sources.
 COPY . .
 
-# Touch sources to invalidate stubs.
-RUN find jalki-common/src jalki/src jalki-codegen/src jalki-mcp/src \
-    jalki-sdk-meta/src xtask/src jalki-ebpf/src -name '*.rs' -exec touch {} +
-
-# Build eBPF programs.
+# eBPF first — build order matters (the daemon embeds no object; it loads the
+# file at runtime from JALKI_EBPF_PATH).
 RUN cargo run -p xtask -- build-ebpf --release
 
-# Build userspace binaries.
 RUN cargo build --release -p jalki -p jalki-mcp -p jalki-sdk-meta
 
-# Stage 2: Minimal runtime image
+# Stage 2: minimal runtime image.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /build/target/release/jalki /usr/local/bin/jalki
@@ -55,10 +32,20 @@ COPY --from=builder /build/target/release/jalki-mcp /usr/local/bin/jalki-mcp
 COPY --from=builder /build/target/release/jalki-sdk-codegen /usr/local/bin/jalki-sdk-codegen
 COPY --from=builder /build/jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf /usr/local/share/jalki/jalki-ebpf
 
-# eBPF requires running as root with capabilities. The "nonroot" base is
-# overridden at deploy time via securityContext in the Helm chart.
+# eBPF requires root + CAP_BPF/CAP_PERFMON at runtime; the "nonroot" base is
+# overridden at deploy time via the DaemonSet/Helm securityContext.
 ENV JALKI_EBPF_PATH=/usr/local/share/jalki/jalki-ebpf
 ENV RUST_LOG=jalki=info
 
+ARG VERSION=0.0.0-dev
+ARG GIT_SHA=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="jälki" \
+      org.opencontainers.image.description="Programmable eBPF fentry/fexit framework: kernel evidence with runtime binding, delivered to Vartio (Plane B) and to agents (Plane A)." \
+      org.opencontainers.image.source="https://github.com/false-systems/jalki" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
 ENTRYPOINT ["/usr/local/bin/jalki"]
-CMD ["--emit", "stdout"]
+CMD ["--sink", "stdout"]
