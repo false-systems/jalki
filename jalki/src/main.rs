@@ -151,6 +151,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 requires exactly one process-level crypto provider; the dep
+    // tree (kube rustls-tls) compiles rustls without one, which panics at the
+    // first TLS use (e.g. the k8s-enrichment client). Install ring up front —
+    // Err just means another component already installed one, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     match &cli.command {
