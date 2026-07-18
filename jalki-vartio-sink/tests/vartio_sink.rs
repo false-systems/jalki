@@ -253,6 +253,65 @@ async fn bearer_token_rides_the_authorization_header() {
     );
 }
 
+/// A record whose occurrence type the importer does not accept
+/// (`kernel.file.open`) — the daemon captures these but Vartio rejects them.
+fn unsupported_type_record() -> EvidenceRecord {
+    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.file.open");
+    EvidenceRecord {
+        observed_at_ns: 1_000_000,
+        pid: 4242,
+        cgroup_id: 77,
+        probe: probe(),
+        occurrence,
+        binding: None,
+    }
+    .with_runtime_binding(RuntimeBinding::Bound {
+        container_id: "containerd://abc".to_string(),
+        pod_uid: Some("pod-uid-1".to_string()),
+        namespace: Some("workloads".to_string()),
+        service_account: None,
+        labels: BTreeMap::new(),
+        provenance: BindingProvenance::Observed,
+    })
+}
+
+#[tokio::test]
+async fn importer_unsupported_types_are_dropped_with_a_warning() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let sink = connect(rx.endpoint.clone()).await;
+
+    // One supported (tcp.connect) + one unsupported (file.open) — only the
+    // supported one crosses the wire; the drop is a visible warning, not a
+    // reject and not silent.
+    let result = sink
+        .append_batch(EvidenceBatch::new(
+            producer(),
+            vec![bound_record(), unsupported_type_record()],
+        ))
+        .await
+        .expect("accepted");
+    assert_eq!(
+        result.accepted_count, 1,
+        "only the supported type delivered"
+    );
+    assert_eq!(
+        result.rejected_count, 0,
+        "unsupported is dropped, not rejected"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("unsupported-by-importer") && w.contains("kernel.file.open")),
+        "the drop is visible: {:?}",
+        result.warnings
+    );
+
+    let batches = rx.received.lock().unwrap();
+    assert_eq!(batches[0].items.len(), 1, "only 1 item on the wire");
+    assert_eq!(batches[0].items[0].occurrence_type, "kernel.tcp.connect");
+}
+
 #[tokio::test]
 async fn duplicates_count_as_accepted_with_a_warning() {
     let rx = spawn_receiver(false, 1, 0).await;

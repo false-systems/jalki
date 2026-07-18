@@ -37,6 +37,7 @@ pub mod proto {
 
 pub mod native;
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -51,6 +52,19 @@ use proto::source_ingress_client::SourceIngressClient;
 use proto::{ProviderEvidenceBatch, ProviderEvidenceItem};
 
 pub const SINK_NAME: &str = "vartio";
+
+/// Occurrence types Vartio's `Importer.Jalki` accepts (the `vartio-jalki`
+/// namespace contract): exec + the three TCP signals. The daemon also captures
+/// `kernel.file.open{,_attempt}`, which the importer rejects as
+/// `UNSUPPORTED_EVENT` — sending them is guaranteed data loss logged as error.
+/// We drop them here with a visible warning instead. Widening this set is a
+/// Vartio-side decision (add the type to the importer first).
+pub const VARTIO_SUPPORTED_TYPES: &[&str] = &[
+    "kernel.process.exec",
+    "kernel.tcp.connect",
+    "kernel.tcp.close",
+    "kernel.tcp.retransmit",
+];
 
 /// Static identity + target for the Vartio ingress lane. Cluster/node identity
 /// rides on each `EvidenceBatch`'s `ProducerMetadata`, not here.
@@ -184,15 +198,38 @@ impl EvidenceSink for VartioSink {
             })
             .collect();
 
-        if projection.occurrences.is_empty() {
+        // Only send occurrence types the Vartio importer accepts; anything else
+        // is a guaranteed UNSUPPORTED_EVENT reject. Drop with a visible,
+        // aggregated warning (never silent — matches ADR-0002 §D7).
+        let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
+        let occurrences: Vec<_> = projection
+            .occurrences
+            .into_iter()
+            .filter(|occ| {
+                let t = occ.occurrence_type.as_str();
+                if VARTIO_SUPPORTED_TYPES.contains(&t) {
+                    true
+                } else {
+                    *unsupported.entry(t.to_string()).or_insert(0) += 1;
+                    false
+                }
+            })
+            .collect();
+        for (t, n) in &unsupported {
+            warnings.push(format!(
+                "dropped {n} record(s) of unsupported-by-importer type {t}"
+            ));
+        }
+
+        if occurrences.is_empty() {
             // Nothing bound to deliver — a local no-op, never a wire call.
             let mut result = AppendResult::accepted(SINK_NAME, 0);
             result.warnings = warnings;
             return Ok(result);
         }
 
-        let mut items = Vec::with_capacity(projection.occurrences.len());
-        for occ in &projection.occurrences {
+        let mut items = Vec::with_capacity(occurrences.len());
+        for occ in &occurrences {
             let observed_at = prost_types::Timestamp {
                 seconds: occ.timestamp.timestamp(),
                 nanos: occ.timestamp.timestamp_subsec_nanos().min(999_999_999) as i32,
