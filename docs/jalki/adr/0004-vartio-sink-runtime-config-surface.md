@@ -1,7 +1,9 @@
 # ADR-0004 — VartioSink runtime config surface: authentication + payload shape
 
-- **Status:** Proposed (Dima, 2026-07-17 — **decisions needed from Yair**)
-- **Date:** 2026-07-17
+- **Status:** **Accepted** (2026-07-18 — decision delegated by Yair: "no time to decide,
+  make the call, worst case we change it later." Decisions taken: **D1-a** + **D2-a**,
+  the recommendations below. Revisitable — the seams are one function each.)
+- **Date:** 2026-07-17 (proposed) / 2026-07-18 (accepted by delegation)
 - **Follows:** ADR-0003 (the native `VartioSink`). ADR-0003 sized the sink as "the gRPC
   client + wiring" and left the runtime **config surface** — how the sink authenticates
   and exactly what shape rides the wire — as an explicit follow-up. This ADR resolves
