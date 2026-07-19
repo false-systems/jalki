@@ -69,18 +69,40 @@ closes a latent gap where tcp.connect/close failures lost their errno at the sin
 Required fields (importer `require_type_fields!`): `file.open` → `pid`, `comm`,
 `path`; `open_attempt` → `pid`, `comm`, `requested_path`, `errno`.
 
-## 4. Consequence — deploy order (hard requirement)
+## 4. Consequence — deploy order (decoupled by a runtime gate)
 
-The two halves must land **importer first**:
+The receiving importer must accept the types before jälki sends them. Rather than
+enforcing that as release ordering (a human-memory invariant), the file family is
+**gated at runtime**: the sink sends `kernel.file.*` only when `send_file_types` is
+enabled (daemon env `JALKI_VARTIO_FILE_TYPES=1`), default **off**. Gated-off drops
+surface as a distinct warning naming the flag, so operators see *config*, not
+*contract* (§D7 — no silent loss).
 
-1. Vartio: `RuntimeEvent` file fields + importer clauses + fixtures (deployable alone —
-   inert until jälki sends the types).
-2. jälki: `native_runtime_item` file projection + widen `VARTIO_SUPPORTED_TYPES`
-   (must not deploy before 1 — every file item would return a permanent per-item
-   reject → `PartialFailure` noise on every batch containing file evidence).
+Rollout therefore has no ordering hazard:
+
+1. Vartio: `RuntimeEvent` file fields + importer clauses + fixtures (inert until
+   jälki sends the types).
+2. jälki: projection + widened `VARTIO_SUPPORTED_TYPES` + the gate — deployable any
+   time; flipping the env flag on before Vartio ships costs permanent per-item
+   rejects (`PartialFailure` noise), never corruption.
+3. Once both are live: set `JALKI_VARTIO_FILE_TYPES=1` on the DaemonSet. A later
+   ADR may retire the flag in favor of receiver-advertised capabilities (see §6).
 
 ## 5. Evidence
 
 New Vartio fixtures `file_open_denied.json` / `file_open_attempt_enoent.json` +
 importer tests; jälki-side projection tests mirror them key-for-key so the two repos
-pin the same wire shape from both ends.
+pin the same wire shape from both ends. Sink tests cover both gate positions.
+
+## 6. Follow-ups deliberately out of scope
+
+- **Capability negotiation.** Static type lists mirrored in two repos (plus the §4
+  flag) is the weakest part of the ingress contract. The receiver knows what it
+  supports; it should advertise it (or treat unsupported as an explicit *skip*, not
+  an error), eliminating send-side lists for every future type. ADR-scale change to
+  the source-ingress protocol — needs its own proposal.
+- **Attribution-without-resource.** `kernel.file.open_attempt` is the first
+  attribution-class event with no resource ref. If a future corroboration lane
+  assumes attribution ⇒ resource, either that assumption or this classification
+  must give; a third evidence class (`:probe`) is the alternative. Flagged for the
+  Vartio owner.
