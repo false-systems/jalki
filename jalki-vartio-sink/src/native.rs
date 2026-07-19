@@ -76,6 +76,32 @@ pub fn native_runtime_item(occ: &Occurrence) -> Map<String, Value> {
         }
     }
 
+    // File family (ADR-0005). `path` is asserted ONLY for a resolved file
+    // identity (`kernel.file.open`); an attempt's user-requested string rides
+    // `requested_path` + `path_resolution=unresolved`, never `path`.
+    if labels.get("resource_ref_kind").map(String::as_str) == Some("file") {
+        if let Some(path) = labels.get("resource_ref_id") {
+            item.insert("path".into(), json!(path));
+        }
+    }
+    for key in ["requested_path", "path_resolution", "coverage", "flags"] {
+        if let Some(value) = labels.get(key) {
+            item.insert(key.into(), json!(value));
+        }
+    }
+    if labels.get("path_truncated").map(String::as_str) == Some("true") {
+        item.insert("path_truncated".into(), json!(true));
+    }
+    // Wire errno is the positive number (`tcp_close_errno.json` convention);
+    // the `errno_num` label is the raw negative kernel return.
+    if let Some(errno) = labels
+        .get("errno_num")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|ret| *ret < 0)
+    {
+        item.insert("errno".into(), json!(-errno));
+    }
+
     if let Some(process) = &occ.process_data {
         item.insert("pid".into(), json!(process.pid));
         if let Some(ppid) = process.ppid {
@@ -199,6 +225,69 @@ mod tests {
         assert_eq!(m["argv_hash"], "sha256:6cdb1f73c8f42df8");
         assert_eq!(m["ppid"], 1707001);
         assert_eq!(m["uid"], 1001);
+    }
+
+    #[test]
+    fn file_open_projects_resolved_path_coverage_and_errno() {
+        let mut occ = base_occ("kernel.file.open");
+        occ.outcome = Some(Outcome::Failure);
+        for (k, v) in [
+            ("resource_ref_kind", "file"),
+            ("resource_ref_id", "/etc/shadow"),
+            ("coverage", "lsm_gated"),
+            ("flags", "32768"),
+            ("result", "denied"),
+            ("errno_num", "-13"), // EACCES, raw negative kernel ret
+        ] {
+            occ.labels.insert(k.into(), v.into());
+        }
+        occ.process_data = Some(ProcessEventData {
+            pid: 4242,
+            ppid: None,
+            command: "cat".into(),
+            args: None,
+            uid: 1001,
+            exit_code: None,
+        });
+
+        let m = native_runtime_item(&occ);
+        assert_eq!(m["path"], "/etc/shadow");
+        assert_eq!(m["coverage"], "lsm_gated");
+        assert_eq!(m["flags"], "32768");
+        assert_eq!(m["errno"], 13, "wire errno is positive (fixture convention)");
+        assert_eq!(m["state"], "failure");
+        assert!(!m.contains_key("requested_path"));
+        assert!(!m.contains_key("exe"), "a file ref is not an exe");
+    }
+
+    #[test]
+    fn open_attempt_projects_requested_path_never_path() {
+        let mut occ = base_occ("kernel.file.open_attempt");
+        occ.outcome = Some(Outcome::Failure);
+        for (k, v) in [
+            ("requested_path", "/var/run/secrets/missing"),
+            ("path_resolution", "unresolved"),
+            ("path_truncated", "true"),
+            ("errno_num", "-2"), // ENOENT
+        ] {
+            occ.labels.insert(k.into(), v.into());
+        }
+        occ.process_data = Some(ProcessEventData {
+            pid: 7,
+            ppid: None,
+            command: "cat".into(),
+            args: None,
+            uid: 0,
+            exit_code: None,
+        });
+
+        let m = native_runtime_item(&occ);
+        assert_eq!(m["requested_path"], "/var/run/secrets/missing");
+        assert_eq!(m["path_resolution"], "unresolved");
+        assert_eq!(m["path_truncated"], true);
+        assert_eq!(m["errno"], 2);
+        // The unresolved string must never be asserted as a file identity.
+        assert!(!m.contains_key("path"));
     }
 
     #[test]

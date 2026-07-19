@@ -253,10 +253,10 @@ async fn bearer_token_rides_the_authorization_header() {
     );
 }
 
-/// A record whose occurrence type the importer does not accept
-/// (`kernel.file.open`) — the daemon captures these but Vartio rejects them.
+/// A record whose occurrence type the importer does not accept — a probe the
+/// daemon could capture but the `vartio-jalki` contract does not cover.
 fn unsupported_type_record() -> EvidenceRecord {
-    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.file.open");
+    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.sched.switch");
     EvidenceRecord {
         observed_at_ns: 1_000_000,
         pid: 4242,
@@ -280,7 +280,7 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
     let rx = spawn_receiver(false, 0, 0).await;
     let sink = connect(rx.endpoint.clone()).await;
 
-    // One supported (tcp.connect) + one unsupported (file.open) — only the
+    // One supported (tcp.connect) + one unsupported (sched.switch) — only the
     // supported one crosses the wire; the drop is a visible warning, not a
     // reject and not silent.
     let result = sink
@@ -302,7 +302,7 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("unsupported-by-importer") && w.contains("kernel.file.open")),
+            .any(|w| w.contains("unsupported-by-importer") && w.contains("kernel.sched.switch")),
         "the drop is visible: {:?}",
         result.warnings
     );

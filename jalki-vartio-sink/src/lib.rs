@@ -54,16 +54,18 @@ use proto::{ProviderEvidenceBatch, ProviderEvidenceItem};
 pub const SINK_NAME: &str = "vartio";
 
 /// Occurrence types Vartio's `Importer.Jalki` accepts (the `vartio-jalki`
-/// namespace contract): exec + the three TCP signals. The daemon also captures
-/// `kernel.file.open{,_attempt}`, which the importer rejects as
-/// `UNSUPPORTED_EVENT` — sending them is guaranteed data loss logged as error.
-/// We drop them here with a visible warning instead. Widening this set is a
-/// Vartio-side decision (add the type to the importer first).
+/// namespace contract): exec, the three TCP signals, and the file family
+/// (ADR-0005). Anything else is dropped here with a visible warning rather
+/// than sent as a guaranteed `UNSUPPORTED_EVENT` reject. Widening this set is
+/// a Vartio-side decision — the importer must accept a type BEFORE it is
+/// added here (ADR-0005 §4 deploy order).
 pub const VARTIO_SUPPORTED_TYPES: &[&str] = &[
     "kernel.process.exec",
     "kernel.tcp.connect",
     "kernel.tcp.close",
     "kernel.tcp.retransmit",
+    "kernel.file.open",
+    "kernel.file.open_attempt",
 ];
 
 /// Static identity + target for the Vartio ingress lane. Cluster/node identity
