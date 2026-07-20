@@ -100,9 +100,15 @@ pin the same wire shape from both ends. Sink tests cover both gate positions.
   flag) is the weakest part of the ingress contract. The receiver knows what it
   supports; it should advertise it (or treat unsupported as an explicit *skip*, not
   an error), eliminating send-side lists for every future type. ADR-scale change to
-  the source-ingress protocol — needs its own proposal.
+  the source-ingress protocol — needs its own proposal. **Deferred by the rule of
+  three** (the pattern vartio#65 applies to receiver extraction): jälki is today the
+  *only* source-ingress producer, so a negotiated contract would be abstracted from
+  one instance. **Revisit when** a second producer speaks source-ingress or a third
+  type family needs a §4-style gate.
 - **Attribution-without-resource.** `kernel.file.open_attempt` is the first
   attribution-class event with no resource ref. If a future corroboration lane
   assumes attribution ⇒ resource, either that assumption or this classification
-  must give; a third evidence class (`:probe`) is the alternative. Flagged for the
+  must give; a third evidence class (`:probe`) is the alternative. **Revisit when**
+  the corroboration lane lands — its first test run should include the
+  `file_open_attempt_enoent` fixture to surface the assumption. Flagged for the
   Vartio owner.
