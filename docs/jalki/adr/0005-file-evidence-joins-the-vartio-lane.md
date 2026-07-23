@@ -63,8 +63,13 @@ family adds these keys, sourced from jälki's occurrence labels:
 | `flags` | string | `file.open` | `flags` |
 
 `coverage=lsm_gated` crosses the wire deliberately: it is data honesty ("absence of a
-denial is not an allow"), not interpretation. `errno` projection is generic — it also
-closes a latent gap where tcp.connect/close failures lost their errno at the sink.
+denial is not an allow"), not interpretation. `errno` projection is generic over the
+`errno_num` label — which requires the normalize layer to actually emit it: denied
+`kernel.file.open` and failed `kernel.tcp.connect` now do (closing a latent gap where
+connect failures carried errno only in the Plane-A error block, which never reaches
+this wire). `kernel.tcp.close` cannot carry errno yet — `TcpCloseEvent` has no ret
+field; `tcp_close_errno.json` pins the *shape* for when it does (needs an eBPF
+struct change, out of scope here).
 
 Required fields (importer `require_type_fields!`): `file.open` → `pid`, `comm`,
 `path`; `open_attempt` → `pid`, `comm`, `requested_path`, `errno`.
