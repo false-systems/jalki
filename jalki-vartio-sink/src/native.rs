@@ -254,7 +254,10 @@ mod tests {
         assert_eq!(m["path"], "/etc/shadow");
         assert_eq!(m["coverage"], "lsm_gated");
         assert_eq!(m["flags"], "32768");
-        assert_eq!(m["errno"], 13, "wire errno is positive (fixture convention)");
+        assert_eq!(
+            m["errno"], 13,
+            "wire errno is positive (fixture convention)"
+        );
         assert_eq!(m["state"], "failure");
         assert!(!m.contains_key("requested_path"));
         assert!(!m.contains_key("exe"), "a file ref is not an exe");

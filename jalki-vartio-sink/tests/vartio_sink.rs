@@ -348,12 +348,9 @@ async fn file_family_is_gated_off_by_default_with_a_config_warning() {
         .expect("accepted");
     assert_eq!(result.accepted_count, 1, "only the tcp record delivered");
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("gated off")
-                && w.contains("JALKI_VARTIO_FILE_TYPES")
-                && w.contains("kernel.file.open_attempt")),
+        result.warnings.iter().any(|w| w.contains("gated off")
+            && w.contains("JALKI_VARTIO_FILE_TYPES")
+            && w.contains("kernel.file.open_attempt")),
         "the gate drop is visible and names the remedy: {:?}",
         result.warnings
     );
@@ -366,8 +363,7 @@ async fn file_family_is_gated_off_by_default_with_a_config_warning() {
 #[tokio::test]
 async fn file_family_is_delivered_when_enabled() {
     let rx = spawn_receiver(false, 0, 0).await;
-    let cfg =
-        VartioSinkConfig::new(rx.endpoint.clone(), "jalki-adapter-1").with_file_types(true);
+    let cfg = VartioSinkConfig::new(rx.endpoint.clone(), "jalki-adapter-1").with_file_types(true);
     let sink = connect_cfg(cfg).await;
 
     let result = sink
