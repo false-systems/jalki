@@ -37,11 +37,16 @@ jobs:
   image:
     name: Build + (on main/tags) publish
     # arm64-native to match the cluster workers. jälki is a PUBLIC repo, so the
-    # org's self-hosted arc-arm64 runners deliberately don't serve it (fork PRs
-    # must never reach our infra) — GitHub-hosted arm64 runners are free for
-    # public repos instead. The eBPF object (bpfel-unknown-none) is
-    # arch-independent bytecode, but the daemon binary is arm64.
-    runs-on: arc-arm64
+    # runner follows the trust boundary of the triggering event: pull_request
+    # runs code that anyone (incl. forks) controls and must never reach our
+    # infra — those builds stay on GitHub-hosted arm64 runners, which are free
+    # for public repos and unaffected by the org billing issue
+    # (false-infra#5). push to main/tags and workflow_dispatch only run
+    # reviewed code, so they use the org's self-hosted arc-arm64 pool (dind
+    # available) like the rest of the org. The eBPF object
+    # (bpfel-unknown-none) is arch-independent bytecode, but the daemon
+    # binary is arm64.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'arc-arm64' }}
     steps:
       - uses: actions/checkout@v4
 
