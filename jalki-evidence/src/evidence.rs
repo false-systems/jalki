@@ -380,6 +380,28 @@ impl EvidenceBatch {
         self.records.is_empty()
     }
 
+    /// Approximate in-memory footprint of this batch, for byte-budget
+    /// accounting (retry buffering). The occurrence dominates each record's
+    /// heap use, so its JSON serialization is the estimate's backbone, plus a
+    /// fixed per-record allowance for probe/binding strings and struct
+    /// overhead. An estimate, not an audit: serialization failures fall back
+    /// to a conservative constant rather than panicking in the buffer path.
+    pub fn approx_bytes(&self) -> usize {
+        const PER_RECORD_OVERHEAD: usize = 256;
+        const FALLBACK_OCCURRENCE_BYTES: usize = 1024;
+
+        self.records
+            .iter()
+            .map(|r| {
+                let occ = serde_json::to_vec(&r.occurrence)
+                    .map(|v| v.len())
+                    .unwrap_or(FALLBACK_OCCURRENCE_BYTES);
+                occ + PER_RECORD_OVERHEAD
+            })
+            .sum::<usize>()
+            + 128
+    }
+
     /// Project every record into an `Occurrence` carrying full metadata, applying
     /// this batch's [`ProducerMetadata`] to each. Consumes the batch — this is the
     /// intended hand-off into a sink.
