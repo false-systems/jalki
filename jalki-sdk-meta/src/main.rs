@@ -3,7 +3,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "jalki-sdk-codegen", about = "Generate jälki SDK foundation from meta")]
+#[command(
+    name = "jalki-sdk-codegen",
+    about = "Generate jälki SDK foundation from meta"
+)]
 struct Cli {
     /// Target language: python, go, elixir, typescript
     #[arg(long)]
