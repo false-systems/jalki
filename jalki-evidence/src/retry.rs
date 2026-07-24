@@ -67,6 +67,15 @@ pub struct GapReport {
 }
 
 impl GapReport {
+    pub fn merge(&mut self, other: Self) {
+        if self.cause != other.cause {
+            self.cause = "multiple".into();
+        }
+        self.dropped_records = self.dropped_records.saturating_add(other.dropped_records);
+        self.gap_start_ns = self.gap_start_ns.min(other.gap_start_ns);
+        self.gap_end_ns = self.gap_end_ns.max(other.gap_end_ns);
+    }
+
     pub fn into_batch(self, producer: ProducerMetadata) -> EvidenceBatch {
         let mut occ = Occurrence::new("jalki/agent", "jalki.agent.gap")
             .severity(Severity::Warning)
@@ -370,6 +379,27 @@ mod tests {
         buffer.pop_delivered();
         buffer.pop_delivered();
         assert_eq!(buffer.len_bytes(), 0, "delivery returns the budget");
+    }
+
+    #[test]
+    fn gap_reports_merge_without_growing_the_retry_buffer() {
+        let mut pending = GapReport {
+            cause: "retry_buffer_overflow".into(),
+            dropped_records: 2,
+            gap_start_ns: 20,
+            gap_end_ns: 30,
+        };
+        pending.merge(GapReport {
+            cause: "retry_buffer_expired".into(),
+            dropped_records: 3,
+            gap_start_ns: 10,
+            gap_end_ns: 40,
+        });
+
+        assert_eq!(pending.cause, "multiple");
+        assert_eq!(pending.dropped_records, 5);
+        assert_eq!(pending.gap_start_ns, 10);
+        assert_eq!(pending.gap_end_ns, 40);
     }
 
     #[test]
