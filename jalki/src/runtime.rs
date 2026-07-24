@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
-    EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind, ProbeMetadata, ProducerMetadata,
-    RetryBuffer, RetryBufferConfig, SinkError,
+    EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport, HookKind, ProbeMetadata,
+    ProducerMetadata, RetryBuffer, RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
@@ -204,8 +204,9 @@ impl Runtime {
                 max_records = retry_config.max_records,
                 max_batches = retry_config.max_batches,
                 max_age_ms = retry_config.max_age_ms,
+                max_bytes = retry_config.max_bytes,
                 "retry buffer bounded (sheds oldest as gap evidence past these; \
-                 tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS}})"
+                 tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS,BYTES}})"
             );
             match &namespace_allowlist {
                 Some(ns) => info!(
@@ -219,6 +220,7 @@ impl Runtime {
                 ),
             }
             let mut retry_buffer = RetryBuffer::new(retry_config);
+            let mut pending_gaps = PendingGaps::default();
             let retry_clock_start = Instant::now();
             while let Some(mut records) = rx.recv().await {
                 if records.is_empty() {
@@ -245,36 +247,60 @@ impl Runtime {
                 }
 
                 let now_ms = elapsed_ms(retry_clock_start);
-                for gap in retry_buffer.drop_expired(now_ms) {
-                    retry_buffer.enqueue(gap.into_batch(producer_for_sink.clone()), now_ms);
-                }
+                pending_gaps.extend(retry_buffer.drop_expired(now_ms));
 
                 let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
-                for gap in retry_buffer.enqueue(batch, now_ms) {
-                    retry_buffer.enqueue(gap.into_batch(producer_for_sink.clone()), now_ms);
+                if retry_buffer.is_empty() && pending_gaps.is_empty() {
+                    match sink.append_batch(batch.clone()).await {
+                        Ok(_) => continue,
+                        Err(err) if RetryBuffer::should_retry(&err) => {
+                            record_sink_error(&metrics_clone, sink.name());
+                            pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
+                            warn!(
+                                sink = sink.name(),
+                                error = %err,
+                                queued_batches = retry_buffer.len_batches(),
+                                queued_records = retry_buffer.len_records(),
+                                queued_bytes = retry_buffer.len_bytes(),
+                                "evidence sink append failed; retrying later"
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            record_sink_error(&metrics_clone, sink.name());
+                            error!(
+                                sink = sink.name(),
+                                error = %err,
+                                "evidence sink append failed permanently; dropping batch"
+                            );
+                            pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &batch));
+                        }
+                    }
+                } else {
+                    pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
                 }
 
                 flush_retry_buffer(
                     sink.as_ref(),
                     &mut retry_buffer,
+                    &mut pending_gaps,
                     &metrics_clone,
                     &producer_for_sink,
-                    retry_clock_start,
                 )
                 .await;
             }
 
-            while !retry_buffer.is_empty() {
-                let before = retry_buffer.len_batches();
+            while !retry_buffer.is_empty() || !pending_gaps.is_empty() {
+                let before = (retry_buffer.len_batches(), pending_gaps.len());
                 flush_retry_buffer(
                     sink.as_ref(),
                     &mut retry_buffer,
+                    &mut pending_gaps,
                     &metrics_clone,
                     &producer_for_sink,
-                    retry_clock_start,
                 )
                 .await;
-                if retry_buffer.len_batches() == before {
+                if (retry_buffer.len_batches(), pending_gaps.len()) == before {
                     break;
                 }
             }
@@ -450,10 +476,34 @@ fn producer_metadata(cluster: &str) -> ProducerMetadata {
 async fn flush_retry_buffer(
     sink: &dyn EvidenceSink,
     retry_buffer: &mut RetryBuffer,
+    pending_gaps: &mut PendingGaps,
     metrics: &Metrics,
     producer: &ProducerMetadata,
-    retry_clock_start: Instant,
 ) {
+    while let Some(batch) = pending_gaps.front(producer) {
+        match sink.append_batch(batch).await {
+            Ok(_) => pending_gaps.pop_front(),
+            Err(err) if RetryBuffer::should_retry(&err) => {
+                record_sink_error(metrics, sink.name());
+                warn!(
+                    sink = sink.name(),
+                    error = %err,
+                    "gap evidence delivery failed; retrying later"
+                );
+                return;
+            }
+            Err(err) => {
+                record_sink_error(metrics, sink.name());
+                error!(
+                    sink = sink.name(),
+                    error = %err,
+                    "gap evidence delivery failed permanently"
+                );
+                pending_gaps.pop_front();
+            }
+        }
+    }
+
     while let Some(batch) = retry_buffer.front().cloned() {
         match sink.append_batch(batch).await {
             Ok(_) => {
@@ -466,6 +516,7 @@ async fn flush_retry_buffer(
                     error = %err,
                     queued_batches = retry_buffer.len_batches(),
                     queued_records = retry_buffer.len_records(),
+                    queued_bytes = retry_buffer.len_bytes(),
                     "evidence sink append failed; retrying later"
                 );
                 break;
@@ -479,20 +530,89 @@ async fn flush_retry_buffer(
                 );
                 let dropped = retry_buffer.pop_delivered();
                 if let Some(dropped) = dropped {
-                    let gap = jalki_evidence::GapReport {
-                        cause: terminal_gap_cause(&err).into(),
-                        dropped_records: dropped.len(),
-                        gap_start_ns: dropped.observed_at_min,
-                        gap_end_ns: dropped.observed_at_max,
-                    };
-                    retry_buffer.enqueue(
-                        gap.into_batch(producer.clone()),
-                        elapsed_ms(retry_clock_start),
-                    );
+                    pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &dropped));
                 }
                 break;
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct PendingGaps {
+    in_flight: Option<EvidenceBatch>,
+    queued: Option<GapReport>,
+}
+
+impl PendingGaps {
+    fn merge(&mut self, gap: GapReport) {
+        match &mut self.queued {
+            Some(existing) => existing.merge(gap),
+            None => self.queued = Some(gap),
+        }
+    }
+
+    fn extend(&mut self, gaps: impl IntoIterator<Item = GapReport>) {
+        for gap in gaps {
+            self.merge(gap);
+        }
+    }
+
+    fn front(&mut self, producer: &ProducerMetadata) -> Option<EvidenceBatch> {
+        if self.in_flight.is_none() {
+            self.in_flight = self
+                .queued
+                .take()
+                .map(|gap| gap.into_batch(producer.clone()));
+        }
+        self.in_flight.clone()
+    }
+
+    fn pop_front(&mut self) {
+        self.in_flight = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.in_flight.is_none() && self.queued.is_none()
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.in_flight.is_some()) + usize::from(self.queued.is_some())
+    }
+}
+
+fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
+    GapReport {
+        cause: cause.into(),
+        dropped_records: batch.len(),
+        gap_start_ns: batch.observed_at_min,
+        gap_end_ns: batch.observed_at_max,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_gap_retries_keep_the_same_ids() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let mut pending = PendingGaps::default();
+        pending.merge(GapReport {
+            cause: "retry_buffer_overflow".into(),
+            dropped_records: 1,
+            gap_start_ns: 10,
+            gap_end_ns: 20,
+        });
+
+        let first = pending.front(&producer).expect("pending gap");
+        let retry = pending.front(&producer).expect("same pending gap");
+
+        assert_eq!(retry.batch_id, first.batch_id);
+        assert_eq!(
+            retry.records[0].occurrence.id,
+            first.records[0].occurrence.id
+        );
     }
 }
 

@@ -380,6 +380,31 @@ impl EvidenceBatch {
         self.records.is_empty()
     }
 
+    /// Approximate in-memory footprint of this batch, for byte-budget
+    /// accounting (retry buffering). The occurrence dominates each record's
+    /// heap use, so its JSON serialization is the estimate's backbone, plus a
+    /// fixed per-record allowance for probe/binding strings and struct
+    /// overhead. An estimate, not an audit: serialization failures fall back
+    /// to a conservative constant rather than panicking in the buffer path.
+    pub fn approx_bytes(&self) -> usize {
+        const PER_RECORD_OVERHEAD: usize = 256;
+        const FALLBACK_OCCURRENCE_BYTES: usize = 1024;
+
+        self.records
+            .iter()
+            .map(|r| {
+                let occ = serde_json::to_vec(&r.occurrence)
+                    .map(|v| v.len())
+                    .unwrap_or(FALLBACK_OCCURRENCE_BYTES);
+                occ.saturating_add(record_metadata_bytes(r))
+                    .saturating_add(PER_RECORD_OVERHEAD)
+            })
+            .fold(
+                128usize.saturating_add(producer_metadata_bytes(&self.producer)),
+                |sum, bytes| sum.saturating_add(bytes),
+            )
+    }
+
     /// Project every record into an `Occurrence` carrying full metadata, applying
     /// this batch's [`ProducerMetadata`] to each. Consumes the batch — this is the
     /// intended hand-off into a sink.
@@ -416,6 +441,55 @@ impl EvidenceBatch {
             dropped_unbound,
         }
     }
+}
+
+fn producer_metadata_bytes(producer: &ProducerMetadata) -> usize {
+    [
+        &producer.producer,
+        &producer.producer_version,
+        &producer.cluster,
+        &producer.node_id,
+        &producer.kernel_release,
+    ]
+    .into_iter()
+    .map(String::capacity)
+    .sum()
+}
+
+fn record_metadata_bytes(record: &EvidenceRecord) -> usize {
+    let probe = [
+        &record.probe.probe_id,
+        &record.probe.probe_version,
+        &record.probe.probe_family,
+        &record.probe.kernel_function,
+    ]
+    .into_iter()
+    .map(String::capacity)
+    .sum::<usize>();
+
+    let binding = match &record.binding {
+        Some(RuntimeBinding::Bound {
+            container_id,
+            pod_uid,
+            namespace,
+            service_account,
+            labels,
+            ..
+        }) => {
+            let strings = container_id.capacity()
+                + pod_uid.as_ref().map_or(0, String::capacity)
+                + namespace.as_ref().map_or(0, String::capacity)
+                + service_account.as_ref().map_or(0, String::capacity);
+            labels.iter().fold(strings, |sum, (key, value)| {
+                sum.saturating_add(key.capacity())
+                    .saturating_add(value.capacity())
+                    .saturating_add(64)
+            })
+        }
+        Some(RuntimeBinding::Unbound { .. }) | None => 0,
+    };
+
+    probe.saturating_add(binding)
 }
 
 #[cfg(test)]
@@ -480,6 +554,26 @@ mod tests {
         assert_eq!(batch.observed_at_max, 50);
         assert_eq!(batch.len(), 3);
         assert!(!batch.batch_id.is_empty());
+    }
+
+    #[test]
+    fn byte_estimate_includes_runtime_binding_labels() {
+        let producer = ProducerMetadata::new("prod", "node-1", "6.17.0");
+        let base = EvidenceBatch::new(producer.clone(), vec![record(1)]).approx_bytes();
+        let labels = BTreeMap::from([("large".into(), "x".repeat(4096))]);
+        let bound = record(1).with_runtime_binding(RuntimeBinding::Bound {
+            container_id: "container-1".into(),
+            pod_uid: Some("pod-1".into()),
+            namespace: Some("default".into()),
+            service_account: None,
+            labels,
+            provenance: BindingProvenance::Observed,
+        });
+
+        assert!(
+            EvidenceBatch::new(producer, vec![bound]).approx_bytes() >= base + 4096,
+            "variable binding metadata must count against the byte budget"
+        );
     }
 
     #[test]
