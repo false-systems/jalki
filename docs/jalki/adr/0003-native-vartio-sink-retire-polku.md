@@ -1,6 +1,6 @@
 # ADR-0003 — Jälki speaks Vartio's source-ingress directly; Polku leaves the deployed topology
 
-- **Status:** Proposed (Dima, 2026-07-02 — for Yair's review)
+- **Status:** Accepted (2026-07-27)
 - **Date:** 2026-07-02
 - **Supersedes:** ADR-0002 §D1 (the *routing* clause only — "through Polku") and §D2
   (the "Polku sink targets Vartio's ingress" mechanism). See §6.

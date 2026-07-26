@@ -9,7 +9,8 @@ jälki is a programmable eBPF **fentry/fexit framework** for kernel and runtime 
 Two value planes run off one capture engine:
 
 - **Direct / interpreted** — the `ask`/`watch`/`stream`/`list` CLI, the MCP server, the Python SDK, and an embedded knowledge base that *interprets* raw signals (e.g. "ESTABLISHED-state retransmit ⇒ network problem, not application"). For humans and agents debugging *now*.
-- **Neutral evidence** — capture → normalize → `EvidenceSink`. Today's sinks are `stdout`/`file`/`composite`; the durable destination (the False Systems causality pipeline) is under active redesign — see **Design docs** below.
+- **Neutral evidence** — capture → normalize → `EvidenceSink`. Sinks are
+  `stdout`/`file`/`composite` plus the native Vartio source-ingress sink.
 
 The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults; the framework makes writing *any* fentry/fexit probe a matter of implementing the `Probe` trait.
 
@@ -239,11 +240,15 @@ pub trait EvidenceSink: Send + Sync {
 
 ## Design docs
 
-`docs/jalki/` contains a May-2026 design pass plus `adr/0001`. **⚠ Partially stale — under active reconciliation.** That pass framed jälki as a *direct Ahti producer* (jälki authenticates to Ahti and writes records to the `jalki` namespace). That premise has been reversed:
+`docs/jalki/` contains a May-2026 design pass plus the current routing ADRs.
+The old direct-Ahti and deployed-Polku premises are both retired:
 
-- Evidence routes **`jälki → Polku → Vartio → Ahti`**. jälki does **not** write to Ahti directly; Vartio interprets the evidence (normalize → chains → decisions) and writes the product records to Ahti.
+- Evidence routes **`jälki → Vartio → Ahti`** through the native
+  `jalki-vartio-sink`. Jälki does **not** write to Ahti directly; Vartio
+  interprets the evidence and writes product records to Ahti.
 - jälki **keeps** its product surface (`ask`/MCP/SDK/KB/interpretation) — the old plan to demote `ask` to a Lähde shim and move the KB out of the binary is dropped.
-- ADR-0001's interpretation reversal ("jälki MAY interpret") still holds; its D2 routing (`PolkuSink`/`AhtiSink` → Ahti) does not.
+- ADR-0001's interpretation reversal ("jälki MAY interpret") still holds; its
+  old routing clause does not.
 
 Until a superseding ADR lands, treat the storage/routing claims in these docs as wrong. The fentry/fexit framework, the `Probe` trait, and the eBPF crates are accurate and preserved.
 
@@ -263,7 +268,6 @@ For architectural changes, write a design doc first (MUST/SHOULD/MAY discipline)
 jälki     kernel observation (fentry/fexit framework)
 TAPIO     k8s observation
 RAUTA     L7 gateway
-POLKU     event transport
 AHTI      causality correlation
 syva      enforcement
 rauha     container runtime

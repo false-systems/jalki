@@ -63,7 +63,7 @@ Evidence shipped to Vartio on Plane B **MUST** be neutral: no product severity, 
 
 Vartio's runtime importer requires a **strong runtime binding** (`pod.uid` or `container.id`) and **drops** unbound evidence (`{:error, :unbound_runtime_evidence}`). Therefore Jälki **MUST** enrich each kernel event with `cgroup_id → container_id → pod_uid → namespace` *before* emitting on Plane B. This promotes the enrichment described in `local-agent-state.md` §6 from optional polish to a **hard dependency** — and it is the single largest piece of new Jälki work, larger than the sink itself. The `evidence_level` provenance rule survives (`observed` if the lookup is deterministic, `derived` if it came from a possibly-stale cache).
 
-Jälki **MUST** emit runtime identity in Vartio's vocabulary: `k8s_pod_uid`, `k8s_pod_name`, `k8s_container_id`, and `k8s_namespace`; plus a resource reference per event (for TCP, `network_endpoint` = `dst_ip:dst_port`).
+Jälki **MUST** emit runtime identity in Vartio's vocabulary: `k8s_pod_uid`, `k8s_pod_name`, `k8s_container_id`, and `k8s_namespace`; plus a resource reference per event (for TCP, `network_endpoint` = `dst_ip:dst_port`). Jälki does not infer `github_run_id`; Vartio owns the GitHub workflow-job runner-name to pod-name join.
 
 ### D6 — The Vartio-side importer is the cross-repo contract
 
