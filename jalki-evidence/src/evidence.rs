@@ -470,20 +470,16 @@ fn record_metadata_bytes(record: &EvidenceRecord) -> usize {
         Some(RuntimeBinding::Bound {
             container_id,
             pod_uid,
+            pod_name,
             namespace,
             service_account,
-            labels,
             ..
         }) => {
-            let strings = container_id.capacity()
+            container_id.capacity()
                 + pod_uid.as_ref().map_or(0, String::capacity)
+                + pod_name.as_ref().map_or(0, String::capacity)
                 + namespace.as_ref().map_or(0, String::capacity)
-                + service_account.as_ref().map_or(0, String::capacity);
-            labels.iter().fold(strings, |sum, (key, value)| {
-                sum.saturating_add(key.capacity())
-                    .saturating_add(value.capacity())
-                    .saturating_add(64)
-            })
+                + service_account.as_ref().map_or(0, String::capacity)
         }
         Some(RuntimeBinding::Unbound { .. }) | None => 0,
     };
@@ -556,16 +552,15 @@ mod tests {
     }
 
     #[test]
-    fn byte_estimate_includes_runtime_binding_labels() {
+    fn byte_estimate_includes_runtime_binding_strings() {
         let producer = ProducerMetadata::new("prod", "node-1", "6.17.0");
         let base = EvidenceBatch::new(producer.clone(), vec![record(1)]).approx_bytes();
-        let labels = BTreeMap::from([("large".into(), "x".repeat(4096))]);
         let bound = record(1).with_runtime_binding(RuntimeBinding::Bound {
             container_id: "container-1".into(),
             pod_uid: Some("pod-1".into()),
+            pod_name: Some("x".repeat(4096)),
             namespace: Some("default".into()),
             service_account: None,
-            labels,
             provenance: BindingProvenance::Observed,
         });
 
