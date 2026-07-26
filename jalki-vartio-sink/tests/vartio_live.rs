@@ -9,8 +9,6 @@
 //! When either var is unset, the tests return early (pass) so a plain
 //! `cargo test` is unaffected.
 
-use std::collections::BTreeMap;
-
 use jalki_evidence::{
     BindingProvenance, EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind, KernelEvent,
     ProbeMetadata, ProducerMetadata, RuntimeBinding, SinkError, TcpConnectEvent,
@@ -68,9 +66,9 @@ fn bound_record() -> EvidenceRecord {
         .with_runtime_binding(RuntimeBinding::Bound {
             container_id: "containerd://abc".to_string(),
             pod_uid: Some("pod-uid-live-1".to_string()),
+            pod_name: Some("runner-live-1".to_string()),
             namespace: Some("workloads".to_string()),
             service_account: None,
-            labels: BTreeMap::new(),
             provenance: BindingProvenance::Observed,
         })
 }

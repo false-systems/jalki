@@ -12,9 +12,9 @@
 //! Field sources, by occurrence anatomy:
 //! - identity/time: `id` → `event_id`, `timestamp` → `observed_at` +
 //!   `agent_recv_time`, label `observed_at_ns` → numeric `kernel_time_ns`
-//! - binding labels: `k8s_pod_uid` → `pod_uid`, `k8s_container_id` →
-//!   `container_id`, `k8s_namespace`, `k8s_service_account` →
-//!   `service_account`, `github_run_id`, `evidence_level`
+//! - binding labels: `k8s_pod_uid` → `pod_uid`, `k8s_pod_name` → `pod_name`,
+//!   `k8s_container_id` → `container_id`, `k8s_namespace`,
+//!   `k8s_service_account` → `service_account`, `evidence_level`
 //! - process block: `pid`, `ppid`, `command` → `comm`, `uid`; labels `gid`
 //!   (numeric) and `argv_hash`; `exe` from the `resource_ref_id` label when
 //!   `resource_ref_kind == "executable"`
@@ -29,10 +29,10 @@ use serde_json::{json, Map, Value};
 const LABEL_KEYS: &[(&str, &str)] = &[
     ("node_id", "node_id"),
     ("k8s_pod_uid", "pod_uid"),
+    ("k8s_pod_name", "pod_name"),
     ("k8s_container_id", "container_id"),
     ("k8s_namespace", "k8s_namespace"),
     ("k8s_service_account", "service_account"),
-    ("github_run_id", "github_run_id"),
     ("cgroup_id", "cgroup_id"),
     ("argv_hash", "argv_hash"),
     ("tcp_state", "tcp_state"),
@@ -143,6 +143,7 @@ mod tests {
             ("cluster_id", "cluster-1"),
             ("observed_at_ns", "657653680687218"),
             ("k8s_pod_uid", "pod-uid-1"),
+            ("k8s_pod_name", "runner-1"),
             ("k8s_container_id", "containerd://abc"),
             ("k8s_namespace", "workloads"),
             ("cgroup_id", "913488225941"),
@@ -188,6 +189,7 @@ mod tests {
         assert_eq!(m["node_id"], "node-vox");
         assert_eq!(m["kernel_time_ns"], 657653680687218u64);
         assert_eq!(m["pod_uid"], "pod-uid-1");
+        assert_eq!(m["pod_name"], "runner-1");
         assert_eq!(m["container_id"], "containerd://abc");
         assert_eq!(m["pid"], 4242);
         assert_eq!(m["comm"], "kubectl");

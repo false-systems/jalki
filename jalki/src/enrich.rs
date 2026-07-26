@@ -159,7 +159,6 @@ pub fn bind_record(record: EvidenceRecord, enricher: &dyn RuntimeEnricher) -> Ev
 mod tests {
     use false_protocol::Occurrence;
     use jalki_evidence::{EvidenceRecord, HookKind, ProbeMetadata};
-    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -200,9 +199,9 @@ mod tests {
     fn metadata() -> jalki_enrich::PodMetadata {
         jalki_enrich::PodMetadata {
             pod_uid: "pod-1".into(),
+            pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
-            labels: BTreeMap::new(),
         }
     }
 

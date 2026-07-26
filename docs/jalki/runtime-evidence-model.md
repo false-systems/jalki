@@ -8,7 +8,9 @@ The vocabulary is normative. Field shapes are encoded by `jalki-evidence` on emi
 
 ## 0. Common envelope (recap)
 
-Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_container_id` / `k8s_namespace`, optional `github_run_id`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B.
+Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_pod_name` / `k8s_container_id` / `k8s_namespace`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B.
+
+Migration note: callers constructing `RuntimeBinding::Bound`, `PodMetadata`, or `PodSnapshot` must now supply `pod_name` (`None` only when unavailable); their unused pod-label map was removed. The Kubernetes watcher always supplies the name from `metadata.name`.
 
 - `observed_at` (kernel CLOCK_BOOTTIME) is preserved; ingest time is never set by Jälki.
 

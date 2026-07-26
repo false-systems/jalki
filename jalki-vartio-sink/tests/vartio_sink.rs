@@ -1,9 +1,8 @@
 //! Integration tests: drive `VartioSink` over real gRPC against an in-crate
-//! `SourceIngress` test receiver (ported from polku #159). Verifies the wire
-//! contract, all-or-retry, fail-fast identity, the Plane-B boundary, and the
-//! ADR-0004 config surface (bearer auth + native payload shape).
+//! `SourceIngress` test receiver. Verifies the wire contract, all-or-retry,
+//! fail-fast identity, the Plane-B boundary, and the ADR-0004 config surface
+//! (bearer auth + native payload shape).
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -158,9 +157,9 @@ fn bound_record() -> EvidenceRecord {
         .with_runtime_binding(RuntimeBinding::Bound {
             container_id: "containerd://abc".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
+            pod_name: Some("runner-1".to_string()),
             namespace: Some("workloads".to_string()),
             service_account: None,
-            labels: BTreeMap::new(),
             provenance: BindingProvenance::Observed,
         })
 }
@@ -216,6 +215,7 @@ async fn delivers_a_bound_batch_with_the_wire_contract() {
     let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
     assert_eq!(payload["occurrence_type"], "kernel.tcp.connect");
     assert_eq!(payload["pod_uid"], "pod-uid-1");
+    assert_eq!(payload["pod_name"], "runner-1");
     assert_eq!(payload["container_id"], "containerd://abc");
     assert_eq!(payload["k8s_namespace"], "workloads");
     assert_eq!(payload["node_id"], "node-vox");
@@ -268,9 +268,9 @@ fn unsupported_type_record() -> EvidenceRecord {
     .with_runtime_binding(RuntimeBinding::Bound {
         container_id: "containerd://abc".to_string(),
         pod_uid: Some("pod-uid-1".to_string()),
+        pod_name: Some("runner-1".to_string()),
         namespace: Some("workloads".to_string()),
         service_account: None,
-        labels: BTreeMap::new(),
         provenance: BindingProvenance::Observed,
     })
 }
@@ -327,9 +327,9 @@ fn file_family_record() -> EvidenceRecord {
     .with_runtime_binding(RuntimeBinding::Bound {
         container_id: "containerd://abc".to_string(),
         pod_uid: Some("pod-uid-1".to_string()),
+        pod_name: Some("runner-1".to_string()),
         namespace: Some("workloads".to_string()),
         service_account: None,
-        labels: BTreeMap::new(),
         provenance: BindingProvenance::Observed,
     })
 }

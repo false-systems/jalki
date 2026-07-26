@@ -101,8 +101,8 @@ fn remove_pod_from_cache(uid: &str, cache: &Arc<RwLock<BindingCache>>) -> Result
 
 pub fn pod_to_snapshot(pod: &Pod) -> Option<PodSnapshot> {
     let pod_uid = pod.metadata.uid.clone()?;
+    let pod_name = pod.metadata.name.clone()?;
     let namespace = pod.namespace()?;
-    let labels = pod.labels().clone();
     let service_account = pod
         .spec
         .as_ref()
@@ -120,9 +120,9 @@ pub fn pod_to_snapshot(pod: &Pod) -> Option<PodSnapshot> {
 
     Some(PodSnapshot {
         pod_uid,
+        pod_name,
         namespace,
         service_account,
-        labels,
         containers,
     })
 }
@@ -146,8 +146,6 @@ fn collect_container_statuses(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use k8s_openapi::api::core::v1::{ContainerStatus, PodSpec, PodStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
@@ -164,13 +162,11 @@ mod tests {
     }
 
     fn pod() -> Pod {
-        let mut labels = BTreeMap::new();
-        labels.insert("actions.github.com/run-id".into(), "123456".into());
         Pod {
             metadata: ObjectMeta {
                 uid: Some("pod-uid-1".into()),
+                name: Some("runner-1".into()),
                 namespace: Some("default".into()),
-                labels: Some(labels),
                 ..Default::default()
             },
             spec: Some(PodSpec {
@@ -189,15 +185,9 @@ mod tests {
         let snapshot = pod_to_snapshot(&pod()).unwrap();
 
         assert_eq!(snapshot.pod_uid, "pod-uid-1");
+        assert_eq!(snapshot.pod_name, "runner-1");
         assert_eq!(snapshot.namespace, "default");
         assert_eq!(snapshot.service_account.as_deref(), Some("builder"));
-        assert_eq!(
-            snapshot
-                .labels
-                .get("actions.github.com/run-id")
-                .map(String::as_str),
-            Some("123456")
-        );
         assert_eq!(snapshot.containers.len(), 1);
         assert_eq!(
             snapshot.containers[0].container_id,

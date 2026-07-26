@@ -4,7 +4,7 @@
 //! pieces that can be tested on any host: parsing cgroup/container identifiers
 //! and converting resolved pod/container metadata into `RuntimeBinding`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -15,7 +15,6 @@ use jalki_evidence::{BindingProvenance, RuntimeBinding, UnboundReason};
 use thiserror::Error;
 
 const CONTAINER_ID_LEN: usize = 64;
-const ARC_RUN_ID_LABEL: &str = "actions.github.com/run-id";
 const DEFAULT_BINDING_CACHE_MAX_CONTAINERS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,15 +259,9 @@ pub fn parse_k8s_container_id(value: &str) -> Result<ContainerRef, ParseContaine
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodMetadata {
     pub pod_uid: String,
+    pub pod_name: String,
     pub namespace: String,
     pub service_account: Option<String>,
-    pub labels: BTreeMap<String, String>,
-}
-
-impl PodMetadata {
-    pub fn github_run_id(&self) -> Option<&str> {
-        self.labels.get(ARC_RUN_ID_LABEL).map(String::as_str)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,9 +280,9 @@ impl ContainerStatusSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodSnapshot {
     pub pod_uid: String,
+    pub pod_name: String,
     pub namespace: String,
     pub service_account: Option<String>,
-    pub labels: BTreeMap<String, String>,
     pub containers: Vec<ContainerStatusSnapshot>,
 }
 
@@ -297,9 +290,9 @@ impl PodSnapshot {
     pub fn metadata(&self) -> PodMetadata {
         PodMetadata {
             pod_uid: self.pod_uid.clone(),
+            pod_name: self.pod_name.clone(),
             namespace: self.namespace.clone(),
             service_account: self.service_account.clone(),
-            labels: self.labels.clone(),
         }
     }
 }
@@ -333,9 +326,9 @@ impl Binding {
             } => RuntimeBinding::Bound {
                 container_id,
                 pod_uid: Some(metadata.pod_uid),
+                pod_name: Some(metadata.pod_name),
                 namespace: Some(metadata.namespace),
                 service_account: metadata.service_account,
-                labels: metadata.labels,
                 provenance,
             },
             Binding::Unbound { reason } => RuntimeBinding::Unbound { reason },
@@ -541,24 +534,20 @@ mod tests {
     const UPPER_ID: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
 
     fn metadata() -> PodMetadata {
-        let mut labels = BTreeMap::new();
-        labels.insert(ARC_RUN_ID_LABEL.into(), "987654321".into());
         PodMetadata {
             pod_uid: "pod-uid-1".into(),
+            pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
-            labels,
         }
     }
 
     fn pod_snapshot() -> PodSnapshot {
-        let mut labels = BTreeMap::new();
-        labels.insert(ARC_RUN_ID_LABEL.into(), "987654321".into());
         PodSnapshot {
             pod_uid: "pod-uid-1".into(),
+            pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
-            labels,
             containers: vec![ContainerStatusSnapshot::new(format!("containerd://{ID}"))],
         }
     }
@@ -684,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_cache_returns_runtime_binding_with_arc_label() {
+    fn binding_cache_returns_pod_identity() {
         let mut cache = BindingCache::new();
         cache.upsert(ID, metadata());
 
@@ -694,9 +683,9 @@ mod tests {
 
         let RuntimeBinding::Bound {
             pod_uid,
+            pod_name,
             namespace,
             service_account,
-            labels,
             provenance,
             ..
         } = binding
@@ -705,12 +694,9 @@ mod tests {
         };
 
         assert_eq!(pod_uid.as_deref(), Some("pod-uid-1"));
+        assert_eq!(pod_name.as_deref(), Some("runner-1"));
         assert_eq!(namespace.as_deref(), Some("default"));
         assert_eq!(service_account.as_deref(), Some("builder"));
-        assert_eq!(
-            labels.get(ARC_RUN_ID_LABEL).map(String::as_str),
-            Some("987654321")
-        );
         assert_eq!(provenance, BindingProvenance::Observed);
     }
 

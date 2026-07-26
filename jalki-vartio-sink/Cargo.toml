@@ -7,14 +7,14 @@ publish = false
 
 # The Plane-B transport: an `EvidenceSink` that delivers jälki evidence to
 # Vartio's `SourceIngress.ReceiveBatch` (ADR-0003). aya-free — builds and tests
-# everywhere jalki-evidence does. Ported from polku #159's VartioEmitter.
+# everywhere jalki-evidence does.
 
 [dependencies]
 jalki-evidence = { path = "../jalki-evidence" }
 false-protocol = { workspace = true }
 
 # gRPC stack — pinned to the combination the vendored codegen was generated and
-# tested with (0.14.6 raises MSRV; see polku #159 lineage).
+# tested with (0.14.6 raises MSRV).
 tonic = { version = "=0.14.5", features = ["transport"] }
 tonic-prost = "=0.14.5"
 prost = "0.14"

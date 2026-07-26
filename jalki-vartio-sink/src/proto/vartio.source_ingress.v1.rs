@@ -2,13 +2,13 @@
 /// One batch = one (source_key, provider, namespace) from one adapter/node.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProviderEvidenceBatch {
-    /// e.g. "tetragon"        -> ProviderEvidence.source_key
+    /// e.g. "jalki"        -> ProviderEvidence.source_key
     #[prost(string, tag = "1")]
     pub source_key: ::prost::alloc::string::String,
-    /// e.g. "tetragon"        -> ProviderEvidence.provider
+    /// e.g. "jalki"        -> ProviderEvidence.provider
     #[prost(string, tag = "2")]
     pub provider: ::prost::alloc::string::String,
-    /// e.g. "vartio-tetragon" (Ahti adapter namespace)
+    /// e.g. "vartio-jalki" (Ahti adapter namespace)
     #[prost(string, tag = "3")]
     pub namespace: ::prost::alloc::string::String,
     /// adapter-generated; response/log correlation (-> delivery_id)
@@ -36,7 +36,7 @@ pub struct ProviderEvidenceItem {
     /// the importer derives the durable Ahti logical_key from the normalized event.
     #[prost(string, tag = "1")]
     pub idempotency_key: ::prost::alloc::string::String,
-    /// e.g. "tetragon.process_exec"
+    /// e.g. "kernel.process.exec"
     #[prost(string, tag = "2")]
     pub occurrence_type: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]

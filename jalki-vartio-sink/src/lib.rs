@@ -1,9 +1,7 @@
 //! `VartioSink` — the Plane-B transport (ADR-0003).
 //!
 //! An [`EvidenceSink`] that delivers jälki evidence to Vartio's
-//! `SourceIngress.ReceiveBatch` over gRPC. Ported from polku #159's
-//! `VartioEmitter` (all-or-retry, source-scoped idempotency, in-crate test
-//! receiver), adapted to jälki's seams:
+//! `SourceIngress.ReceiveBatch` over gRPC:
 //!
 //! - **Plane-B projection at the door**: `EvidenceBatch::into_plane_b_projection`
 //!   supplies neutral, strongly-bound occurrences (ADR-0002 §D4/§D5). Unbound
@@ -22,7 +20,7 @@
 //!   [`SinkError::PartialFailure`] (matching `PipelineSink`), so the runtime
 //!   sink loop records the drop as gap evidence instead of counting the batch
 //!   as delivered.
-//! - **fail-fast identity** (polku #159 review): a batch whose producer carries
+//! - **fail-fast identity**: a batch whose producer carries
 //!   an empty cluster or node identity is refused as `Misconfigured` — the sink
 //!   never emits `jalki:::…` idempotency keys.
 //! - **bounded-and-lossy is the caller's policy** (ADR-0003 §D3): this sink
@@ -197,7 +195,7 @@ impl EvidenceSink for VartioSink {
     }
 
     async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
-        // fail-fast identity (polku #159 review): never emit `jalki:::…` keys.
+        // Fail fast: never emit `jalki:::…` keys.
         let producer = batch.producer.clone();
         if producer.cluster.is_empty() || producer.node_id.is_empty() {
             return Err(SinkError::Misconfigured {
