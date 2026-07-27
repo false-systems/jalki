@@ -1,9 +1,7 @@
 //! `VartioSink` — the Plane-B transport (ADR-0003).
 //!
 //! An [`EvidenceSink`] that delivers jälki evidence to Vartio's
-//! `SourceIngress.ReceiveBatch` over gRPC. Ported from polku #159's
-//! `VartioEmitter` (all-or-retry, source-scoped idempotency, in-crate test
-//! receiver), adapted to jälki's seams:
+//! `SourceIngress.ReceiveBatch` over gRPC:
 //!
 //! - **Plane-B projection at the door**: `EvidenceBatch::into_plane_b_projection`
 //!   supplies neutral, strongly-bound occurrences (ADR-0002 §D4/§D5). Unbound
@@ -22,7 +20,7 @@
 //!   [`SinkError::PartialFailure`] (matching `PipelineSink`), so the runtime
 //!   sink loop records the drop as gap evidence instead of counting the batch
 //!   as delivered.
-//! - **fail-fast identity** (polku #159 review): a batch whose producer carries
+//! - **fail-fast identity**: a batch whose producer carries
 //!   an empty cluster or node identity is refused as `Misconfigured` — the sink
 //!   never emits `jalki:::…` idempotency keys.
 //! - **bounded-and-lossy is the caller's policy** (ADR-0003 §D3): this sink
@@ -54,17 +52,26 @@ use proto::{ProviderEvidenceBatch, ProviderEvidenceItem};
 pub const SINK_NAME: &str = "vartio";
 
 /// Occurrence types Vartio's `Importer.Jalki` accepts (the `vartio-jalki`
-/// namespace contract): exec + the three TCP signals. The daemon also captures
-/// `kernel.file.open{,_attempt}`, which the importer rejects as
-/// `UNSUPPORTED_EVENT` — sending them is guaranteed data loss logged as error.
-/// We drop them here with a visible warning instead. Widening this set is a
-/// Vartio-side decision (add the type to the importer first).
+/// namespace contract): exec, the three TCP signals, and the file family
+/// (ADR-0005). Anything else is dropped here with a visible warning rather
+/// than sent as a guaranteed `UNSUPPORTED_EVENT` reject. Widening this set is
+/// a Vartio-side decision — the importer must accept a type BEFORE it is
+/// added here (ADR-0005 §4).
 pub const VARTIO_SUPPORTED_TYPES: &[&str] = &[
     "kernel.process.exec",
     "kernel.tcp.connect",
     "kernel.tcp.close",
     "kernel.tcp.retransmit",
+    "kernel.file.open",
+    "kernel.file.open_attempt",
 ];
+
+/// The file family is additionally gated at runtime (`send_file_types`,
+/// daemon env `JALKI_VARTIO_FILE_TYPES`) so a jälki release can deploy ahead
+/// of the Vartio importer without every file item becoming a permanent
+/// per-item reject. Flip the flag on once the receiver accepts these types
+/// (ADR-0005 §4).
+pub const VARTIO_FILE_TYPES: &[&str] = &["kernel.file.open", "kernel.file.open_attempt"];
 
 /// Static identity + target for the Vartio ingress lane. Cluster/node identity
 /// rides on each `EvidenceBatch`'s `ProducerMetadata`, not here.
@@ -85,6 +92,11 @@ pub struct VartioSinkConfig {
     /// receivers. The daemon sources this from `VARTIO_INGRESS_TOKEN`; it must
     /// never be logged.
     pub ingress_token: Option<String>,
+    /// Send the file family (`VARTIO_FILE_TYPES`) on the wire. Default false:
+    /// the receiving importer must accept these types first (ADR-0005 §4), so
+    /// the flag decouples jälki's deploy from Vartio's. Daemon env:
+    /// `JALKI_VARTIO_FILE_TYPES=1`.
+    pub send_file_types: bool,
     pub timeout: Duration,
 }
 
@@ -97,6 +109,7 @@ impl VartioSinkConfig {
             namespace: "vartio-jalki".to_string(),
             adapter_id: adapter_id.into(),
             ingress_token: None,
+            send_file_types: false,
             timeout: Duration::from_secs(10),
         }
     }
@@ -105,6 +118,13 @@ impl VartioSinkConfig {
     pub fn with_ingress_token(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
         self.ingress_token = (!token.is_empty()).then_some(token);
+        self
+    }
+
+    /// Enable sending the file family (ADR-0005). Only flip this on once the
+    /// receiving Vartio's `Importer.Jalki` accepts `kernel.file.*`.
+    pub fn with_file_types(mut self, enabled: bool) -> Self {
+        self.send_file_types = enabled;
         self
     }
 
@@ -175,7 +195,7 @@ impl EvidenceSink for VartioSink {
     }
 
     async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
-        // fail-fast identity (polku #159 review): never emit `jalki:::…` keys.
+        // Fail fast: never emit `jalki:::…` keys.
         let producer = batch.producer.clone();
         if producer.cluster.is_empty() || producer.node_id.is_empty() {
             return Err(SinkError::Misconfigured {
@@ -200,24 +220,37 @@ impl EvidenceSink for VartioSink {
 
         // Only send occurrence types the Vartio importer accepts; anything else
         // is a guaranteed UNSUPPORTED_EVENT reject. Drop with a visible,
-        // aggregated warning (never silent — matches ADR-0002 §D7).
+        // aggregated warning (never silent — matches ADR-0002 §D7). The file
+        // family is additionally gated behind `send_file_types` (ADR-0005 §4)
+        // and gets its own warning so operators see config, not contract.
         let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
+        let mut gated: BTreeMap<String, usize> = BTreeMap::new();
         let occurrences: Vec<_> = projection
             .occurrences
             .into_iter()
             .filter(|occ| {
                 let t = occ.occurrence_type.as_str();
-                if VARTIO_SUPPORTED_TYPES.contains(&t) {
-                    true
-                } else {
+                if !VARTIO_SUPPORTED_TYPES.contains(&t) {
                     *unsupported.entry(t.to_string()).or_insert(0) += 1;
                     false
+                } else if VARTIO_FILE_TYPES.contains(&t) && !self.cfg.send_file_types {
+                    *gated.entry(t.to_string()).or_insert(0) += 1;
+                    false
+                } else {
+                    true
                 }
             })
             .collect();
         for (t, n) in &unsupported {
             warnings.push(format!(
                 "dropped {n} record(s) of unsupported-by-importer type {t}"
+            ));
+        }
+        for (t, n) in &gated {
+            warnings.push(format!(
+                "dropped {n} record(s) of type {t}: file family gated off — set \
+                 JALKI_VARTIO_FILE_TYPES=1 once Vartio's Importer.Jalki accepts \
+                 kernel.file.* (ADR-0005 §4)"
             ));
         }
 

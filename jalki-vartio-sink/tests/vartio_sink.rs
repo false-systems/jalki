@@ -1,9 +1,8 @@
 //! Integration tests: drive `VartioSink` over real gRPC against an in-crate
-//! `SourceIngress` test receiver (ported from polku #159). Verifies the wire
-//! contract, all-or-retry, fail-fast identity, the Plane-B boundary, and the
-//! ADR-0004 config surface (bearer auth + native payload shape).
+//! `SourceIngress` test receiver. Verifies the wire contract, all-or-retry,
+//! fail-fast identity, the Plane-B boundary, and the ADR-0004 config surface
+//! (bearer auth + native payload shape).
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -158,9 +157,9 @@ fn bound_record() -> EvidenceRecord {
         .with_runtime_binding(RuntimeBinding::Bound {
             container_id: "containerd://abc".to_string(),
             pod_uid: Some("pod-uid-1".to_string()),
+            pod_name: Some("runner-1".to_string()),
             namespace: Some("workloads".to_string()),
             service_account: None,
-            labels: BTreeMap::new(),
             provenance: BindingProvenance::Observed,
         })
 }
@@ -216,6 +215,7 @@ async fn delivers_a_bound_batch_with_the_wire_contract() {
     let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
     assert_eq!(payload["occurrence_type"], "kernel.tcp.connect");
     assert_eq!(payload["pod_uid"], "pod-uid-1");
+    assert_eq!(payload["pod_name"], "runner-1");
     assert_eq!(payload["container_id"], "containerd://abc");
     assert_eq!(payload["k8s_namespace"], "workloads");
     assert_eq!(payload["node_id"], "node-vox");
@@ -253,10 +253,10 @@ async fn bearer_token_rides_the_authorization_header() {
     );
 }
 
-/// A record whose occurrence type the importer does not accept
-/// (`kernel.file.open`) — the daemon captures these but Vartio rejects them.
+/// A record whose occurrence type the importer does not accept — a probe the
+/// daemon could capture but the `vartio-jalki` contract does not cover.
 fn unsupported_type_record() -> EvidenceRecord {
-    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.file.open");
+    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.sched.switch");
     EvidenceRecord {
         observed_at_ns: 1_000_000,
         pid: 4242,
@@ -268,9 +268,9 @@ fn unsupported_type_record() -> EvidenceRecord {
     .with_runtime_binding(RuntimeBinding::Bound {
         container_id: "containerd://abc".to_string(),
         pod_uid: Some("pod-uid-1".to_string()),
+        pod_name: Some("runner-1".to_string()),
         namespace: Some("workloads".to_string()),
         service_account: None,
-        labels: BTreeMap::new(),
         provenance: BindingProvenance::Observed,
     })
 }
@@ -280,7 +280,7 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
     let rx = spawn_receiver(false, 0, 0).await;
     let sink = connect(rx.endpoint.clone()).await;
 
-    // One supported (tcp.connect) + one unsupported (file.open) — only the
+    // One supported (tcp.connect) + one unsupported (sched.switch) — only the
     // supported one crosses the wire; the drop is a visible warning, not a
     // reject and not silent.
     let result = sink
@@ -302,7 +302,7 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
         result
             .warnings
             .iter()
-            .any(|w| w.contains("unsupported-by-importer") && w.contains("kernel.file.open")),
+            .any(|w| w.contains("unsupported-by-importer") && w.contains("kernel.sched.switch")),
         "the drop is visible: {:?}",
         result.warnings
     );
@@ -310,6 +310,78 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
     let batches = rx.received.lock().unwrap();
     assert_eq!(batches[0].items.len(), 1, "only 1 item on the wire");
     assert_eq!(batches[0].items[0].occurrence_type, "kernel.tcp.connect");
+}
+
+/// A bound `kernel.file.open_attempt` record — importer-supported, but gated
+/// behind `send_file_types` (ADR-0005 §4).
+fn file_family_record() -> EvidenceRecord {
+    let occurrence = false_protocol::Occurrence::new("jalki", "kernel.file.open_attempt");
+    EvidenceRecord {
+        observed_at_ns: 2_000_000,
+        pid: 7,
+        cgroup_id: 77,
+        probe: probe(),
+        occurrence,
+        binding: None,
+    }
+    .with_runtime_binding(RuntimeBinding::Bound {
+        container_id: "containerd://abc".to_string(),
+        pod_uid: Some("pod-uid-1".to_string()),
+        pod_name: Some("runner-1".to_string()),
+        namespace: Some("workloads".to_string()),
+        service_account: None,
+        provenance: BindingProvenance::Observed,
+    })
+}
+
+#[tokio::test]
+async fn file_family_is_gated_off_by_default_with_a_config_warning() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let sink = connect(rx.endpoint.clone()).await;
+
+    let result = sink
+        .append_batch(EvidenceBatch::new(
+            producer(),
+            vec![bound_record(), file_family_record()],
+        ))
+        .await
+        .expect("accepted");
+    assert_eq!(result.accepted_count, 1, "only the tcp record delivered");
+    assert!(
+        result.warnings.iter().any(|w| w.contains("gated off")
+            && w.contains("JALKI_VARTIO_FILE_TYPES")
+            && w.contains("kernel.file.open_attempt")),
+        "the gate drop is visible and names the remedy: {:?}",
+        result.warnings
+    );
+
+    let batches = rx.received.lock().unwrap();
+    assert_eq!(batches[0].items.len(), 1);
+    assert_eq!(batches[0].items[0].occurrence_type, "kernel.tcp.connect");
+}
+
+#[tokio::test]
+async fn file_family_is_delivered_when_enabled() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let cfg = VartioSinkConfig::new(rx.endpoint.clone(), "jalki-adapter-1").with_file_types(true);
+    let sink = connect_cfg(cfg).await;
+
+    let result = sink
+        .append_batch(EvidenceBatch::new(producer(), vec![file_family_record()]))
+        .await
+        .expect("accepted");
+    assert_eq!(result.accepted_count, 1);
+    assert!(
+        result.warnings.iter().all(|w| !w.contains("gated off")),
+        "no gate warning when enabled: {:?}",
+        result.warnings
+    );
+
+    let batches = rx.received.lock().unwrap();
+    assert_eq!(
+        batches[0].items[0].occurrence_type,
+        "kernel.file.open_attempt"
+    );
 }
 
 #[tokio::test]

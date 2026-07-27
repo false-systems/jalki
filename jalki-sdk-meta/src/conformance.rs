@@ -1,4 +1,4 @@
-/// Conformance test cases — defined once, executed in every SDK language.
+//! Conformance test cases — defined once, executed in every SDK language.
 
 /// A conformance test case.
 #[derive(Debug)]

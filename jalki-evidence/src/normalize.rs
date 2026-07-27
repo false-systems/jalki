@@ -74,6 +74,13 @@ impl FileOpenEvent {
         });
 
         occ.labels.insert("result".into(), result.into());
+        if !success {
+            // A denied open carries its errno on the wire (ADR-0005 §3,
+            // pinned by Vartio's file_open_denied.json) — same label pair as
+            // open_attempt: `errno_num` is the raw negative kernel ret.
+            occ.labels.insert("errno".into(), errno_name(self.ret));
+            occ.labels.insert("errno_num".into(), self.ret.to_string());
+        }
         occ.labels.insert("flags".into(), self.flags.to_string());
         occ.labels
             .insert("cgroup_id".into(), self.cgroup_id.to_string());
@@ -239,6 +246,10 @@ impl TcpConnectEvent {
         occ.labels.insert("netns".into(), self.netns.to_string());
 
         if !success {
+            // `errno_num` (raw negative ret) feeds the sink's generic wire
+            // errno projection (ADR-0005 §3); the error block below carries
+            // the human-readable name for Plane A.
+            occ.labels.insert("errno_num".into(), self.ret.to_string());
             occ.error = Some(OccurrenceError {
                 code: errno_name(self.ret),
                 what_failed: format!(
@@ -533,10 +544,7 @@ mod tests {
 
         let occ = event.to_occurrence("prod");
 
-        assert_eq!(
-            occ.labels.get("path_truncated"),
-            Some(&"true".to_string())
-        );
+        assert_eq!(occ.labels.get("path_truncated"), Some(&"true".to_string()));
     }
 
     #[test]
@@ -547,6 +555,18 @@ mod tests {
         assert_eq!(occ.outcome, Some(Outcome::Failure));
         assert!(occ.error.is_none());
         assert_eq!(occ.labels.get("result"), Some(&"denied".to_string()));
+        // The denial's errno crosses the wire (Vartio's file_open_denied.json
+        // fixture pins `errno: 13`) — the sink projects it from `errno_num`.
+        assert_eq!(occ.labels.get("errno"), Some(&"EACCES".to_string()));
+        assert_eq!(occ.labels.get("errno_num"), Some(&"-13".to_string()));
+    }
+
+    #[test]
+    fn file_open_allowed_carries_no_errno() {
+        let occ = file_open(0).to_occurrence("prod");
+        assert_eq!(occ.labels.get("result"), Some(&"allowed".to_string()));
+        assert!(occ.labels.get("errno").is_none());
+        assert!(occ.labels.get("errno_num").is_none());
     }
 
     #[test]
@@ -602,6 +622,9 @@ mod tests {
 
         assert_eq!(occ.severity, Severity::Warning);
         assert_eq!(occ.outcome, Some(Outcome::Failure));
+        // Raw negative ret as a label — the sink's generic errno projection
+        // reads this; the error block alone never reaches the Plane-B wire.
+        assert_eq!(occ.labels.get("errno_num"), Some(&"-111".to_string()));
         let err = occ.error.unwrap();
         assert_eq!(err.code, "ECONNREFUSED");
         assert!(err.what_failed.contains("curl"));

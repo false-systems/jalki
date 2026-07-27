@@ -56,12 +56,12 @@ pub const POS_CMD: usize = 9; // str|nil
 pub const POS_LABELS: usize = 10; // map|nil
 pub const POS_INTERP: usize = 11; // [str, str]|nil — [conclusion, action]
 
-/// REQUEST payload: [request_id: u32, method: u8, params: msgpack_value]
-/// RESPONSE payload: [request_id: u32, ok: bool, result_or_error: msgpack_value]
-/// STREAM_START payload: [probe_names: [str]] — probe name table
-/// STREAM_END payload: [] — empty
-/// ERROR payload: [code: str, message: str]
-/// PING/PONG payload: [] — empty
+// REQUEST payload: [request_id: u32, method: u8, params: msgpack_value]
+// RESPONSE payload: [request_id: u32, ok: bool, result_or_error: msgpack_value]
+// STREAM_START payload: [probe_names: [str]] — probe name table
+// STREAM_END payload: [] — empty
+// ERROR payload: [code: str, message: str]
+// PING/PONG payload: [] — empty
 
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 pub const KEEPALIVE_TIMEOUT_SECS: u64 = 5;

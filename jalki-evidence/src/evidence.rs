@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use false_protocol::{Occurrence, Severity};
 
 /// Version of jälki's emitted-occurrence schema — the cross-team wire contract
-/// with Polku and Vartio. Carried on every occurrence as the `schema_version`
+/// with Vartio. Carried on every occurrence as the `schema_version`
 /// label so a real shape change is a negotiated break, not a silent one. New
 /// fields ride "present-but-zero" without a bump; only an incompatible change
 /// bumps this. (See the "present-but-zero, never silently absent" doctrine.)
@@ -86,9 +86,9 @@ pub enum RuntimeBinding {
     Bound {
         container_id: String,
         pod_uid: Option<String>,
+        pod_name: Option<String>,
         namespace: Option<String>,
         service_account: Option<String>,
-        labels: BTreeMap<String, String>,
         provenance: BindingProvenance,
     },
     Unbound {
@@ -248,9 +248,9 @@ fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>)
         Some(RuntimeBinding::Bound {
             container_id,
             pod_uid,
+            pod_name,
             namespace,
             service_account,
-            labels,
             provenance,
         }) => {
             if !container_id.is_empty() {
@@ -265,6 +265,9 @@ fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>)
                 occ.labels.insert("k8s_pod_uid".into(), pod_uid.clone());
                 push_unique(&mut occ.correlation_keys, format!("k8s_pod_uid:{pod_uid}"));
             }
+            if let Some(pod_name) = pod_name.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels.insert("k8s_pod_name".into(), pod_name.clone());
+            }
             if let Some(namespace) = namespace.as_ref().filter(|v| !v.is_empty()) {
                 occ.namespace = Some(namespace.clone());
                 occ.labels.insert("k8s_namespace".into(), namespace.clone());
@@ -276,10 +279,6 @@ fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>)
             if let Some(service_account) = service_account.as_ref().filter(|v| !v.is_empty()) {
                 occ.labels
                     .insert("k8s_service_account".into(), service_account.clone());
-            }
-            if let Some(run_id) = labels.get("actions.github.com/run-id") {
-                occ.labels.insert("github_run_id".into(), run_id.clone());
-                push_unique(&mut occ.correlation_keys, format!("github_run_id:{run_id}"));
             }
             occ.labels
                 .insert("evidence_level".into(), provenance.as_str().into());
@@ -471,20 +470,16 @@ fn record_metadata_bytes(record: &EvidenceRecord) -> usize {
         Some(RuntimeBinding::Bound {
             container_id,
             pod_uid,
+            pod_name,
             namespace,
             service_account,
-            labels,
             ..
         }) => {
-            let strings = container_id.capacity()
+            container_id.capacity()
                 + pod_uid.as_ref().map_or(0, String::capacity)
+                + pod_name.as_ref().map_or(0, String::capacity)
                 + namespace.as_ref().map_or(0, String::capacity)
-                + service_account.as_ref().map_or(0, String::capacity);
-            labels.iter().fold(strings, |sum, (key, value)| {
-                sum.saturating_add(key.capacity())
-                    .saturating_add(value.capacity())
-                    .saturating_add(64)
-            })
+                + service_account.as_ref().map_or(0, String::capacity)
         }
         Some(RuntimeBinding::Unbound { .. }) | None => 0,
     };
@@ -504,9 +499,9 @@ mod tests {
         let bound = record(0).with_runtime_binding(RuntimeBinding::Bound {
             container_id: "c".into(),
             pod_uid: Some("p".into()),
+            pod_name: Some("pod".into()),
             namespace: Some("workloads".into()),
             service_account: None,
-            labels: std::collections::BTreeMap::new(),
             provenance: BindingProvenance::Observed,
         });
         assert_eq!(bound.bound_namespace(), Some("workloads"));
@@ -557,16 +552,15 @@ mod tests {
     }
 
     #[test]
-    fn byte_estimate_includes_runtime_binding_labels() {
+    fn byte_estimate_includes_runtime_binding_strings() {
         let producer = ProducerMetadata::new("prod", "node-1", "6.17.0");
         let base = EvidenceBatch::new(producer.clone(), vec![record(1)]).approx_bytes();
-        let labels = BTreeMap::from([("large".into(), "x".repeat(4096))]);
         let bound = record(1).with_runtime_binding(RuntimeBinding::Bound {
             container_id: "container-1".into(),
             pod_uid: Some("pod-1".into()),
+            pod_name: Some("x".repeat(4096)),
             namespace: Some("default".into()),
             service_account: None,
-            labels,
             provenance: BindingProvenance::Observed,
         });
 
@@ -649,14 +643,12 @@ mod tests {
 
     #[test]
     fn plane_b_projection_adds_binding_and_strips_interpretation() {
-        let mut labels = BTreeMap::new();
-        labels.insert("actions.github.com/run-id".into(), "123456".into());
         let mut record = record(42).with_runtime_binding(RuntimeBinding::Bound {
             container_id: "container-1".into(),
             pod_uid: Some("pod-1".into()),
+            pod_name: Some("runner-1".into()),
             namespace: Some("default".into()),
             service_account: Some("builder".into()),
-            labels,
             provenance: BindingProvenance::Observed,
         });
         record.occurrence.severity = Severity::Critical;
@@ -679,8 +671,8 @@ mod tests {
             Some("pod-1")
         );
         assert_eq!(
-            occ.labels.get("github_run_id").map(String::as_str),
-            Some("123456")
+            occ.labels.get("k8s_pod_name").map(String::as_str),
+            Some("runner-1")
         );
         assert!(occ
             .correlation_keys

@@ -183,8 +183,7 @@ Runtime binding is mandatory: Vartio drops evidence without a `pod_uid`/`contain
 | Field | Source | Notes |
 |---|---|---|
 | `container_id` | **`/proc/<pid>/cgroup`** (hot path, O(1)); cgroupfs-inode scan as a **memoized** fallback | parses containerd / CRI-O / docker cgroup forms |
-| `pod_uid`, `namespace`, `service_account`, labels | Kubernetes **pod watch** filtered to this node (`spec.nodeName`), indexed `container_id → pod metadata` in a bounded `BindingCache` (FIFO eviction, hit/miss stats) | refreshed on watch events |
-| `github_run_id` | the ARC runner-pod label `actions.github.com/run-id` | the join to the GitHub Actions chain root |
+| `pod_uid`, `pod_name`, `namespace`, `service_account` | Kubernetes **pod watch** filtered to this node (`spec.nodeName`), indexed `container_id → pod metadata` in a bounded `BindingCache` (FIFO eviction, hit/miss stats) | refreshed on watch events |
 | `argv_hash` | source-side digest | raw argv is never captured |
 
 ### 6.2 Provenance

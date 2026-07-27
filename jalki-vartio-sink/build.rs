@@ -1,9 +1,9 @@
 //! Compile the vendored Vartio source-ingress contract.
 //!
 //! Source of truth: `vartio/apps/vartio_runtime/proto/source_ingress.proto`
-//! (Vartio owns the contract; producers vendor a copy — polku #158 Q2). We build
-//! the client for the sink and the server for the in-crate test receiver. CI
-//! without `protoc` falls back to the checked-in generated file under `src/proto/`.
+//! (Vartio owns the contract; producers vendor a copy). We build the client for
+//! the sink and the server for the in-crate test receiver. CI without `protoc`
+//! falls back to the checked-in generated file under `src/proto/`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/source_ingress.proto");

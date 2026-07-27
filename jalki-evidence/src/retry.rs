@@ -230,8 +230,6 @@ fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
 mod tests {
     use super::*;
     use crate::{BindingProvenance, RuntimeBinding};
-    use std::collections::BTreeMap;
-
     fn producer() -> ProducerMetadata {
         ProducerMetadata::new("prod", "node-1", "6.17.0")
     }
@@ -252,9 +250,9 @@ mod tests {
             binding: Some(RuntimeBinding::Bound {
                 container_id: "container-1".into(),
                 pod_uid: Some("pod-1".into()),
+                pod_name: Some("runner-1".into()),
                 namespace: Some("default".into()),
                 service_account: None,
-                labels: BTreeMap::new(),
                 provenance: BindingProvenance::Observed,
             }),
         }

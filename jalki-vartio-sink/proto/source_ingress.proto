@@ -4,10 +4,9 @@ package vartio.source_ingress.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// Tetragon -> Vartio (and future source adapters) batch ingress contract.
+// Source adapter -> Vartio batch ingress contract.
 //
-// Vartio owns this contract; downstream emitters (e.g. polku's Tetragon source
-// adapter) vendor a copy, the same way they vendor `ahti_append.proto`. This is
+// Vartio owns this contract; downstream emitters vendor a copy. This is
 // a CONTRACT artifact: the gRPC server that implements `SourceIngress` lives in
 // the adapter layer (vartio_runtime / vartio_ahti_client), never in the pure
 // `vartio_core` library, and is a separate build step. The file is checked in
@@ -33,9 +32,9 @@ service SourceIngress {
 
 // One batch = one (source_key, provider, namespace) from one adapter/node.
 message ProviderEvidenceBatch {
-  string source_key = 1; // e.g. "tetragon"        -> ProviderEvidence.source_key
-  string provider = 2;   // e.g. "tetragon"        -> ProviderEvidence.provider
-  string namespace = 3;  // e.g. "vartio-tetragon" (Ahti adapter namespace)
+  string source_key = 1; // e.g. "jalki"        -> ProviderEvidence.source_key
+  string provider = 2;   // e.g. "jalki"        -> ProviderEvidence.provider
+  string namespace = 3;  // e.g. "vartio-jalki" (Ahti adapter namespace)
   string batch_id = 4;   // adapter-generated; response/log correlation (-> delivery_id)
   string adapter_id = 5; // -> ProviderEvidence.source_context.adapter_id
   string cluster_id = 6; // -> source_context.cluster_id (+ idempotency scope)
@@ -49,7 +48,7 @@ message ProviderEvidenceItem {
   // (or a canonical globally-unique equivalent). Vartio dedups on this at ingress;
   // the importer derives the durable Ahti logical_key from the normalized event.
   string idempotency_key = 1;
-  string occurrence_type = 2; // e.g. "tetragon.process_exec"
+  string occurrence_type = 2; // e.g. "kernel.process.exec"
   google.protobuf.Timestamp observed_at = 3;
 
   // Provider-native record body as UTF-8 JSON bytes. MUST be source-redacted at

@@ -295,6 +295,12 @@ async fn build_vartio_sink(cli: &Cli) -> Result<jalki_vartio_sink::VartioSink> {
     if let Ok(token) = std::env::var("VARTIO_INGRESS_TOKEN") {
         cfg = cfg.with_ingress_token(token);
     }
+    // ADR-0005 §4: the file family ships only when the receiving importer
+    // accepts it; the flag decouples jälki's deploy from Vartio's.
+    let file_types = std::env::var("JALKI_VARTIO_FILE_TYPES")
+        .map(|v| matches!(v.trim(), "1" | "true"))
+        .unwrap_or(false);
+    cfg = cfg.with_file_types(file_types);
     jalki_vartio_sink::VartioSink::connect(cfg)
         .await
         .map_err(|e| anyhow::anyhow!("vartio sink connect failed: {e}"))

@@ -197,11 +197,11 @@ pub enum PipelineError {
     Misconfigured(String),
 }
 
-/// Neutral Plane-B sink for the Polku/Vartio pipeline.
+/// Neutral Plane-B sink for an injected pipeline client.
 ///
 /// This sink deliberately owns only the stable projection and error mapping. The
-/// concrete Polku/Vartio wire lives behind [`PipelineClient`] so the transport
-/// can change without changing evidence semantics.
+/// concrete wire lives behind [`PipelineClient`] so the transport can change
+/// without changing evidence semantics.
 pub struct PipelineSink<C> {
     client: C,
     name: String,
@@ -601,9 +601,9 @@ mod tests {
         record(observed_at_ns).with_runtime_binding(RuntimeBinding::Bound {
             container_id: "container-1".into(),
             pod_uid: Some("pod-1".into()),
+            pod_name: Some("runner-1".into()),
             namespace: Some("default".into()),
             service_account: None,
-            labels: Default::default(),
             provenance: BindingProvenance::Observed,
         })
     }

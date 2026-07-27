@@ -210,7 +210,7 @@ impl FileOpenEvent {
     }
 
     pub fn path_truncated(&self) -> bool {
-        !self.path.iter().any(|&b| b == 0)
+        !self.path.contains(&0)
     }
 }
 

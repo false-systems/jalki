@@ -88,8 +88,8 @@ impl Runtime {
 
     /// Restrict sink delivery to evidence bound to these Kubernetes namespaces.
     /// Empty = no restriction (deliver all bound evidence). This is the
-    /// source-side volume control (mirrors the tetragon-adapter's namespace
-    /// allow-list); it scopes only the sink path, not the local CLI query view.
+    /// source-side volume control; it scopes only the sink path, not the local
+    /// CLI query view.
     pub fn namespace_allowlist(mut self, namespaces: Vec<String>) -> Self {
         let set: HashSet<String> = namespaces
             .into_iter()
@@ -232,8 +232,7 @@ impl Runtime {
 
                 // Source-side volume control: keep only evidence bound to an
                 // allowed namespace. Out-of-scope namespaces are deliberately
-                // not observed here (a scope, not a loss — no gap evidence),
-                // mirroring the tetragon-adapter's namespace filter.
+                // not observed here (a scope, not a loss — no gap evidence).
                 if let Some(allow) = &namespace_allowlist {
                     let before = records.len();
                     records.retain(|r| r.bound_namespace().is_some_and(|ns| allow.contains(ns)));
