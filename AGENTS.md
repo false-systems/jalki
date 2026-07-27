@@ -5,9 +5,10 @@ Operational field manual for agents working on jalki.
 Read `CLAUDE.md` first for the full architecture. Jalki is a programmable
 fentry/fexit framework for kernel and runtime evidence: it observes with
 fentry/fexit probes, turns raw kernel signals into validated evidence, and
-hands that evidence to Polku for delivery to Vartio (which interprets and writes
-to Ahti). Jalki must not write to Ahti directly and must not become a parallel
-datastore. See `docs/jalki/adr/0002-evidence-through-polku-to-vartio.md`.
+delivers that evidence directly to Vartio's source ingress (which interprets
+and writes to Ahti). Jalki must not write to Ahti directly and must not become
+a parallel datastore. See
+`docs/jalki/adr/0003-native-vartio-sink-retire-polku.md`.
 
 ## Agentic Dev Lane
 
@@ -28,8 +29,8 @@ commits own truth.
 
 - Jalki emits kernel and runtime evidence; it does not own durable evidence
   storage.
-- Evidence reaches Ahti via Polku → Vartio; Vartio is the writer. Jalki must not
-  write to Ahti directly and must not keep a parallel datastore.
+- Evidence reaches Ahti via Jälki → Vartio; Vartio is the writer. Jalki must
+  not write to Ahti directly and must not keep a parallel datastore.
 - Jalki may keep local node state only to observe, attach probes, buffer events
   briefly, and report status.
 - Lähde and Vartio interpret and correlate; do not move broad observability or
@@ -147,7 +148,7 @@ expectations aligned when behavior changes.
 Before changing product boundaries, evidence ownership, Ahti integration, CLI
 surface, MCP surface, or storage behavior, read:
 
-- `docs/jalki/adr/0002-evidence-through-polku-to-vartio.md` (current architecture — read first)
+- `docs/jalki/adr/0003-native-vartio-sink-retire-polku.md` (current architecture — read first)
 - `docs/jalki/README.md`
 - `docs/jalki/product-boundaries.md`
 - `docs/jalki/v0-scope.md`

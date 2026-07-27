@@ -186,6 +186,11 @@ Runtime binding is mandatory: Vartio drops evidence without a `pod_uid`/`contain
 | `pod_uid`, `pod_name`, `namespace`, `service_account` | Kubernetes **pod watch** filtered to this node (`spec.nodeName`), indexed `container_id → pod metadata` in a bounded `BindingCache` (FIFO eviction, hit/miss stats) | refreshed on watch events |
 | `argv_hash` | source-side digest | raw argv is never captured |
 
+Jälki does not infer a GitHub run id from pod labels. ARC runner pods do not
+carry a run-id label. Instead, Jälki emits the observed Kubernetes `pod_name`;
+Vartio joins it to GitHub's `workflow_job.runner_name`, which ARC sets from the
+same EphemeralRunner identity.
+
 ### 6.2 Provenance
 
 `BindingProvenance::Observed` when the container ref was resolved live (procfs); `DerivedFromCache` when served from the memoized cgroupfs fallback. This rides in the `evidence_level` label — not as an Ahti record.

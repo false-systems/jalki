@@ -8,7 +8,7 @@ The vocabulary is normative. Field shapes are encoded by `jalki-evidence` on emi
 
 ## 0. Common envelope (recap)
 
-Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_pod_name` / `k8s_container_id` / `k8s_namespace`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B.
+Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_pod_name` / `k8s_container_id` / `k8s_namespace`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B. Jälki emits observed pod identity, not an inferred GitHub run id.
 
 Migration note: callers constructing `RuntimeBinding::Bound`, `PodMetadata`, or `PodSnapshot` must now supply `pod_name` (`None` only when unavailable); their unused pod-label map was removed. The Kubernetes watcher always supplies the name from `metadata.name`.
 
@@ -56,6 +56,7 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 | `uid` / `gid` | u32 | |
 | `cgroup_id` | u64 | Kernel cgroup ID |
 | `container_id` | string | Enriched; format `<runtime>://<id>` |
+| `pod_name` | string | Enriched Kubernetes pod name |
 | `pod_uid` | string | Enriched |
 | `namespace` | string | Kubernetes namespace (enrichment) |
 | `service_account` | string | Enrichment |
