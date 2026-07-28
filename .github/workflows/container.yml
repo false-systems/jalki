@@ -61,13 +61,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check this commit is still the tip of main
+        # A re-run of an old push build keeps its original github.sha, so
+        # without this guard it re-publishes :main from that stale commit and
+        # silently rolls the deployed tag back (issue #36: two re-runs of the
+        # d4cb486 build overwrote the c6f0667 image hours after it shipped).
+        # Stale builds keep their immutable sha tag; only the mutable branch
+        # tag is gated. This also covers out-of-order queued builds racing a
+        # newer push.
+        id: tip
+        if: github.event_name != 'pull_request'
+        run: |
+          tip="$(git ls-remote origin refs/heads/main | cut -f1)"
+          echo "is_tip=$([ "$tip" = "$GITHUB_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Image metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.tip.outputs.is_tip == 'true' }}
             type=semver,pattern={{version}}
             type=sha,format=short
 
