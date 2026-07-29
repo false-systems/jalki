@@ -301,7 +301,11 @@ async fn build_vartio_sink(cli: &Cli) -> Result<jalki_vartio_sink::VartioSink> {
         .map(|v| matches!(v.trim(), "1" | "true"))
         .unwrap_or(false);
     cfg = cfg.with_file_types(file_types);
+    // Lazy (jalki #38): this no longer dials, so the only failure it can
+    // propagate to `main` — and thus to a process exit — is a misconfigured
+    // endpoint, which no retry would fix. A Vartio that is merely *down* is
+    // now the retry loop's problem, not a reason to exit.
     jalki_vartio_sink::VartioSink::connect(cfg)
         .await
-        .map_err(|e| anyhow::anyhow!("vartio sink connect failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("vartio sink misconfigured: {e}"))
 }
