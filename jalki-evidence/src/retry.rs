@@ -59,6 +59,148 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryBackoffConfig {
+    /// Ceiling for the first retry after a failure.
+    pub base_ms: u64,
+    /// Ceiling the doubling stops at.
+    pub max_ms: u64,
+}
+
+impl Default for RetryBackoffConfig {
+    fn default() -> Self {
+        // 250ms first, doubling to a 30s ceiling: fast enough that a blip costs
+        // no visible delivery latency, slow enough that a struggling sink is not
+        // hammered. At the cap a single agent sends at most ~4 attempts/min.
+        Self {
+            base_ms: 250,
+            max_ms: 30_000,
+        }
+    }
+}
+
+impl RetryBackoffConfig {
+    /// `JALKI_RETRY_BACKOFF_{BASE_MS,MAX_MS}`, each falling back to the default.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            base_ms: env_parse("JALKI_RETRY_BACKOFF_BASE_MS", d.base_ms),
+            max_ms: env_parse("JALKI_RETRY_BACKOFF_MAX_MS", d.max_ms),
+        }
+        .normalized()
+    }
+
+    /// A zero base would make the retry timer a busy loop, and a max below the
+    /// base would make the "cap" tighten rather than widen the schedule. Both
+    /// are operator typos rather than intentions, so clamp instead of trusting.
+    fn normalized(self) -> Self {
+        let base_ms = self.base_ms.max(1);
+        Self {
+            base_ms,
+            max_ms: self.max_ms.max(base_ms),
+        }
+    }
+}
+
+/// Retry schedule for a sink that is refusing work: exponential, jittered, and
+/// reset by success (jalki #39).
+///
+/// Before this, retries were driven only by the arrival of new evidence — so a
+/// busy node hammered a struggling sink once per drain cycle, while a **quiet
+/// node never retried at all** and its buffered evidence sat until some
+/// unrelated event happened to arrive. Both halves are fixed by making the
+/// cadence a property of the failure rather than of the traffic.
+///
+/// **Equal jitter**, not full jitter: the delay is `ceiling/2 + rand(0,
+/// ceiling/2)`, so it keeps the herd-breaking property while retaining a hard
+/// lower bound. That bound is the point — "attempt rate is bounded by the
+/// backoff cap" is only provable if the draw cannot come back near zero, and a
+/// DaemonSet means every node's agent is otherwise reconnecting to the same
+/// Vartio at the same instant after an outage.
+#[derive(Debug, Clone)]
+pub struct RetryBackoff {
+    config: RetryBackoffConfig,
+    attempt: u32,
+    jitter: Jitter,
+}
+
+impl RetryBackoff {
+    pub fn new(config: RetryBackoffConfig) -> Self {
+        Self {
+            config: config.normalized(),
+            attempt: 0,
+            jitter: Jitter::new(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(RetryBackoffConfig::from_env())
+    }
+
+    /// Consecutive failures since the last success. 0 means the next delay is
+    /// the first one.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// The un-jittered ceiling the next delay is drawn under: `base * 2^attempt`
+    /// clamped to `max_ms`. Deterministic, so schedules can be asserted exactly.
+    ///
+    /// Saturating, not shifting: `base_ms.checked_shl(n)` looks like the obvious
+    /// spelling and is wrong, because it only returns `None` when *n* exceeds
+    /// the width — the value itself still wraps. `250u64.checked_shl(63)` is
+    /// `Some(0)`, which would collapse the ceiling to zero and turn the retry
+    /// timer into a busy loop after ~63 consecutive failures (about half an hour
+    /// at the default cap — well inside a real outage).
+    pub fn ceiling_ms(&self) -> u64 {
+        1u64.checked_shl(self.attempt)
+            .map(|factor| self.config.base_ms.saturating_mul(factor))
+            .unwrap_or(u64::MAX)
+            .min(self.config.max_ms)
+    }
+
+    /// Draw the next delay and count the failure.
+    pub fn next_delay_ms(&mut self) -> u64 {
+        let ceiling = self.ceiling_ms();
+        self.attempt = self.attempt.saturating_add(1);
+        let half = ceiling / 2;
+        half + self.jitter.below(ceiling - half + 1)
+    }
+
+    /// A delivery succeeded: the next failure starts from `base_ms` again.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+/// Jitter without pulling in `rand`: a `RandomState` is seeded per process from
+/// the OS, so hashing a counter under it gives a stream that differs between
+/// pods — which is the whole point, since a synchronized DaemonSet is exactly
+/// the herd being broken up.
+#[derive(Debug, Clone)]
+struct Jitter {
+    state: std::collections::hash_map::RandomState,
+    counter: u64,
+}
+
+impl Jitter {
+    fn new() -> Self {
+        Self {
+            state: std::collections::hash_map::RandomState::new(),
+            counter: 0,
+        }
+    }
+
+    /// Uniform-ish draw in `[0, bound)`. `bound` is never 0 at the call site.
+    fn below(&mut self, bound: u64) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        self.counter = self.counter.wrapping_add(1);
+        let mut hasher = self.state.build_hasher();
+        hasher.write_u64(self.counter);
+        hasher.finish() % bound.max(1)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapReport {
     pub cause: String,
     pub dropped_records: usize,
@@ -443,5 +585,130 @@ mod tests {
             "garbage falls back to the default"
         );
         unsafe { std::env::remove_var(key) };
+    }
+
+    // ── RetryBackoff (jalki #39) ────────────────────────────────────────────
+
+    fn backoff(base_ms: u64, max_ms: u64) -> RetryBackoff {
+        RetryBackoff::new(RetryBackoffConfig { base_ms, max_ms })
+    }
+
+    #[test]
+    fn ceiling_doubles_per_consecutive_failure_then_caps() {
+        let mut b = backoff(250, 2_000);
+        let mut ceilings = Vec::new();
+        for _ in 0..6 {
+            ceilings.push(b.ceiling_ms());
+            b.next_delay_ms();
+        }
+        assert_eq!(
+            ceilings,
+            vec![250, 500, 1_000, 2_000, 2_000, 2_000],
+            "exponential up to the cap, flat at it"
+        );
+    }
+
+    #[test]
+    fn every_delay_sits_inside_its_own_ceiling() {
+        let mut b = backoff(250, 30_000);
+        for _ in 0..64 {
+            let ceiling = b.ceiling_ms();
+            let delay = b.next_delay_ms();
+            assert!(
+                delay >= ceiling / 2 && delay <= ceiling,
+                "equal jitter keeps the draw in [ceiling/2, ceiling]: \
+                 got {delay} for ceiling {ceiling}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_bounds_the_attempt_rate() {
+        // The acceptance criterion this exists for: under a sustained outage the
+        // RPC rate is a function of the cap, not of how much evidence arrives.
+        let mut b = backoff(250, 30_000);
+        for _ in 0..16 {
+            b.next_delay_ms();
+        }
+        let steady: Vec<u64> = (0..32).map(|_| b.next_delay_ms()).collect();
+        let attempts_per_minute = 60_000 / steady.iter().copied().max().unwrap();
+        assert!(
+            steady.iter().all(|d| *d >= 15_000),
+            "a saturated backoff can never dip below half the cap: {steady:?}"
+        );
+        assert!(
+            attempts_per_minute <= 2,
+            "at the 30s cap a single agent stays at ~2 attempts/min, got {attempts_per_minute}"
+        );
+    }
+
+    #[test]
+    fn jitter_actually_varies_the_delay() {
+        // Without this the schedule is a fixed ladder and every pod in the
+        // DaemonSet reconnects to Vartio on the same tick.
+        let mut b = backoff(1_000, 1_000);
+        let draws: std::collections::BTreeSet<u64> = (0..32).map(|_| b.next_delay_ms()).collect();
+        assert!(
+            draws.len() > 1,
+            "a constant delay is not jitter; drew {draws:?}"
+        );
+    }
+
+    #[test]
+    fn success_restarts_the_ladder() {
+        let mut b = backoff(250, 30_000);
+        for _ in 0..8 {
+            b.next_delay_ms();
+        }
+        assert!(b.ceiling_ms() > 250, "precondition: the ladder climbed");
+
+        b.reset();
+
+        assert_eq!(b.attempt(), 0);
+        assert_eq!(
+            b.ceiling_ms(),
+            250,
+            "a delivered batch means the next outage starts from the bottom again"
+        );
+    }
+
+    #[test]
+    fn a_long_outage_never_collapses_the_ceiling() {
+        // The ladder must be monotone: once it reaches the cap it stays there
+        // for as long as the sink is down. Asserting only `delay <= cap` is not
+        // enough — a ceiling that overflowed to 0 satisfies that too, and then
+        // the retry timer fires immediately and spins. That is exactly what a
+        // `base_ms.checked_shl(attempt)` implementation does at attempt 63,
+        // roughly half an hour into an outage at the default cap.
+        let mut b = backoff(250, 30_000);
+        for attempt in 0..256 {
+            let ceiling = b.ceiling_ms();
+            assert!(
+                ceiling >= 250,
+                "ceiling collapsed below base at attempt {attempt}: {ceiling}"
+            );
+            let delay = b.next_delay_ms();
+            assert!(
+                (125..=30_000).contains(&delay),
+                "delay escaped its bounds at attempt {attempt}: {delay}"
+            );
+        }
+        assert_eq!(b.ceiling_ms(), 30_000, "and it is still pinned at the cap");
+    }
+
+    #[test]
+    fn nonsense_config_is_clamped_rather_than_trusted() {
+        let zero_base = backoff(0, 30_000);
+        assert!(
+            zero_base.ceiling_ms() >= 1,
+            "a zero base would make the retry timer a busy loop"
+        );
+
+        let inverted = backoff(5_000, 100);
+        assert_eq!(
+            inverted.ceiling_ms(),
+            5_000,
+            "a max below the base must not tighten the schedule below its first step"
+        );
     }
 }

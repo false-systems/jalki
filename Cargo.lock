@@ -1097,6 +1097,7 @@ name = "jalki"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aya",
  "aya-log",
  "chrono",
