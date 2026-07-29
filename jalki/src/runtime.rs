@@ -461,6 +461,11 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         // far-future value is only there to have something to construct.
         let retry_at = next_retry.unwrap_or_else(|| Deadline::now() + IDLE_PARK);
 
+        // No `biased;` — deliberately. `select!` picks randomly among ready
+        // branches, which is the only thing keeping the retry arm alive on a
+        // node where `rx.recv()` is *always* ready. Adding `biased;` to
+        // prioritise fresh evidence would starve the timer and put us straight
+        // back to the traffic-coupled retries this issue is about.
         tokio::select! {
             maybe_records = rx.recv() => {
                 let Some(mut records) = maybe_records else { break };
@@ -583,6 +588,22 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         if (retry_buffer.len_batches(), pending_gaps.len()) == before {
             break;
         }
+    }
+
+    if !retry_buffer.is_empty() || !pending_gaps.is_empty() {
+        // The sink is still refusing at shutdown, so this evidence dies with
+        // the process. It is a real loss and it gets said out loud — silence
+        // here would be indistinguishable from a clean drain (ADR-0009
+        // contract 6). Surviving a restart needs the spill-to-disk half of
+        // #33; this is the honesty half.
+        error!(
+            sink = sink.name(),
+            lost_batches = retry_buffer.len_batches(),
+            lost_records = retry_buffer.len_records(),
+            lost_bytes = retry_buffer.len_bytes(),
+            pending_gap_reports = pending_gaps.len(),
+            "sink loop exiting with an undeliverable backlog; this evidence is lost"
+        );
     }
 
     info!("sink loop finished");
