@@ -43,3 +43,11 @@ kube = { version = "4.0.0", default-features = false, features = ["runtime", "cl
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
 futures = "0.3.32"
+
+[dev-dependencies]
+# The sink-loop tests define a stub EvidenceSink and drive the retry timer on
+# tokio's paused clock. `test-util` is NOT part of tokio's "full" feature — it
+# has to be asked for by name, and `time::advance`/`start_paused` are the whole
+# reason the cadence tests are deterministic rather than sleep-and-hope.
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

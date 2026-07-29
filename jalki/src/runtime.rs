@@ -2,16 +2,17 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
     EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport, HookKind, ProbeMetadata,
-    ProducerMetadata, RetryBuffer, RetryBufferConfig, SinkError,
+    ProducerMetadata, RetryBackoff, RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::Instant as Deadline;
 use tracing::{error, info, warn};
 
 use crate::enrich::{NoopEnricher, RuntimeEnricher};
@@ -135,7 +136,7 @@ impl Runtime {
         ));
 
         // Channel: readers → sink loop.
-        let (tx, mut rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
+        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
 
         // Spawn a reader for each probe, register in the registry.
         let mut stats_map: Vec<(String, Arc<ProbeStats>)> = Vec::new();
@@ -198,114 +199,54 @@ impl Runtime {
         let enricher_for_metrics = self.enricher.clone();
         let namespace_allowlist = self.namespace_allowlist.clone();
 
-        let sink_handle = tokio::spawn(async move {
-            let retry_config = RetryBufferConfig::from_env();
-            info!(
-                max_records = retry_config.max_records,
-                max_batches = retry_config.max_batches,
-                max_age_ms = retry_config.max_age_ms,
-                max_bytes = retry_config.max_bytes,
-                "retry buffer bounded (sheds oldest as gap evidence past these; \
-                 tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS,BYTES}})"
-            );
-            match &namespace_allowlist {
-                Some(ns) => info!(
-                    namespaces = ?ns,
-                    "namespace allow-list active: only bound evidence in these \
-                     namespaces is delivered to the sink"
-                ),
-                None => info!(
-                    "no namespace allow-list: delivering all bound evidence \
-                     (set JALKI_NAMESPACES to scope the whole-node firehose)"
-                ),
-            }
-            let mut retry_buffer = RetryBuffer::new(retry_config);
-            let mut pending_gaps = PendingGaps::default();
-            let retry_clock_start = Instant::now();
-            while let Some(mut records) = rx.recv().await {
-                if records.is_empty() {
-                    continue;
+        let retry_config = RetryBufferConfig::from_env();
+        info!(
+            max_records = retry_config.max_records,
+            max_batches = retry_config.max_batches,
+            max_age_ms = retry_config.max_age_ms,
+            max_bytes = retry_config.max_bytes,
+            "retry buffer bounded (sheds oldest as gap evidence past these; \
+             tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS,BYTES}})"
+        );
+        match &namespace_allowlist {
+            Some(ns) => info!(
+                namespaces = ?ns,
+                "namespace allow-list active: only bound evidence in these \
+                 namespaces is delivered to the sink"
+            ),
+            None => info!(
+                "no namespace allow-list: delivering all bound evidence \
+                 (set JALKI_NAMESPACES to scope the whole-node firehose)"
+            ),
+        }
+        let backoff_config = RetryBackoffConfig::from_env();
+        info!(
+            base_ms = backoff_config.base_ms,
+            max_ms = backoff_config.max_ms,
+            "sink retries are timer-driven and jittered, independent of event \
+             arrival (tune via JALKI_RETRY_BACKOFF_{{BASE_MS,MAX_MS}})"
+        );
+
+        let sink_handle = tokio::spawn(run_sink_loop(SinkLoop {
+            rx,
+            sink,
+            metrics: metrics_clone,
+            producer: producer_for_sink,
+            enricher: enricher_for_metrics,
+            namespace_allowlist,
+            retry_config,
+            backoff_config,
+        }));
+
+        // Spawn metrics server.
+        let _metrics_handle = {
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_metrics(metrics).await {
+                    error!(error = %e, "metrics server failed");
                 }
-
-                record_unbound_drops(&metrics_clone, &records);
-                refresh_binding_cache_metrics(&metrics_clone, enricher_for_metrics.as_ref());
-
-                // Source-side volume control: keep only evidence bound to an
-                // allowed namespace. Out-of-scope namespaces are deliberately
-                // not observed here (a scope, not a loss — no gap evidence).
-                if let Some(allow) = &namespace_allowlist {
-                    let before = records.len();
-                    records.retain(|r| r.bound_namespace().is_some_and(|ns| allow.contains(ns)));
-                    let dropped = before - records.len();
-                    if dropped > 0 {
-                        tracing::debug!(dropped, "records filtered by namespace allow-list");
-                    }
-                    if records.is_empty() {
-                        continue;
-                    }
-                }
-
-                let now_ms = elapsed_ms(retry_clock_start);
-                pending_gaps.extend(retry_buffer.drop_expired(now_ms));
-
-                let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
-                if retry_buffer.is_empty() && pending_gaps.is_empty() {
-                    match sink.append_batch(batch.clone()).await {
-                        Ok(_) => continue,
-                        Err(err) if RetryBuffer::should_retry(&err) => {
-                            record_sink_error(&metrics_clone, sink.name());
-                            pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
-                            warn!(
-                                sink = sink.name(),
-                                error = %err,
-                                queued_batches = retry_buffer.len_batches(),
-                                queued_records = retry_buffer.len_records(),
-                                queued_bytes = retry_buffer.len_bytes(),
-                                "evidence sink append failed; retrying later"
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            record_sink_error(&metrics_clone, sink.name());
-                            error!(
-                                sink = sink.name(),
-                                error = %err,
-                                "evidence sink append failed permanently; dropping batch"
-                            );
-                            pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &batch));
-                        }
-                    }
-                } else {
-                    pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
-                }
-
-                flush_retry_buffer(
-                    sink.as_ref(),
-                    &mut retry_buffer,
-                    &mut pending_gaps,
-                    &metrics_clone,
-                    &producer_for_sink,
-                )
-                .await;
-            }
-
-            while !retry_buffer.is_empty() || !pending_gaps.is_empty() {
-                let before = (retry_buffer.len_batches(), pending_gaps.len());
-                flush_retry_buffer(
-                    sink.as_ref(),
-                    &mut retry_buffer,
-                    &mut pending_gaps,
-                    &metrics_clone,
-                    &producer_for_sink,
-                )
-                .await;
-                if (retry_buffer.len_batches(), pending_gaps.len()) == before {
-                    break;
-                }
-            }
-
-            info!("sink loop finished");
-        });
+            })
+        };
 
         // Spawn metrics server.
         let _metrics_handle = {
@@ -472,6 +413,244 @@ fn producer_metadata(cluster: &str) -> ProducerMetadata {
     ProducerMetadata::new(cluster, node_id, kernel_release)
 }
 
+/// Inputs for [`run_sink_loop`]. A struct rather than eight positional
+/// arguments, and separate from `Runtime` so the loop can be driven directly by
+/// tests — the daemon itself cannot be, because loading eBPF needs a kernel.
+pub(crate) struct SinkLoop {
+    pub rx: mpsc::Receiver<Vec<EvidenceRecord>>,
+    pub sink: Box<dyn EvidenceSink>,
+    pub metrics: Arc<Metrics>,
+    pub producer: ProducerMetadata,
+    pub enricher: Arc<dyn RuntimeEnricher>,
+    pub namespace_allowlist: Option<HashSet<String>>,
+    pub retry_config: RetryBufferConfig,
+    pub backoff_config: RetryBackoffConfig,
+}
+
+/// One `EvidenceBatch` per ring-buffer drain cycle, with a bounded retry buffer
+/// for transient downstream failures and a timer that owns the retry cadence.
+pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
+    let SinkLoop {
+        mut rx,
+        sink,
+        metrics: metrics_clone,
+        producer: producer_for_sink,
+        enricher: enricher_for_metrics,
+        namespace_allowlist,
+        retry_config,
+        backoff_config,
+    } = loop_state;
+
+    let mut retry_buffer = RetryBuffer::new(retry_config);
+    let mut backoff = RetryBackoff::new(backoff_config);
+    let mut pending_gaps = PendingGaps::default();
+    let retry_clock_start = Instant::now();
+    // Absolute deadline of the next retry sweep; `None` means there is
+    // no backlog and the timer arm stays disabled, so an idle agent
+    // costs nothing. Absolute rather than a duration because `select!`
+    // rebuilds the sleep on every iteration — a relative delay would be
+    // pushed back by each arriving batch and, on a busy node, never
+    // fire.
+    let mut next_retry: Option<Deadline> = None;
+
+    loop {
+        // `select!` constructs *every* branch's future before consulting
+        // the preconditions (verified: a disabled arm's expression still
+        // runs), so this has to be safe to build with no backlog. The
+        // `if` below is what stops the arm from ever firing then; the
+        // far-future value is only there to have something to construct.
+        let retry_at = next_retry.unwrap_or_else(|| Deadline::now() + IDLE_PARK);
+
+        // No `biased;` — deliberately. `select!` picks randomly among ready
+        // branches, which is the only thing keeping the retry arm alive on a
+        // node where `rx.recv()` is *always* ready. Adding `biased;` to
+        // prioritise fresh evidence would starve the timer and put us straight
+        // back to the traffic-coupled retries this issue is about.
+        tokio::select! {
+            maybe_records = rx.recv() => {
+                let Some(mut records) = maybe_records else { break };
+                if records.is_empty() {
+                    continue;
+                }
+
+                record_unbound_drops(&metrics_clone, &records);
+                refresh_binding_cache_metrics(&metrics_clone, enricher_for_metrics.as_ref());
+
+                // Source-side volume control: keep only evidence bound to an
+                // allowed namespace. Out-of-scope namespaces are deliberately
+                // not observed here (a scope, not a loss — no gap evidence).
+                if let Some(allow) = &namespace_allowlist {
+                    let before = records.len();
+                    records.retain(|r| r.bound_namespace().is_some_and(|ns| allow.contains(ns)));
+                    let dropped = before - records.len();
+                    if dropped > 0 {
+                        tracing::debug!(dropped, "records filtered by namespace allow-list");
+                    }
+                    if records.is_empty() {
+                        continue;
+                    }
+                }
+
+                let now_ms = elapsed_ms(retry_clock_start);
+                pending_gaps.extend(retry_buffer.drop_expired(now_ms));
+
+                let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
+                if retry_buffer.is_empty() && pending_gaps.is_empty() {
+                    // Nothing queued, so the sink is presumed working:
+                    // deliver inline and keep the latency.
+                    match sink.append_batch(batch.clone()).await {
+                        Ok(_) => {
+                            backoff.reset();
+                        }
+                        Err(err) if RetryBuffer::should_retry(&err) => {
+                            record_sink_error(&metrics_clone, sink.name());
+                            pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
+                            warn!(
+                                sink = sink.name(),
+                                error = %err,
+                                queued_batches = retry_buffer.len_batches(),
+                                queued_records = retry_buffer.len_records(),
+                                queued_bytes = retry_buffer.len_bytes(),
+                                "evidence sink append failed; retrying later"
+                            );
+                        }
+                        Err(err) => {
+                            record_sink_error(&metrics_clone, sink.name());
+                            error!(
+                                sink = sink.name(),
+                                error = %err,
+                                "evidence sink append failed permanently; dropping batch"
+                            );
+                            pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &batch));
+                        }
+                    }
+                } else {
+                    // A backlog exists, so the sink is known to be
+                    // refusing work: queue behind it and let the timer
+                    // decide when to try again. Retrying here is what
+                    // used to hammer a struggling sink once per drain
+                    // cycle, and what tied a quiet node's retries to
+                    // traffic it wasn't receiving (jalki #39).
+                    pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
+                }
+
+                next_retry = schedule_retry(
+                    next_retry,
+                    &mut backoff,
+                    has_backlog(&retry_buffer, &pending_gaps),
+                    sink.name(),
+                );
+            }
+
+            _ = tokio::time::sleep_until(retry_at), if next_retry.is_some() => {
+                let now_ms = elapsed_ms(retry_clock_start);
+                // Age out the buffer on the timer too: on a quiet node
+                // nothing else calls this, so expired batches would
+                // otherwise sit past max_age_ms without becoming gaps.
+                pending_gaps.extend(retry_buffer.drop_expired(now_ms));
+
+                let before = backlog_len(&retry_buffer, &pending_gaps);
+                flush_retry_buffer(
+                    sink.as_ref(),
+                    &mut retry_buffer,
+                    &mut pending_gaps,
+                    &metrics_clone,
+                    &producer_for_sink,
+                )
+                .await;
+
+                // Any batch accepted means the sink is taking work
+                // again, so start the next outage from the bottom of
+                // the ladder rather than wherever this one ended.
+                if backlog_len(&retry_buffer, &pending_gaps) < before {
+                    backoff.reset();
+                }
+                next_retry = schedule_retry(
+                    None,
+                    &mut backoff,
+                    has_backlog(&retry_buffer, &pending_gaps),
+                    sink.name(),
+                );
+            }
+        }
+    }
+
+    while !retry_buffer.is_empty() || !pending_gaps.is_empty() {
+        let before = (retry_buffer.len_batches(), pending_gaps.len());
+        flush_retry_buffer(
+            sink.as_ref(),
+            &mut retry_buffer,
+            &mut pending_gaps,
+            &metrics_clone,
+            &producer_for_sink,
+        )
+        .await;
+        if (retry_buffer.len_batches(), pending_gaps.len()) == before {
+            break;
+        }
+    }
+
+    if !retry_buffer.is_empty() || !pending_gaps.is_empty() {
+        // The sink is still refusing at shutdown, so this evidence dies with
+        // the process. It is a real loss and it gets said out loud — silence
+        // here would be indistinguishable from a clean drain (ADR-0009
+        // contract 6). Surviving a restart needs the spill-to-disk half of
+        // #33; this is the honesty half.
+        error!(
+            sink = sink.name(),
+            lost_batches = retry_buffer.len_batches(),
+            lost_records = retry_buffer.len_records(),
+            lost_bytes = retry_buffer.len_bytes(),
+            pending_gap_reports = pending_gaps.len(),
+            "sink loop exiting with an undeliverable backlog; this evidence is lost"
+        );
+    }
+
+    info!("sink loop finished");
+}
+
+/// How far out to park the retry timer when there is no backlog. Never elapses
+/// in practice — the arm is disabled — it just gives `select!` a deadline to
+/// construct.
+const IDLE_PARK: Duration = Duration::from_secs(3600);
+
+fn has_backlog(retry_buffer: &RetryBuffer, pending_gaps: &PendingGaps) -> bool {
+    !retry_buffer.is_empty() || !pending_gaps.is_empty()
+}
+
+fn backlog_len(retry_buffer: &RetryBuffer, pending_gaps: &PendingGaps) -> usize {
+    retry_buffer.len_batches() + pending_gaps.len()
+}
+
+/// Decide when the backlog gets its next attempt.
+///
+/// Passing `Some(deadline)` as `current` keeps an already-scheduled attempt
+/// rather than pushing it out — otherwise arriving evidence would postpone the
+/// retry it is queueing behind, which is the traffic-coupling jalki #39 exists
+/// to remove.
+fn schedule_retry(
+    current: Option<Deadline>,
+    backoff: &mut RetryBackoff,
+    backlog: bool,
+    sink_name: &str,
+) -> Option<Deadline> {
+    if !backlog {
+        backoff.reset();
+        return None;
+    }
+    if let Some(deadline) = current {
+        return Some(deadline);
+    }
+    let delay_ms = backoff.next_delay_ms();
+    info!(
+        sink = sink_name,
+        delay_ms,
+        attempt = backoff.attempt(),
+        "backlog queued; next sink retry scheduled"
+    );
+    Some(Deadline::now() + Duration::from_millis(delay_ms))
+}
+
 async fn flush_retry_buffer(
     sink: &dyn EvidenceSink,
     retry_buffer: &mut RetryBuffer,
@@ -612,6 +791,279 @@ mod tests {
             retry.records[0].occurrence.id,
             first.records[0].occurrence.id
         );
+    }
+
+    // ── sink loop retry cadence (jalki #39) ─────────────────────────────────
+    //
+    // Driven on tokio's paused clock: `advance` fires the retry timer without
+    // the tests taking the wall-clock time the schedule describes, and — more
+    // importantly — makes "did it retry on its own?" a deterministic question
+    // rather than a sleep-and-hope.
+
+    use jalki_evidence::{AppendResult, Checkpoint, HealthStatus, KernelEvent, TcpConnectEvent};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Mutex as StdMutex;
+
+    /// A sink whose availability the test controls, counting every attempt.
+    struct ControlledSink {
+        up: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+        delivered: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EvidenceSink for ControlledSink {
+        fn name(&self) -> &str {
+            "controlled"
+        }
+
+        async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.up.load(Ordering::SeqCst) {
+                return Err(SinkError::Unavailable {
+                    sink: "controlled".into(),
+                    message: "test sink is down".into(),
+                });
+            }
+            let n = batch.len();
+            self.delivered.lock().unwrap().push(batch.batch_id.clone());
+            Ok(AppendResult {
+                accepted_count: n,
+                rejected_count: 0,
+                sink_name: "controlled".into(),
+                watermark: Some(Checkpoint {
+                    value: batch.batch_id,
+                }),
+                warnings: Vec::new(),
+            })
+        }
+
+        async fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+    }
+
+    struct Harness {
+        tx: mpsc::Sender<Vec<EvidenceRecord>>,
+        up: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+        delivered: Arc<StdMutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_loop(backoff_config: RetryBackoffConfig) -> Harness {
+        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(64);
+        let up = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(StdMutex::new(Vec::new()));
+        let handle = tokio::spawn(run_sink_loop(SinkLoop {
+            rx,
+            sink: Box::new(ControlledSink {
+                up: up.clone(),
+                attempts: attempts.clone(),
+                delivered: delivered.clone(),
+            }),
+            metrics: Arc::new(Metrics::new()),
+            producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
+            enricher: Arc::new(NoopEnricher),
+            namespace_allowlist: None,
+            retry_config: RetryBufferConfig::default(),
+            backoff_config,
+        }));
+        Harness {
+            tx,
+            up,
+            attempts,
+            delivered,
+            handle,
+        }
+    }
+
+    /// Let the loop consume whatever is queued. On a paused clock nothing else
+    /// advances the scheduler, so a single `yield_now` only gets one batch
+    /// through — a count sampled too early reads as "throttled" when it really
+    /// means "not delivered yet".
+    async fn drain(h: &Harness) {
+        for _ in 0..2_000 {
+            if h.tx.capacity() == h.tx.max_capacity() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn one_record() -> Vec<EvidenceRecord> {
+        let event = KernelEvent::TcpConnect(TcpConnectEvent {
+            observed_at_ns: 1_000,
+            pid: 1,
+            tid: 1,
+            src_ip: "10.0.0.1".parse().unwrap(),
+            dst_ip: "10.0.0.2".parse().unwrap(),
+            src_port: 1234,
+            dst_port: 443,
+            addr_family: 2,
+            ret: 0,
+            cgroup_id: 1,
+            comm: "test".into(),
+            netns: 0,
+        });
+        event
+            .normalize(
+                ProbeMetadata {
+                    probe_id: "tcp_connect".into(),
+                    probe_version: "1".into(),
+                    probe_family: "tcp".into(),
+                    hook_kind: HookKind::Fexit,
+                    kernel_function: "tcp_connect".into(),
+                },
+                "test",
+            )
+            .records
+    }
+
+    /// Acceptance criterion 1: buffered evidence is retried on the backoff
+    /// schedule with **zero** further events. Before #39 the retry only ran
+    /// inside the `rx.recv()` arm, so a node that went quiet during an outage
+    /// held its evidence until some unrelated event arrived — possibly never.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_node_retries_without_any_new_events() {
+        let h = spawn_loop(RetryBackoffConfig {
+            base_ms: 100,
+            max_ms: 400,
+        });
+
+        // One batch against a down sink: attempted inline, then buffered.
+        h.tx.send(one_record()).await.unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let after_first = h.attempts.load(Ordering::SeqCst);
+        assert_eq!(after_first, 1, "the inline attempt still happens");
+
+        // Nothing is sent from here on. The timer alone must drive retries.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let retried = h.attempts.load(Ordering::SeqCst);
+        assert!(
+            retried > after_first,
+            "a quiet node must still retry: attempts stuck at {retried}"
+        );
+
+        // And when the sink returns, the held evidence lands — still with no
+        // new events to trigger it.
+        h.up.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.delivered.lock().unwrap().len(),
+            1,
+            "buffered batch delivers once the sink recovers"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// Acceptance criterion 2: under load against a down sink, the attempt rate
+    /// follows the backoff cap, not the event rate. Before #39 every arriving
+    /// batch triggered a flush, so a busy node hammered a struggling sink.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_rate_follows_the_cap_not_the_event_rate() {
+        let h = spawn_loop(RetryBackoffConfig {
+            base_ms: 1_000,
+            max_ms: 1_000,
+        });
+
+        // 200 batches against a down sink, all inside one backoff window.
+        for _ in 0..200 {
+            h.tx.send(one_record()).await.unwrap();
+        }
+        drain(&h).await;
+
+        let attempts = h.attempts.load(Ordering::SeqCst);
+        assert!(
+            attempts <= 2,
+            "200 batches inside one backoff window must not become 200 RPCs; got {attempts}"
+        );
+
+        // Without this the assertion above is satisfied just as well by a loop
+        // that never consumed the channel — which is exactly how an earlier
+        // version of this test passed against the pre-#39 code it was meant to
+        // fail against. Delivering all 200 proves they were really ingested and
+        // held, so the low attempt count means throttling and not backlog.
+        h.up.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drain(&h).await;
+        assert_eq!(
+            h.delivered.lock().unwrap().len(),
+            200,
+            "every batch was buffered while the sink was down"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// The ladder is reset by success, so a second outage starts fast rather
+    /// than inheriting the first one's cap.
+    #[tokio::test(start_paused = true)]
+    async fn delivery_resets_the_ladder_for_the_next_outage() {
+        let h = spawn_loop(RetryBackoffConfig {
+            base_ms: 100,
+            max_ms: 10_000,
+        });
+
+        // Climb the ladder against a down sink, then let it drain.
+        h.tx.send(one_record()).await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        h.up.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.delivered.lock().unwrap().len(),
+            1,
+            "precondition: drained"
+        );
+
+        // Second outage: the first retry must come at ~base, not at the cap the
+        // previous outage climbed to.
+        h.up.store(false, Ordering::SeqCst);
+        h.tx.send(one_record()).await.unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        let before = h.attempts.load(Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            h.attempts.load(Ordering::SeqCst) > before,
+            "a reset ladder retries within ~base_ms; it waited longer"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// An idle agent with no backlog must not wake up at all — the timer arm is
+    /// disabled, not merely parked far out.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_loop_makes_no_attempts() {
+        let h = spawn_loop(RetryBackoffConfig::default());
+        h.up.store(true, Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            h.attempts.load(Ordering::SeqCst),
+            0,
+            "no evidence and no backlog means no RPCs"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
     }
 }
 
