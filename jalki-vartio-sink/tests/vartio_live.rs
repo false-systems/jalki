@@ -69,6 +69,9 @@ fn bound_record() -> EvidenceRecord {
             pod_name: Some("runner-live-1".to_string()),
             namespace: Some("workloads".to_string()),
             service_account: None,
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         })
 }

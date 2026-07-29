@@ -14,7 +14,8 @@
 //!   `agent_recv_time`, label `observed_at_ns` → numeric `kernel_time_ns`
 //! - binding labels: `k8s_pod_uid` → `pod_uid`, `k8s_pod_name` → `pod_name`,
 //!   `k8s_container_id` → `container_id`, `k8s_namespace`,
-//!   `k8s_service_account` → `service_account`, `evidence_level`
+//!   `k8s_service_account` → `service_account`,
+//!   `k8s_owner_{kind,name,uid}` → `owner_{kind,name,uid}`, `evidence_level`
 //! - process block: `pid`, `ppid`, `command` → `comm`, `uid`; labels `gid`
 //!   (numeric) and `argv_hash`; `exe` from the `resource_ref_id` label when
 //!   `resource_ref_kind == "executable"`
@@ -33,6 +34,12 @@ const LABEL_KEYS: &[(&str, &str)] = &[
     ("k8s_container_id", "container_id"),
     ("k8s_namespace", "k8s_namespace"),
     ("k8s_service_account", "service_account"),
+    // Workload lineage (jalki #44). Passed through uninterpreted: stripping a
+    // ReplicaSet's hash suffix to name its Deployment is a judgement about
+    // lineage, and judgements are Vartio's. Feeds runtime-corroboration Lane 2.
+    ("k8s_owner_kind", "owner_kind"),
+    ("k8s_owner_name", "owner_name"),
+    ("k8s_owner_uid", "owner_uid"),
     ("cgroup_id", "cgroup_id"),
     ("argv_hash", "argv_hash"),
     ("tcp_state", "tcp_state"),

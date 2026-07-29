@@ -187,6 +187,9 @@ fn bound_record() -> EvidenceRecord {
             pod_name: Some("runner-1".to_string()),
             namespace: Some("workloads".to_string()),
             service_account: None,
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         })
 }
@@ -298,6 +301,9 @@ fn unsupported_type_record() -> EvidenceRecord {
         pod_name: Some("runner-1".to_string()),
         namespace: Some("workloads".to_string()),
         service_account: None,
+        owner_kind: None,
+        owner_name: None,
+        owner_uid: None,
         provenance: BindingProvenance::Observed,
     })
 }
@@ -357,6 +363,9 @@ fn file_family_record() -> EvidenceRecord {
         pod_name: Some("runner-1".to_string()),
         namespace: Some("workloads".to_string()),
         service_account: None,
+        owner_kind: None,
+        owner_name: None,
+        owner_uid: None,
         provenance: BindingProvenance::Observed,
     })
 }
@@ -633,5 +642,60 @@ async fn misconfiguration_still_fails_fast() {
             ),
             Ok(_) => panic!("{label} endpoint must be refused at construction"),
         }
+    }
+}
+
+/// jalki #44: workload lineage has to survive the whole path — binding →
+/// occurrence labels → Plane-B projection → native wire map — or Vartio's
+/// runtime-corroboration Lane 2 has nothing to join on.
+#[tokio::test]
+async fn workload_owner_rides_the_wire() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let sink = connect(rx.endpoint.clone()).await;
+
+    let record = bound_record().with_runtime_binding(RuntimeBinding::Bound {
+        container_id: "containerd://abc".to_string(),
+        pod_uid: Some("pod-uid-1".to_string()),
+        pod_name: Some("runner-abc123".to_string()),
+        namespace: Some("arc-runners".to_string()),
+        service_account: None,
+        owner_kind: Some("ReplicaSet".to_string()),
+        owner_name: Some("runner-5f9c".to_string()),
+        owner_uid: Some("uid-rs-1".to_string()),
+        provenance: BindingProvenance::Observed,
+    });
+
+    sink.append_batch(EvidenceBatch::new(producer(), vec![record]))
+        .await
+        .expect("delivered");
+
+    let batches = rx.received.lock().unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&batches[0].items[0].payload).unwrap();
+    assert_eq!(payload["owner_kind"], "ReplicaSet");
+    assert_eq!(payload["owner_name"], "runner-5f9c");
+    assert_eq!(
+        payload["owner_uid"], "uid-rs-1",
+        "the uid is the identity that outlives the pod; without it a runtime \
+         hop can only ever name an instance"
+    );
+}
+
+/// A pod with no controller must not acquire an invented owner on the way out.
+#[tokio::test]
+async fn an_unowned_pod_ships_no_owner_fields() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let sink = connect(rx.endpoint.clone()).await;
+
+    sink.append_batch(EvidenceBatch::new(producer(), vec![bound_record()]))
+        .await
+        .expect("delivered");
+
+    let batches = rx.received.lock().unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&batches[0].items[0].payload).unwrap();
+    for key in ["owner_kind", "owner_name", "owner_uid"] {
+        assert!(
+            payload.get(key).is_none(),
+            "{key} must be absent, not empty: {payload}"
+        );
     }
 }

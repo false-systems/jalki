@@ -202,6 +202,7 @@ mod tests {
             pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
+            owner: None,
         }
     }
 

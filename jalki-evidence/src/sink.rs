@@ -604,6 +604,9 @@ mod tests {
             pod_name: Some("runner-1".into()),
             namespace: Some("default".into()),
             service_account: None,
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         })
     }
