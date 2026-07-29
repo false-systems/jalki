@@ -534,6 +534,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                     pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
                 }
 
+                publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
                 next_retry = schedule_retry(
                     next_retry,
                     &mut backoff,
@@ -565,6 +566,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                 if backlog_len(&retry_buffer, &pending_gaps) < before {
                     backoff.reset();
                 }
+                publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
                 next_retry = schedule_retry(
                     None,
                     &mut backoff,
@@ -585,6 +587,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
             &producer_for_sink,
         )
         .await;
+        publish_backlog_metrics(&metrics_clone, &retry_buffer, elapsed_ms(retry_clock_start));
         if (retry_buffer.len_batches(), pending_gaps.len()) == before {
             break;
         }
@@ -848,6 +851,7 @@ mod tests {
         up: Arc<AtomicBool>,
         attempts: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<String>>>,
+        metrics: Arc<Metrics>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -856,6 +860,7 @@ mod tests {
         let up = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         let delivered = Arc::new(StdMutex::new(Vec::new()));
+        let metrics = Arc::new(Metrics::new());
         let handle = tokio::spawn(run_sink_loop(SinkLoop {
             rx,
             sink: Box::new(ControlledSink {
@@ -863,7 +868,7 @@ mod tests {
                 attempts: attempts.clone(),
                 delivered: delivered.clone(),
             }),
-            metrics: Arc::new(Metrics::new()),
+            metrics: metrics.clone(),
             producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
             enricher: Arc::new(NoopEnricher),
             namespace_allowlist: None,
@@ -875,6 +880,7 @@ mod tests {
             up,
             attempts,
             delivered,
+            metrics,
             handle,
         }
     }
@@ -1065,6 +1071,183 @@ mod tests {
         drop(h.tx);
         let _ = h.handle.await;
     }
+
+    // ── observability surface (jalki #42) ───────────────────────────────────
+
+    #[test]
+    fn request_paths_are_parsed_and_query_strings_stripped() {
+        assert_eq!(
+            request_path(b"GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n").as_deref(),
+            Some("/readyz")
+        );
+        assert_eq!(
+            request_path(b"GET /metrics?debug=1 HTTP/1.1\r\n").as_deref(),
+            Some("/metrics"),
+            "kube-prometheus appends params; they must not turn into a 404"
+        );
+        assert_eq!(request_path(b"").as_deref(), None);
+        assert_eq!(request_path(b"garbage\r\n").as_deref(), None);
+    }
+
+    /// Serve one request against a real socket and return (status line, body).
+    async fn probe_request(metrics: &Arc<Metrics>, path: &str, max_age: u64) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_observability_request(stream, &m, max_age).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: t\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).await.unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+        (
+            head.lines().next().unwrap_or("").to_string(),
+            body.to_string(),
+        )
+    }
+
+    /// The contract vartio ADR-0009 insists on: liveness must never consult a
+    /// dependency. A `/healthz` that went red during a Vartio outage would have
+    /// the kubelet restart the agent — destroying the buffered evidence the
+    /// outage is precisely when we need — and turn one incident into the crash
+    /// loop this whole milestone exists to break.
+    /// A single `read()` is not guaranteed to return the whole request line.
+    /// Split across segments, the old handler saw `GET /healt` and answered
+    /// 404 — a failed liveness probe, i.e. a restart. Feed it deliberately
+    /// fragmented, the way a real network can.
+    #[tokio::test]
+    async fn a_request_split_across_packets_still_routes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let metrics = Arc::new(Metrics::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_observability_request(stream, &m, 60).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for piece in ["GET /he", "alt", "hz HTTP/1.1\r\n", "Host: t\r\n\r\n"] {
+            client.write_all(piece.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).await.unwrap();
+        assert!(
+            raw.starts_with("HTTP/1.1 200"),
+            "a fragmented /healthz must not 404 into a pod restart: {raw:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_ignores_the_backlog_entirely() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.retry_queued_batches.set(9_999);
+        metrics.retry_oldest_age_seconds.set(86_400.0);
+
+        let (status, body) = probe_request(&metrics, "/healthz", 60).await;
+        assert!(
+            status.contains("200"),
+            "a day-old backlog must not make the process look dead: {status}"
+        );
+        assert_eq!(body, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn readyz_is_ok_while_evidence_is_flowing() {
+        let metrics = Arc::new(Metrics::new());
+        let (status, body) = probe_request(&metrics, "/readyz", 60).await;
+        assert!(status.contains("200"), "{status}");
+        assert!(body.contains("status=ok"), "{body}");
+    }
+
+    /// A quiet node has nothing to deliver, which is not an outage. Readiness
+    /// keys off backlog age rather than sink health precisely so these two stay
+    /// distinguishable — `HealthStatus::Degraded` covers both.
+    #[tokio::test]
+    async fn readyz_is_ok_for_a_brief_backlog() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.retry_queued_batches.set(120);
+        metrics.retry_oldest_age_seconds.set(2.0);
+
+        let (status, _) = probe_request(&metrics, "/readyz", 60).await;
+        assert!(
+            status.contains("200"),
+            "a blip the backoff clears in under a second must not flap the probe: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_goes_notready_once_the_backlog_is_stale() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.retry_queued_batches.set(3);
+        metrics.retry_queued_records.set(42);
+        metrics.retry_oldest_age_seconds.set(120.0);
+
+        let (status, body) = probe_request(&metrics, "/readyz", 60).await;
+        assert!(
+            status.contains("503"),
+            "holding undeliverable evidence for 2 minutes is NotReady: {status}"
+        );
+        assert!(body.contains("status=stalled"), "{body}");
+        assert!(
+            body.contains("queued_records=42"),
+            "the body has to say why, not just fail: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_still_served_and_unknown_paths_404() {
+        let metrics = Arc::new(Metrics::new());
+        let (status, body) = probe_request(&metrics, "/metrics", 60).await;
+        assert!(status.contains("200"), "{status}");
+        assert!(body.contains("jalki_retry_queued_bytes"), "{body}");
+
+        // The old server answered metrics to literally any request, so a probe
+        // pointed at a typo'd path would have passed while measuring nothing.
+        let (status, _) = probe_request(&metrics, "/healthzz", 60).await;
+        assert!(status.contains("404"), "{status}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_publishes_backlog_gauges() {
+        let h = spawn_loop(RetryBackoffConfig {
+            base_ms: 60_000,
+            max_ms: 60_000,
+        });
+        h.tx.send(one_record()).await.unwrap();
+        drain(&h).await;
+
+        assert!(
+            h.metrics.retry_queued_batches.get() > 0,
+            "a batch held for a down sink must be visible as a gauge, not only in a log line"
+        );
+        assert!(h.metrics.retry_queued_records.get() > 0);
+        assert!(h.metrics.retry_queued_bytes.get() > 0);
+
+        h.up.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        drain(&h).await;
+        assert_eq!(
+            h.metrics.retry_queued_batches.get(),
+            0,
+            "and must fall back to zero once delivered, or /readyz stays stuck"
+        );
+        assert_eq!(h.metrics.retry_oldest_age_seconds.get(), 0.0);
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
 }
 
 fn record_sink_error(metrics: &Metrics, sink: &str) {
@@ -1223,23 +1406,187 @@ fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
 }
 
 /// Serve Prometheus metrics on :9090/metrics.
+/// A queued batch older than this makes the agent NotReady: it is holding
+/// evidence it cannot deliver. Well above the backoff cap so an ordinary blip —
+/// which #39 clears in well under a second — never flaps the probe.
+const DEFAULT_READY_MAX_BACKLOG_AGE_SECS: u64 = 60;
+
+fn ready_max_backlog_age_secs() -> u64 {
+    std::env::var("JALKI_READY_MAX_BACKLOG_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_READY_MAX_BACKLOG_AGE_SECS)
+}
+
+/// Serves `/metrics`, `/healthz` and `/readyz` on :9090 (jalki #42).
+///
+/// Deliberately split, and the split is the point (vartio ADR-0009 rejects
+/// sink-health-fed liveness probes):
+///
+/// - `/healthz` — **process alive only**. It must never consult the sink. A
+///   liveness probe that fails during a downstream outage tells the kubelet to
+///   restart the agent, which destroys the buffered evidence the outage is
+///   exactly when we need, and turns one incident into a crash loop.
+/// - `/readyz` — reports whether evidence is *flowing*. NotReady is a visible,
+///   alertable, harmless state for a DaemonSet with no Service in front of it.
+///
+/// Readiness keys off backlog **age**, not the sink's `health()`. Two reasons:
+/// `HealthStatus::Degraded` is overloaded (it covers "never exercised", a
+/// transport error, and permanent per-item rejects alike), and a node whose
+/// namespaces are simply quiet has nothing to deliver — reporting it NotReady
+/// would be indistinguishable from a real outage. "Holding undeliverable
+/// evidence for more than a minute" is the condition an operator actually
+/// wants.
 async fn serve_metrics(metrics: Arc<Metrics>) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("0.0.0.0:9090").await?;
-    info!("metrics server listening on :9090");
+    let max_backlog_age = ready_max_backlog_age_secs();
+    info!(
+        ready_max_backlog_age_secs = max_backlog_age,
+        "observability server listening on :9090 (/metrics, /healthz, /readyz)"
+    );
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let body = metrics.encode();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // A per-connection accept error (fd exhaustion, a peer that
+                // vanished) used to propagate out of this function and take the
+                // whole server with it — silently removing the probe surface
+                // the kubelet is about to depend on.
+                warn!(error = %e, "observability server accept failed; continuing");
+                continue;
+            }
+        };
+        let metrics = metrics.clone();
+        // Per connection: a serial loop lets one slow scraper block every
+        // subsequent request, and once probes point here that is a restart.
+        tokio::spawn(async move {
+            if let Err(e) = handle_observability_request(stream, &metrics, max_backlog_age).await {
+                tracing::debug!(error = %e, "observability request failed");
+            }
+        });
     }
+}
+
+async fn handle_observability_request(
+    mut stream: tokio::net::TcpStream,
+    metrics: &Metrics,
+    max_backlog_age_secs: u64,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let raw = tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut stream))
+        .await
+        .context("timed out reading request")??;
+    let path = request_path(&raw);
+
+    let (status, content_type, body) = match path.as_deref() {
+        Some("/metrics") => (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics.encode(),
+        ),
+        // No sink call, no buffer inspection, no dependency of any kind: if
+        // this task is scheduled to answer, the process is alive, and that is
+        // the entire claim.
+        Some("/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
+        Some("/readyz") => {
+            let age = metrics.retry_oldest_age_seconds.get();
+            let batches = metrics.retry_queued_batches.get();
+            let stalled = age > max_backlog_age_secs as f64;
+            let body = format!(
+                "queued_batches={batches}\nqueued_records={}\nqueued_bytes={}\n\
+                 oldest_age_seconds={age:.1}\nmax_backlog_age_seconds={max_backlog_age_secs}\n\
+                 status={}\n",
+                metrics.retry_queued_records.get(),
+                metrics.retry_queued_bytes.get(),
+                if stalled { "stalled" } else { "ok" },
+            );
+            let status = if stalled {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            (status, "text/plain; charset=utf-8", body)
+        }
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        ),
+    };
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Overall budget for receiving a request, not a per-read one: a peer that
+/// dribbles a byte at a time must not pin the task indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Enough for a request line plus any probe's or scraper's headers. A peer that
+/// sends more just gets answered on what arrived first.
+const MAX_REQUEST_BYTES: usize = 2048;
+
+/// Read until the end of the HTTP request line.
+///
+/// A single `read()` is **not** enough, and the failure it produces is nasty:
+/// TCP may split `GET /healthz HTTP/1.1\r\n` across segments, and the kubelet's
+/// probe reaches this over the pod network rather than loopback. A short read
+/// yields a truncated path like `/healt`, which routes to 404, which fails the
+/// liveness probe, which restarts the agent — the exact outcome the probe was
+/// added to prevent.
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 512];
+    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_BYTES {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break; // peer closed; answer on what we have
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
+/// Path from an HTTP request line (`GET /readyz HTTP/1.1`), query string
+/// stripped. `None` for anything that isn't one.
+fn request_path(raw: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(raw).ok()?.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    Some(target.split('?').next().unwrap_or(target).to_string())
+}
+
+/// Publish retry-buffer state so `/readyz` and Prometheus can see it. Called
+/// wherever the buffer changes — the loop is the only writer.
+fn publish_backlog_metrics(metrics: &Metrics, retry_buffer: &RetryBuffer, now_ms: u64) {
+    metrics
+        .retry_queued_batches
+        .set(retry_buffer.len_batches() as i64);
+    metrics
+        .retry_queued_records
+        .set(retry_buffer.len_records() as i64);
+    metrics
+        .retry_queued_bytes
+        .set(retry_buffer.len_bytes() as i64);
+    metrics.retry_oldest_age_seconds.set(
+        retry_buffer
+            .oldest_age_ms(now_ms)
+            .map(|ms| ms as f64 / 1000.0)
+            .unwrap_or(0.0),
+    );
 }
 
 /// Convenience function matching the design doc's API.

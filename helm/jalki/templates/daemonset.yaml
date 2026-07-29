@@ -56,6 +56,31 @@ spec:
               containerPort: {{ .Values.mcp.port }}
               protocol: TCP
             {{- end }}
+          # Liveness answers /healthz, which consults NOTHING — not the sink,
+          # not the retry buffer. That separation is the point (jalki #42;
+          # vartio ADR-0009 explicitly rejects sink-health-fed liveness): a
+          # liveness probe that fails during a Vartio outage tells the kubelet
+          # to restart the agent, destroying the buffered evidence the outage
+          # is exactly when we need, and turning one incident into a crash
+          # loop. Do not repoint this at /readyz or /metrics.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 6
+          # Readiness reports whether evidence is *flowing*: it goes red once
+          # the agent has held undeliverable evidence longer than
+          # JALKI_READY_MAX_BACKLOG_AGE_SECS (default 60). Nothing selects this
+          # DaemonSet, so NotReady cuts no traffic — it is a visible, alertable
+          # state instead of a restart.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
