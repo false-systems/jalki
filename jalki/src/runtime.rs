@@ -1119,6 +1119,36 @@ mod tests {
     /// the kubelet restart the agent — destroying the buffered evidence the
     /// outage is precisely when we need — and turn one incident into the crash
     /// loop this whole milestone exists to break.
+    /// A single `read()` is not guaranteed to return the whole request line.
+    /// Split across segments, the old handler saw `GET /healt` and answered
+    /// 404 — a failed liveness probe, i.e. a restart. Feed it deliberately
+    /// fragmented, the way a real network can.
+    #[tokio::test]
+    async fn a_request_split_across_packets_still_routes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let metrics = Arc::new(Metrics::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_observability_request(stream, &m, 60).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for piece in ["GET /he", "alt", "hz HTTP/1.1\r\n", "Host: t\r\n\r\n"] {
+            client.write_all(piece.as_bytes()).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).await.unwrap();
+        assert!(
+            raw.starts_with("HTTP/1.1 200"),
+            "a fragmented /healthz must not 404 into a pod restart: {raw:?}"
+        );
+    }
+
     #[tokio::test]
     async fn healthz_ignores_the_backlog_entirely() {
         let metrics = Arc::new(Metrics::new());
@@ -1445,15 +1475,12 @@ async fn handle_observability_request(
     metrics: &Metrics,
     max_backlog_age_secs: u64,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
-    // Enough for a request line plus headers from any probe or scraper; a peer
-    // that sends more, or nothing, must not pin the task forever.
-    let mut buf = [0u8; 2048];
-    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+    let raw = tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut stream))
         .await
         .context("timed out reading request")??;
-    let path = request_path(&buf[..read]);
+    let path = request_path(&raw);
 
     let (status, content_type, body) = match path.as_deref() {
         Some("/metrics") => (
@@ -1499,6 +1526,37 @@ async fn handle_observability_request(
     stream.write_all(response.as_bytes()).await?;
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+/// Overall budget for receiving a request, not a per-read one: a peer that
+/// dribbles a byte at a time must not pin the task indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Enough for a request line plus any probe's or scraper's headers. A peer that
+/// sends more just gets answered on what arrived first.
+const MAX_REQUEST_BYTES: usize = 2048;
+
+/// Read until the end of the HTTP request line.
+///
+/// A single `read()` is **not** enough, and the failure it produces is nasty:
+/// TCP may split `GET /healthz HTTP/1.1\r\n` across segments, and the kubelet's
+/// probe reaches this over the pod network rather than loopback. A short read
+/// yields a truncated path like `/healt`, which routes to 404, which fails the
+/// liveness probe, which restarts the agent — the exact outcome the probe was
+/// added to prevent.
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 512];
+    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_BYTES {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break; // peer closed; answer on what we have
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
 }
 
 /// Path from an HTTP request line (`GET /readyz HTTP/1.1`), query string
