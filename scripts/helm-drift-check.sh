@@ -39,10 +39,18 @@ spec = ds["spec"]["template"]["spec"]
 c = next(x for x in spec["containers"] if x["name"] == "jalki")
 
 def source(e):
-    """Render valueFrom without the server-populated fieldRef apiVersion."""
+    """Render valueFrom without the fields the API server fills in itself.
+
+    `fieldRef.apiVersion` and `resourceFieldRef.divisor` are both defaulted on
+    admission, so a live object always carries them and a rendered manifest
+    never does. Comparing them would report drift on every downward-API env var
+    forever, which trains people to ignore this check."""
     vf = json.loads(json.dumps(e.get("valueFrom")))
-    if isinstance(vf, dict) and isinstance(vf.get("fieldRef"), dict):
-        vf["fieldRef"].pop("apiVersion", None)
+    if isinstance(vf, dict):
+        if isinstance(vf.get("fieldRef"), dict):
+            vf["fieldRef"].pop("apiVersion", None)
+        if isinstance(vf.get("resourceFieldRef"), dict):
+            vf["resourceFieldRef"].pop("divisor", None)
     return "<from:%s>" % json.dumps(vf, sort_keys=True)
 
 env = {}
