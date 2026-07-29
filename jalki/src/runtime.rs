@@ -2230,7 +2230,7 @@ mod tests {
 
         // 900Mi of a 1Gi limit.
         let dir = fake_cgroup("high", 943_718_400, "1073741824");
-        let pressure = MemoryPressure::detect(&dir, None).expect("detected");
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
 
         shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
 
@@ -2256,7 +2256,7 @@ mod tests {
         // 300Mi of 1Gi — comfortable. Buffered evidence is the thing we are
         // trying to deliver; shedding it early would be self-defeating.
         let dir = fake_cgroup("low", 314_572_800, "1073741824");
-        let pressure = MemoryPressure::detect(&dir, None).expect("detected");
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
 
         shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
 

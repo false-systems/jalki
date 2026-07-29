@@ -34,11 +34,24 @@ pub struct MemoryPressure {
 }
 
 impl MemoryPressure {
-    /// Resolve our cgroup and its limit, or `None` when neither can be
-    /// established — in which case the caller must say so and carry on without
-    /// the feature rather than assume headroom.
+    /// Resolve our cgroup beneath `cgroup_root`, then read its limit.
+    ///
+    /// Returns `None` when neither a cgroup limit nor a declared one can be
+    /// established — the caller must say so and carry on without the feature
+    /// rather than assume headroom.
     pub fn detect(cgroup_root: &Path, declared_limit: Option<u64>) -> Option<Self> {
-        let own = own_cgroup_dir(cgroup_root);
+        Self::at(&own_cgroup_dir(cgroup_root), declared_limit)
+    }
+
+    /// Read a specific cgroup directory, skipping resolution.
+    ///
+    /// Split out because `detect` consults the real `/proc/self/cgroup`, which
+    /// makes it a function of the host: it resolves to `/` inside one container
+    /// and to `/actions_job/…` on a CI runner, so a test pointed at a synthetic
+    /// directory passes in one and fails in the other. Resolution and reading
+    /// are separate questions and now have separate entry points.
+    pub fn at(cgroup_dir: &Path, declared_limit: Option<u64>) -> Option<Self> {
+        let own = cgroup_dir.to_path_buf();
         let current_path = own.join("memory.current");
         if !current_path.exists() {
             return None;
@@ -134,7 +147,7 @@ mod tests {
         fs::write(dir.join("memory.current"), "536870912\n").unwrap();
         fs::write(dir.join("memory.max"), "1073741824\n").unwrap();
 
-        let p = MemoryPressure::detect(&dir, None).expect("detected");
+        let p = MemoryPressure::at(&dir, None).expect("detected");
         assert_eq!(p.limit_bytes(), 1_073_741_824);
         assert!(matches!(p.source(), LimitSource::Cgroup(_)));
         assert!((p.ratio().unwrap() - 0.5).abs() < 1e-9);
@@ -151,7 +164,7 @@ mod tests {
         fs::write(dir.join("memory.max"), "max\n").unwrap();
 
         assert!(
-            MemoryPressure::detect(&dir, None).is_none(),
+            MemoryPressure::at(&dir, None).is_none(),
             "an unbounded limit means we are not looking at our own cgroup"
         );
     }
@@ -162,7 +175,7 @@ mod tests {
         fs::write(dir.join("memory.current"), "805306368\n").unwrap();
         fs::write(dir.join("memory.max"), "max\n").unwrap();
 
-        let p = MemoryPressure::detect(&dir, Some(1_073_741_824)).expect("detected");
+        let p = MemoryPressure::at(&dir, Some(1_073_741_824)).expect("detected");
         assert_eq!(*p.source(), LimitSource::DeclaredLimit);
         assert!((p.ratio().unwrap() - 0.75).abs() < 1e-9);
     }
@@ -173,7 +186,7 @@ mod tests {
         fs::write(dir.join("memory.current"), "1\n").unwrap();
         fs::write(dir.join("memory.max"), "max\n").unwrap();
         assert!(
-            MemoryPressure::detect(&dir, Some(0)).is_none(),
+            MemoryPressure::at(&dir, Some(0)).is_none(),
             "dividing by zero would report infinite pressure and shed everything"
         );
     }
@@ -181,7 +194,7 @@ mod tests {
     #[test]
     fn no_cgroup_files_means_no_feature() {
         let dir = scratch("missing");
-        assert!(MemoryPressure::detect(&dir, Some(1024)).is_none());
+        assert!(MemoryPressure::at(&dir, Some(1024)).is_none());
     }
 
     #[test]
@@ -189,7 +202,7 @@ mod tests {
         let dir = scratch("vanishing");
         fs::write(dir.join("memory.current"), "10\n").unwrap();
         fs::write(dir.join("memory.max"), "100\n").unwrap();
-        let p = MemoryPressure::detect(&dir, None).expect("detected");
+        let p = MemoryPressure::at(&dir, None).expect("detected");
 
         fs::remove_file(dir.join("memory.current")).unwrap();
         assert!(
