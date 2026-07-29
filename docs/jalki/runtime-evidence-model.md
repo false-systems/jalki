@@ -8,7 +8,7 @@ The vocabulary is normative. Field shapes are encoded by `jalki-evidence` on emi
 
 ## 0. Common envelope (recap)
 
-Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_pod_name` / `k8s_container_id` / `k8s_namespace`) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B. Jälki emits observed pod identity, not an inferred GitHub run id.
+Each occurrence carries the FALSE Protocol fields produced by `jalki-evidence` (`source`, `occurrence_type`, `severity`, `outcome`, `cluster`, `correlation_keys`, `labels`, …) plus the producer/probe metadata projected by `EvidenceBatch` (ADR-0001 D6). Runtime binding (`k8s_pod_uid` / `k8s_pod_name` / `k8s_container_id` / `k8s_namespace`, plus `k8s_owner_kind` / `k8s_owner_name` / `k8s_owner_uid` for the controlling workload) is attached on the node by `jalki-enrich` before the record reaches the sink; unbound records are dropped from Plane B. The owner is reported exactly as the API server gives it — a pod's direct controller, typically a ReplicaSet rather than the Deployment behind it. Resolving that lineage is interpretation, so it is Vartio's. Jälki emits observed pod identity, not an inferred GitHub run id.
 
 Migration note: callers constructing `RuntimeBinding::Bound`, `PodMetadata`, or `PodSnapshot` must now supply `pod_name` (`None` only when unavailable); their unused pod-label map was removed. The Kubernetes watcher always supplies the name from `metadata.name`.
 

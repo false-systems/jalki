@@ -256,12 +256,32 @@ pub fn parse_k8s_container_id(value: &str) -> Result<ContainerRef, ParseContaine
     validate_container_id(id, runtime)
 }
 
+/// The controller that owns a pod: ReplicaSet, DaemonSet, StatefulSet, Job.
+///
+/// Emitted **as observed**, with no interpretation. Resolving a ReplicaSet back
+/// to its Deployment (or a Job to its CronJob) is a second lookup and a
+/// judgement about lineage; both belong to Vartio, which interprets. Jälki's
+/// job on Plane B is to report what the kernel and the API server said.
+///
+/// Why it matters: a pod name is ephemeral. `runner-abc123` vanishes on
+/// restart and the next one has a different name and uid, so runtime evidence
+/// bound only to a pod cannot be joined to anything that outlives it. The owner
+/// uid is stable across the pod's whole lifecycle, which is what makes a
+/// runtime hop attributable to a workload rather than to an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadOwner {
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodMetadata {
     pub pod_uid: String,
     pub pod_name: String,
     pub namespace: String,
     pub service_account: Option<String>,
+    pub owner: Option<WorkloadOwner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +303,7 @@ pub struct PodSnapshot {
     pub pod_name: String,
     pub namespace: String,
     pub service_account: Option<String>,
+    pub owner: Option<WorkloadOwner>,
     pub containers: Vec<ContainerStatusSnapshot>,
 }
 
@@ -293,6 +314,7 @@ impl PodSnapshot {
             pod_name: self.pod_name.clone(),
             namespace: self.namespace.clone(),
             service_account: self.service_account.clone(),
+            owner: self.owner.clone(),
         }
     }
 }
@@ -329,6 +351,9 @@ impl Binding {
                 pod_name: Some(metadata.pod_name),
                 namespace: Some(metadata.namespace),
                 service_account: metadata.service_account,
+                owner_kind: metadata.owner.as_ref().map(|o| o.kind.clone()),
+                owner_name: metadata.owner.as_ref().map(|o| o.name.clone()),
+                owner_uid: metadata.owner.as_ref().map(|o| o.uid.clone()),
                 provenance,
             },
             Binding::Unbound { reason } => RuntimeBinding::Unbound { reason },
@@ -539,6 +564,7 @@ mod tests {
             pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
+            owner: None,
         }
     }
 
@@ -548,6 +574,7 @@ mod tests {
             pod_name: "runner-1".into(),
             namespace: "default".into(),
             service_account: Some("builder".into()),
+            owner: None,
             containers: vec![ContainerStatusSnapshot::new(format!("containerd://{ID}"))],
         }
     }

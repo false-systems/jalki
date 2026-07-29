@@ -8,7 +8,7 @@ use kube::runtime::watcher::{watcher, Config, Event};
 use kube::{Api, Client, ResourceExt};
 use tracing::{debug, info, warn};
 
-use jalki_enrich::{BindingCache, ContainerStatusSnapshot, PodSnapshot};
+use jalki_enrich::{BindingCache, ContainerStatusSnapshot, PodSnapshot, WorkloadOwner};
 
 /// Watch pods assigned to one node and keep the runtime binding cache current.
 pub async fn run_pod_binding_watcher(
@@ -123,7 +123,32 @@ pub fn pod_to_snapshot(pod: &Pod) -> Option<PodSnapshot> {
         pod_name,
         namespace,
         service_account,
+        owner: controlling_owner(pod),
         containers,
+    })
+}
+
+/// The owner marked `controller: true`, not simply the first reference.
+///
+/// A pod may carry several `ownerReferences` but at most one controller, and
+/// only that one is the workload that manages it. Taking `[0]` happens to be
+/// right in the common single-reference case and quietly wrong the moment
+/// anything else adds a reference — the kind of bug that shows up as evidence
+/// attributed to the wrong workload rather than as an error.
+fn controlling_owner(pod: &Pod) -> Option<WorkloadOwner> {
+    let owner = pod
+        .metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find(|r| r.controller.unwrap_or(false))?;
+    if owner.kind.is_empty() || owner.name.is_empty() || owner.uid.is_empty() {
+        return None;
+    }
+    Some(WorkloadOwner {
+        kind: owner.kind.clone(),
+        name: owner.name.clone(),
+        uid: owner.uid.clone(),
     })
 }
 
@@ -201,5 +226,108 @@ mod tests {
         pod.metadata.uid = None;
 
         assert!(pod_to_snapshot(&pod).is_none());
+    }
+
+    /// A pod may carry several `ownerReferences` but at most one controller.
+    /// Taking `[0]` is right by luck in the common case and wrong the moment
+    /// anything else adds a reference — and it fails as evidence attributed to
+    /// the wrong workload, not as an error.
+    #[test]
+    fn the_controlling_owner_is_chosen_not_the_first_reference() {
+        let mut pod = Pod::default();
+        pod.metadata.uid = Some("pod-uid-1".into());
+        pod.metadata.name = Some("runner-abc123".into());
+        pod.metadata.namespace = Some("arc-runners".into());
+        pod.metadata.owner_references = Some(vec![
+            owner_ref("SomethingElse", "decorator", "uid-not-this", Some(false)),
+            owner_ref("ReplicaSet", "runner-5f9c", "uid-rs-1", Some(true)),
+        ]);
+
+        let snapshot = pod_to_snapshot(&pod).expect("snapshot");
+        let owner = snapshot.owner.expect("controlling owner");
+        assert_eq!(owner.kind, "ReplicaSet");
+        assert_eq!(owner.name, "runner-5f9c");
+        assert_eq!(owner.uid, "uid-rs-1");
+    }
+
+    #[test]
+    fn a_pod_with_no_controller_has_no_owner() {
+        // A bare pod — kubectl run, a static pod — is owned by nobody, and
+        // inventing an owner for it would be worse than reporting none.
+        let mut pod = Pod::default();
+        pod.metadata.uid = Some("pod-uid-2".into());
+        pod.metadata.name = Some("adhoc".into());
+        pod.metadata.namespace = Some("workloads".into());
+        assert!(pod_to_snapshot(&pod).expect("snapshot").owner.is_none());
+
+        pod.metadata.owner_references =
+            Some(vec![owner_ref("ReplicaSet", "rs", "uid", Some(false))]);
+        assert!(
+            pod_to_snapshot(&pod).expect("snapshot").owner.is_none(),
+            "a non-controller reference is not the owning workload"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_owner_reference_is_dropped() {
+        // Half an identity is worse than none: it would bind evidence to a
+        // workload that cannot be looked up.
+        let mut pod = Pod::default();
+        pod.metadata.uid = Some("pod-uid-3".into());
+        pod.metadata.name = Some("p".into());
+        pod.metadata.namespace = Some("workloads".into());
+        pod.metadata.owner_references = Some(vec![owner_ref("ReplicaSet", "rs", "", Some(true))]);
+        assert!(pod_to_snapshot(&pod).expect("snapshot").owner.is_none());
+    }
+
+    #[test]
+    fn the_owner_reaches_the_runtime_binding() {
+        let mut pod = Pod::default();
+        pod.metadata.uid = Some("pod-uid-4".into());
+        pod.metadata.name = Some("runner-abc123".into());
+        pod.metadata.namespace = Some("arc-runners".into());
+        pod.metadata.owner_references = Some(vec![owner_ref(
+            "DaemonSet",
+            "jalki",
+            "uid-ds-1",
+            Some(true),
+        )]);
+
+        let binding = jalki_enrich::Binding::Bound {
+            container_id: "containerd://abc".into(),
+            metadata: pod_to_snapshot(&pod).expect("snapshot").metadata(),
+            provenance: jalki_evidence::BindingProvenance::Observed,
+        }
+        .into_runtime_binding();
+
+        match binding {
+            jalki_evidence::RuntimeBinding::Bound {
+                owner_kind,
+                owner_name,
+                owner_uid,
+                ..
+            } => {
+                assert_eq!(owner_kind.as_deref(), Some("DaemonSet"));
+                assert_eq!(owner_name.as_deref(), Some("jalki"));
+                assert_eq!(owner_uid.as_deref(), Some("uid-ds-1"));
+            }
+            other => panic!("expected Bound, got {other:?}"),
+        }
+    }
+
+    fn owner_ref(
+        kind: &str,
+        name: &str,
+        uid: &str,
+        controller: Option<bool>,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: kind.into(),
+            name: name.into(),
+            uid: uid.into(),
+            controller,
+            block_owner_deletion: None,
+        }
     }
 }

@@ -89,6 +89,14 @@ pub enum RuntimeBinding {
         pod_name: Option<String>,
         namespace: Option<String>,
         service_account: Option<String>,
+        /// Controlling workload (ReplicaSet/DaemonSet/StatefulSet/Job) as
+        /// observed, uninterpreted. A pod name is ephemeral; the owner uid is
+        /// stable for the pod's whole lifecycle, so it is what lets a runtime
+        /// hop attach to a workload rather than to an instance that vanishes on
+        /// restart (jalki #44).
+        owner_kind: Option<String>,
+        owner_name: Option<String>,
+        owner_uid: Option<String>,
         provenance: BindingProvenance,
     },
     Unbound {
@@ -302,6 +310,9 @@ fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>)
             pod_name,
             namespace,
             service_account,
+            owner_kind,
+            owner_name,
+            owner_uid,
             provenance,
         }) => {
             if !container_id.is_empty() {
@@ -330,6 +341,23 @@ fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>)
             if let Some(service_account) = service_account.as_ref().filter(|v| !v.is_empty()) {
                 occ.labels
                     .insert("k8s_service_account".into(), service_account.clone());
+            }
+            if let Some(owner_kind) = owner_kind.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels
+                    .insert("k8s_owner_kind".into(), owner_kind.clone());
+            }
+            if let Some(owner_name) = owner_name.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels
+                    .insert("k8s_owner_name".into(), owner_name.clone());
+            }
+            if let Some(owner_uid) = owner_uid.as_ref().filter(|v| !v.is_empty()) {
+                occ.labels.insert("k8s_owner_uid".into(), owner_uid.clone());
+                // A correlation key, unlike kind/name: it is the identity that
+                // survives the pod, so it is the one worth joining on.
+                push_unique(
+                    &mut occ.correlation_keys,
+                    format!("k8s_owner_uid:{owner_uid}"),
+                );
             }
             occ.labels
                 .insert("evidence_level".into(), provenance.as_str().into());
@@ -553,6 +581,9 @@ mod tests {
             pod_name: Some("pod".into()),
             namespace: Some("workloads".into()),
             service_account: None,
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         });
         assert_eq!(bound.bound_namespace(), Some("workloads"));
@@ -612,6 +643,9 @@ mod tests {
             pod_name: Some("x".repeat(4096)),
             namespace: Some("default".into()),
             service_account: None,
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         });
 
@@ -700,6 +734,9 @@ mod tests {
             pod_name: Some("runner-1".into()),
             namespace: Some("default".into()),
             service_account: Some("builder".into()),
+            owner_kind: None,
+            owner_name: None,
+            owner_uid: None,
             provenance: BindingProvenance::Observed,
         });
         record.occurrence.severity = Severity::Critical;
