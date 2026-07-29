@@ -5,6 +5,19 @@ metadata:
   labels:
     app.kubernetes.io/name: jalki
     app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if .Values.k8sEnrichment }}
+# Read-only pod visibility for the node-scoped watcher that turns a cgroup_id
+# into a pod/container binding. This is the whole of jälki's Kubernetes API
+# surface: no writes, no secrets, no other kinds.
+#
+# (This file previously read `rules: []` under a comment asserting jälki needs
+# no API access. That stopped being true when --k8s-enrichment landed, and the
+# live cluster had the rule applied out of band — jalki #43.)
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+{{- else }}
+# Kernel-only observation: no Kubernetes API access required.
 rules: []
-# jalki does not need Kubernetes API access.
-# All observation happens at the kernel level via eBPF.
+{{- end }}

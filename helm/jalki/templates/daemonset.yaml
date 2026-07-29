@@ -18,8 +18,18 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ .Release.Name }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # hostPID for process/cgroup visibility; hostNetwork so the pod hostname
+      # is the node name and the kernel netns matches the host.
       hostPID: true
       hostNetwork: true
+      # REQUIRED with hostNetwork. Without it the pod inherits the host's
+      # resolver and cluster DNS names do not resolve — so a vartio endpoint
+      # like vartio.vartio.svc.cluster.local silently fails to connect.
+      dnsPolicy: ClusterFirstWithHostNet
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -32,18 +42,71 @@ spec:
         - name: jalki
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # privileged for eBPF load + attach. runAsUser 0 is not redundant:
+          # the image base is distroless :nonroot, so without it the process
+          # keeps uid 65532 and its effective capabilities are cleared at exec —
+          # BPF map creation then fails EPERM even inside a privileged pod.
           securityContext:
             privileged: true
+            runAsUser: 0
+            runAsGroup: 0
           args:
-            - --emit
-            - {{ .Values.emit | quote }}
-            {{- if .Values.cluster }}
-            - --cluster
-            - {{ .Values.cluster | quote }}
+            - --sink
+            - {{ .Values.sink | quote }}
+            {{- if .Values.k8sEnrichment }}
+            - --k8s-enrichment
             {{- end }}
           env:
             - name: RUST_LOG
-              value: "jalki=info"
+              value: {{ .Values.logLevel | quote }}
+            {{- if .Values.cluster }}
+            - name: JALKI_CLUSTER
+              value: {{ .Values.cluster | quote }}
+            {{- end }}
+            {{- if eq .Values.sink "vartio" }}
+            {{- if not .Values.vartio.endpoint }}
+            {{- fail "sink=vartio requires vartio.endpoint" }}
+            {{- end }}
+            - name: JALKI_VARTIO_ENDPOINT
+              value: {{ .Values.vartio.endpoint | quote }}
+            - name: JALKI_VARTIO_ADAPTER_ID
+              value: {{ .Values.vartio.adapterId | quote }}
+            - name: JALKI_VARTIO_FILE_TYPES
+              value: {{ ternary "1" "0" .Values.vartio.fileTypes | quote }}
+            - name: VARTIO_INGRESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vartio.ingressTokenSecret.name | quote }}
+                  key: {{ .Values.vartio.ingressTokenSecret.key | quote }}
+            {{- end }}
+            {{- with .Values.namespaces }}
+            - name: JALKI_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.k8sEnrichment }}
+            - name: JALKI_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
+            - name: JALKI_RETRY_MAX_BYTES
+              value: {{ .Values.retry.maxBytes | int64 | quote }}
+            - name: JALKI_RETRY_MAX_RECORDS
+              value: {{ .Values.retry.maxRecords | int64 | quote }}
+            {{- with .Values.retry.maxAgeMs }}
+            - name: JALKI_RETRY_MAX_AGE_MS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.retry.backoffBaseMs }}
+            - name: JALKI_RETRY_BACKOFF_BASE_MS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.retry.backoffMaxMs }}
+            - name: JALKI_RETRY_BACKOFF_MAX_MS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: JALKI_READY_MAX_BACKLOG_AGE_SECS
+              value: {{ .Values.readiness.maxBacklogAgeSeconds | int64 | quote }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -92,6 +155,13 @@ spec:
             - name: btf
               mountPath: /sys/kernel/btf
               readOnly: true
+            {{- if .Values.k8sEnrichment }}
+            # cgroup_id → container resolution. Without this the enricher
+            # cannot bind evidence to a pod and every record ships unbound.
+            - name: cgroupfs
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            {{- end }}
       volumes:
         - name: bpffs
           hostPath:
@@ -102,3 +172,8 @@ spec:
         - name: btf
           hostPath:
             path: /sys/kernel/btf
+        {{- if .Values.k8sEnrichment }}
+        - name: cgroupfs
+          hostPath:
+            path: /sys/fs/cgroup
+        {{- end }}

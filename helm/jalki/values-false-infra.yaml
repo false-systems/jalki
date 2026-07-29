@@ -1,0 +1,60 @@
+# The live false-infra deployment, expressed as chart values.
+#
+# false-infra/apps/jalki is the *source of truth* for what runs — it is what
+# GitOps applies. This file exists so the chart can be proved capable of
+# reproducing it: `scripts/helm-drift-check.sh` renders with these values and
+# diffs the result against the live DaemonSet. Its job is to fail when the two
+# diverge, which is the whole of jalki #43.
+#
+# Do not deploy from this file. Change false-infra, then update this to match.
+image:
+  repository: ghcr.io/false-systems/jalki
+  tag: "main"
+  pullPolicy: Always
+  pullSecrets:
+    - name: ghcr-pull
+
+cluster: "false-infra"
+sink: "vartio"
+
+vartio:
+  endpoint: "http://vartio.vartio.svc.cluster.local:50061"
+  adapterId: "jalki-daemonset"
+  fileTypes: true
+  ingressTokenSecret:
+    name: jalki-vartio-token
+    key: ingress-token
+
+k8sEnrichment: true
+
+namespaces:
+  - workloads
+  - arc-runners
+
+retry:
+  maxBytes: 67108864
+  maxRecords: 120000
+
+# The published image is arm64-only; the control-plane node is amd64.
+nodeSelector:
+  kubernetes.io/arch: arm64
+  # PAUSED — matches no node, so zero pods schedule. Declared in
+  # false-infra/apps/jalki/daemonset.yaml; the gate for removing it is
+  # false-systems/vartio#246. This drift check is expected to fail the day the
+  # pause is lifted in one place and not the other, which is the point.
+  jalki.false.systems/paused: "true"
+
+tolerations:
+  - operator: Exists
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+# false-infra runs no MCP service for the DaemonSet.
+mcp:
+  enabled: false
