@@ -656,7 +656,7 @@ fn parse_event_filter(params: &Value) -> EventFilter {
 
     let f = filter_val.unwrap_or(&Value::Nil);
     EventFilter {
-        last_seconds: get_u64(f, "last_seconds").or(Some(60)).map(|v| v),
+        last_seconds: get_u64(f, "last_seconds").or(Some(60)),
         src_ip: get_str(f, "src_ip"),
         dst_ip: get_str(f, "dst_ip"),
         src_port: get_u64(f, "src_port").map(|v| v as u16),

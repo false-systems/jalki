@@ -469,6 +469,10 @@ enum FieldRead {
         arg_index: u32,
         struct_offset: u32,
         size: usize,
+        /// Parsed from the probe spec but not consumed by the emitter yet.
+        /// Kept because the variant mirrors the spec's shape; dropping it
+        /// would make the two stop corresponding. See btf.rs `vlen`.
+        #[allow(dead_code)]
         field_type: FieldType,
     },
 }

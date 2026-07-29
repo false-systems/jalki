@@ -36,6 +36,10 @@ pub struct BtfData {
 struct BtfTypeEntry {
     name_off: u32,
     kind: u32,
+    /// Parsed from BTF but not consumed yet: the field/member count.
+    /// Kept because the struct mirrors the on-disk layout — dropping it
+    /// would make the parser's shape stop matching the format it reads.
+    #[allow(dead_code)]
     vlen: u32,
     size_or_type: u32,
     extra: TypeExtra,

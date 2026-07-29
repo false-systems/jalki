@@ -42,6 +42,12 @@ impl ProbeStats {
 ///
 /// Runs as a blocking task (ring buffer polling is synchronous in aya).
 /// Sends one batch per ring-buffer drain cycle through an mpsc channel.
+// Reader setup is genuinely one cohesive bundle (probe, cluster, channel,
+// stats, store, enricher, matcher). Threading it through a params struct —
+// the shape `SinkLoop` uses in runtime.rs — would read better, but it is a
+// call-site refactor and this commit exists to make CI green, not to move
+// code. Tracked separately.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reader(
     ebpf: &mut Ebpf,
     probe: Arc<dyn Probe>,
@@ -80,6 +86,12 @@ pub fn spawn_reader(
     Ok(())
 }
 
+// Reader setup is genuinely one cohesive bundle (probe, cluster, channel,
+// stats, store, enricher, matcher). Threading it through a params struct —
+// the shape `SinkLoop` uses in runtime.rs — would read better, but it is a
+// call-site refactor and this commit exists to make CI green, not to move
+// code. Tracked separately.
+#[allow(clippy::too_many_arguments)]
 fn drain_loop(
     mut ring_buf: RingBuf<aya::maps::MapData>,
     probe: Arc<dyn Probe>,

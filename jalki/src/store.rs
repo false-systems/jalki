@@ -96,7 +96,7 @@ impl EventStore {
             results.extend(filter_events(buffer.iter(), filter));
         }
         // Sort by timestamp, most recent first.
-        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        results.sort_by_key(|occ| std::cmp::Reverse(occ.timestamp));
         let limit = filter.limit.unwrap_or(100);
         results.truncate(limit);
         results

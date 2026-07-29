@@ -1,9 +1,9 @@
-/// BPF instruction encoding.
-///
-/// Each BPF instruction is 8 bytes. The `ld_map_fd` pseudo-instruction
-/// is 16 bytes (two consecutive instructions).
-///
-/// Reference: linux/bpf.h, linux/bpf_common.h
+//! BPF instruction encoding.
+//!
+//! Each BPF instruction is 8 bytes. The `ld_map_fd` pseudo-instruction
+//! is 16 bytes (two consecutive instructions).
+//!
+//! Reference: linux/bpf.h, linux/bpf_common.h
 
 /// A single 8-byte BPF instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

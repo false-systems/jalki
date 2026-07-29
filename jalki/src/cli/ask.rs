@@ -268,10 +268,9 @@ fn extract_fields(event: &serde_json::Value, function: &str) -> jalki::knowledge
         if let Some(outcome) = event.get("outcome").and_then(|v| v.as_str()) {
             match outcome {
                 "success" => fields.ret = Some(0),
-                "failure"
-                    if fields.ret.is_none() => {
-                        fields.ret = Some(-1);
-                    }
+                "failure" if fields.ret.is_none() => {
+                    fields.ret = Some(-1);
+                }
                 _ => {}
             }
         }

@@ -112,7 +112,7 @@ mod tests {
         );
         assert_eq!(occ.labels.get("result").map(String::as_str), Some("failed"));
         // never claims a resolved file identity
-        assert!(occ.labels.get("resource_ref_id").is_none());
+        assert!(!occ.labels.contains_key("resource_ref_id"));
     }
 
     #[test]

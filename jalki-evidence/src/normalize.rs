@@ -565,8 +565,8 @@ mod tests {
     fn file_open_allowed_carries_no_errno() {
         let occ = file_open(0).to_occurrence("prod");
         assert_eq!(occ.labels.get("result"), Some(&"allowed".to_string()));
-        assert!(occ.labels.get("errno").is_none());
-        assert!(occ.labels.get("errno_num").is_none());
+        assert!(!occ.labels.contains_key("errno"));
+        assert!(!occ.labels.contains_key("errno_num"));
     }
 
     #[test]
@@ -591,7 +591,7 @@ mod tests {
             Some(&"/var/run/secrets/missing".to_string())
         );
         // Must NOT claim a resolved file identity — that's kernel.file.open only.
-        assert!(occ.labels.get("resource_ref_id").is_none());
+        assert!(!occ.labels.contains_key("resource_ref_id"));
     }
 
     #[test]

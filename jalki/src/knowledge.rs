@@ -107,7 +107,7 @@ impl KnowledgeBase {
         }
 
         // Sort by relevance (highest score first).
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         matches.into_iter().map(|(p, _)| p).collect()
     }
 

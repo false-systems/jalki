@@ -75,6 +75,12 @@ impl ProbeRegistry {
 
     /// Attach a probe at runtime. Loads the eBPF program, starts the reader,
     /// and begins flowing events into the store and emit channel.
+    // Reader setup is genuinely one cohesive bundle (probe, cluster, channel,
+    // stats, store, enricher, matcher). Threading it through a params struct —
+    // the shape `SinkLoop` uses in runtime.rs — would read better, but it is a
+    // call-site refactor and this commit exists to make CI green, not to move
+    // code. Tracked separately.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
         probe: Arc<dyn Probe>,
