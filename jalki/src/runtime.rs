@@ -8,9 +8,9 @@ use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
-    DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport, HookKind,
-    Pace, ProbeMetadata, ProducerMetadata, RetryBackoff, RetryBackoffConfig, RetryBuffer,
-    RetryBufferConfig, SinkError,
+    gap_for_batch, DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink,
+    GapReport, HookKind, Pace, ProbeMetadata, ProducerMetadata, RetryBackoff, RetryBackoffConfig,
+    RetryBuffer, RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant as Deadline;
@@ -854,15 +854,6 @@ impl PendingGaps {
     }
 }
 
-fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
-    GapReport {
-        cause: cause.into(),
-        dropped_records: batch.len(),
-        gap_start_ns: batch.observed_at_min,
-        gap_end_ns: batch.observed_at_max,
-    }
-}
-
 fn record_sink_error(metrics: &Metrics, sink: &str) {
     metrics
         .sink_errors
@@ -1236,6 +1227,8 @@ mod tests {
             dropped_records: 1,
             gap_start_ns: 10,
             gap_end_ns: 20,
+            dropped_reliability: 0,
+            dropped_attribution: 0,
         });
 
         let first = pending.front(&producer).expect("pending gap");

@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 
 use false_protocol::{Occurrence, Severity};
 
-use crate::{EvidenceBatch, EvidenceRecord, HookKind, ProbeMetadata, ProducerMetadata, SinkError};
+use crate::{
+    EvidenceBatch, EvidenceClass, EvidenceRecord, HookKind, ProbeMetadata, ProducerMetadata,
+    SinkError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryBufferConfig {
@@ -379,6 +382,11 @@ pub struct GapReport {
     pub dropped_records: usize,
     pub gap_start_ns: u64,
     pub gap_end_ns: u64,
+    /// Records lost per class. "We dropped 4,000 tcp.close events" and "we
+    /// dropped 3 execs" are the same number of bytes and completely different
+    /// incidents — coverage downstream cannot tell them apart from a total.
+    pub dropped_reliability: usize,
+    pub dropped_attribution: usize,
 }
 
 impl GapReport {
@@ -387,6 +395,12 @@ impl GapReport {
             self.cause = "multiple".into();
         }
         self.dropped_records = self.dropped_records.saturating_add(other.dropped_records);
+        self.dropped_reliability = self
+            .dropped_reliability
+            .saturating_add(other.dropped_reliability);
+        self.dropped_attribution = self
+            .dropped_attribution
+            .saturating_add(other.dropped_attribution);
         self.gap_start_ns = self.gap_start_ns.min(other.gap_start_ns);
         self.gap_end_ns = self.gap_end_ns.max(other.gap_end_ns);
     }
@@ -398,6 +412,14 @@ impl GapReport {
         occ.labels.insert("cause".into(), self.cause);
         occ.labels
             .insert("dropped_records".into(), self.dropped_records.to_string());
+        occ.labels.insert(
+            "dropped_reliability".into(),
+            self.dropped_reliability.to_string(),
+        );
+        occ.labels.insert(
+            "dropped_attribution".into(),
+            self.dropped_attribution.to_string(),
+        );
         occ.labels
             .insert("gap_start_ns".into(), self.gap_start_ns.to_string());
         occ.labels
@@ -428,6 +450,11 @@ struct BufferedBatch {
     batch: EvidenceBatch,
     enqueued_at_ms: u64,
     approx_bytes: usize,
+    /// Class of every record in this batch. Batches are split by class on the
+    /// way in, so this is exact rather than a summary — a mixed batch
+    /// classified by its strongest member would make almost everything
+    /// attribution and the shed order would do nothing.
+    class: EvidenceClass,
 }
 
 #[derive(Debug, Clone)]
@@ -466,27 +493,65 @@ impl RetryBuffer {
 
     pub fn enqueue(&mut self, batch: EvidenceBatch, now_ms: u64) -> Vec<GapReport> {
         let mut gaps = Vec::new();
-        let approx_bytes = batch.approx_bytes();
-        self.records += batch.len();
-        self.bytes += approx_bytes;
-        self.batches.push_back(BufferedBatch {
-            batch,
-            enqueued_at_ms: now_ms,
-            approx_bytes,
-        });
+
+        // Split by class before buffering. A drain cycle routinely mixes an
+        // exec with tcp.close chatter, and a mixed batch can only be shed as a
+        // unit — so without the split, shedding either drops attribution
+        // evidence to get at telemetry, or (classifying conservatively) never
+        // sheds anything early at all.
+        for part in split_by_class(batch) {
+            let approx_bytes = part.batch.approx_bytes();
+            self.records += part.batch.len();
+            self.bytes += approx_bytes;
+            self.batches.push_back(BufferedBatch {
+                batch: part.batch,
+                enqueued_at_ms: now_ms,
+                approx_bytes,
+                class: part.class,
+            });
+        }
 
         while self.records > self.config.max_records
             || self.batches.len() > self.config.max_batches
             || self.bytes > self.config.max_bytes
         {
-            if let Some(dropped) = self.pop_front() {
-                gaps.push(gap_for_batch("retry_buffer_overflow", &dropped.batch));
-            } else {
-                break;
+            match self.shed_one() {
+                Some(dropped) => gaps.push(gap_for_shed(
+                    "retry_buffer_overflow",
+                    dropped.class,
+                    &dropped.batch,
+                )),
+                None => break,
             }
         }
 
         gaps
+    }
+
+    /// Give up the least valuable batch: oldest reliability evidence if any is
+    /// held, oldest attribution evidence only when nothing else remains
+    /// (vartio ADR-0009 contract 5).
+    ///
+    /// Delivery order is untouched — `front()` is still strictly FIFO, because
+    /// head-of-line ordering is what makes a drain reconstructible. Only the
+    /// *shed* choice is class-aware.
+    fn shed_one(&mut self) -> Option<BufferedBatch> {
+        let victim = self
+            .batches
+            .iter()
+            .position(|b| b.class == EvidenceClass::Reliability)
+            .or(if self.batches.is_empty() {
+                None
+            } else {
+                Some(0)
+            })?;
+        let dropped = self.batches.remove(victim)?;
+        // Saturating, matching `pop_front` — the two are the only paths that
+        // decrement, and they must not disagree about what happens if the
+        // accounting ever drifts.
+        self.records = self.records.saturating_sub(dropped.batch.len());
+        self.bytes = self.bytes.saturating_sub(dropped.approx_bytes);
+        Some(dropped)
     }
 
     pub fn drop_expired(&mut self, now_ms: u64) -> Vec<GapReport> {
@@ -501,7 +566,11 @@ impl RetryBuffer {
                 break;
             }
             if let Some(dropped) = self.pop_front() {
-                gaps.push(gap_for_batch("retry_buffer_expired", &dropped.batch));
+                gaps.push(gap_for_shed(
+                    "retry_buffer_expired",
+                    dropped.class,
+                    &dropped.batch,
+                ));
             }
         }
         gaps
@@ -544,13 +613,82 @@ impl RetryBuffer {
     }
 }
 
-fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
+/// Gap report for a batch lost whole — overflow, expiry, or a terminal sink
+/// error. Public because the runtime needs the same construction for terminal
+/// drops, and a second copy there is precisely how the per-class counts would
+/// go stale (it already had one).
+pub fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
+    let mut reliability = 0;
+    let mut attribution = 0;
+    for record in &batch.records {
+        match record.evidence_class() {
+            EvidenceClass::Reliability => reliability += 1,
+            EvidenceClass::Attribution => attribution += 1,
+        }
+    }
     GapReport {
         cause: cause.into(),
         dropped_records: batch.len(),
         gap_start_ns: batch.observed_at_min,
         gap_end_ns: batch.observed_at_max,
+        dropped_reliability: reliability,
+        dropped_attribution: attribution,
     }
+}
+
+/// Gap for a batch the buffer chose to shed; the class is already known, so it
+/// does not need re-deriving per record.
+fn gap_for_shed(cause: &str, class: EvidenceClass, batch: &EvidenceBatch) -> GapReport {
+    let n = batch.len();
+    GapReport {
+        cause: cause.into(),
+        dropped_records: n,
+        gap_start_ns: batch.observed_at_min,
+        gap_end_ns: batch.observed_at_max,
+        dropped_reliability: match class {
+            EvidenceClass::Reliability => n,
+            EvidenceClass::Attribution => 0,
+        },
+        dropped_attribution: match class {
+            EvidenceClass::Attribution => n,
+            EvidenceClass::Reliability => 0,
+        },
+    }
+}
+
+struct ClassPart {
+    batch: EvidenceBatch,
+    class: EvidenceClass,
+}
+
+/// Partition a batch into per-class batches, preserving record order and
+/// dropping empty parts. Idempotency keys are per-record
+/// (`source:cluster:node:<occurrence id>`), so splitting is safe for dedup —
+/// redelivery of either part is still a no-op downstream.
+fn split_by_class(batch: EvidenceBatch) -> Vec<ClassPart> {
+    let producer = batch.producer.clone();
+    let mut reliability = Vec::new();
+    let mut attribution = Vec::new();
+    for record in batch.records {
+        match record.evidence_class() {
+            EvidenceClass::Reliability => reliability.push(record),
+            EvidenceClass::Attribution => attribution.push(record),
+        }
+    }
+
+    let mut parts = Vec::with_capacity(2);
+    for (records, class) in [
+        (reliability, EvidenceClass::Reliability),
+        (attribution, EvidenceClass::Attribution),
+    ] {
+        if !records.is_empty() {
+            parts.push(ClassPart {
+                batch: EvidenceBatch::new(producer.clone(), records),
+                class,
+            });
+        }
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -650,6 +788,8 @@ mod tests {
             dropped_records: 3,
             gap_start_ns: 10,
             gap_end_ns: 20,
+            dropped_reliability: 0,
+            dropped_attribution: 0,
         };
 
         let mut occurrences = gap.into_batch(producer()).into_plane_b_occurrences();
@@ -713,12 +853,16 @@ mod tests {
             dropped_records: 2,
             gap_start_ns: 20,
             gap_end_ns: 30,
+            dropped_reliability: 0,
+            dropped_attribution: 0,
         };
         pending.merge(GapReport {
             cause: "retry_buffer_expired".into(),
             dropped_records: 3,
             gap_start_ns: 10,
             gap_end_ns: 40,
+            dropped_reliability: 0,
+            dropped_attribution: 0,
         });
 
         assert_eq!(pending.cause, "multiple");
@@ -1042,5 +1186,181 @@ mod tests {
         // The pacer bounds *recovery*, and must not tax ordinary delivery.
         let mut p = pacer(2 * 1024 * 1024, 20);
         assert_eq!(p.poll(0, 4 * 1024), Pace::Send);
+    }
+
+    // ── evidence-class-aware shedding (jalki #41) ───────────────────────────
+    //
+    // ADR-0009 contract 5: when a bounded buffer must drop, reliability
+    // evidence sheds before attribution evidence, and the producer encodes the
+    // order — that is this crate.
+
+    fn classed_record(observed_at_ns: u64, occurrence_type: &str) -> EvidenceRecord {
+        let mut r = record(observed_at_ns);
+        r.occurrence = Occurrence::new("jalki/test", occurrence_type);
+        r
+    }
+
+    fn exec(at: u64) -> EvidenceRecord {
+        classed_record(at, "kernel.process.exec")
+    }
+
+    fn chatter(at: u64) -> EvidenceRecord {
+        classed_record(at, "kernel.tcp.close")
+    }
+
+    fn classes_held(buffer: &RetryBuffer) -> (usize, usize) {
+        let mut reliability = 0;
+        let mut attribution = 0;
+        for b in &buffer.batches {
+            match b.class {
+                EvidenceClass::Reliability => reliability += b.batch.len(),
+                EvidenceClass::Attribution => attribution += b.batch.len(),
+            }
+        }
+        (reliability, attribution)
+    }
+
+    #[test]
+    fn classification_matches_vartios_importer() {
+        // These four lists are the contract with Importer.Jalki. If Vartio
+        // moves a type between them and this is not updated, jälki sheds
+        // evidence Vartio treats as attribution-critical and the only symptom
+        // is a chain that never forms.
+        for t in [
+            "kernel.process.exec",
+            "kernel.tcp.connect",
+            "kernel.file.open",
+            "kernel.file.open_attempt",
+        ] {
+            assert_eq!(EvidenceClass::of(t), EvidenceClass::Attribution, "{t}");
+        }
+        for t in ["kernel.tcp.close", "kernel.tcp.retransmit"] {
+            assert_eq!(EvidenceClass::of(t), EvidenceClass::Reliability, "{t}");
+        }
+        assert_eq!(
+            EvidenceClass::of("kernel.something.new"),
+            EvidenceClass::Attribution,
+            "an unclassified type must be kept, not silently shed"
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_is_split_so_shedding_can_be_precise() {
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        buffer.enqueue(
+            EvidenceBatch::new(producer(), vec![exec(1), chatter(2), chatter(3)]),
+            0,
+        );
+        assert_eq!(
+            buffer.len_batches(),
+            2,
+            "one batch in, one per class out — a mixed batch can only be shed \
+             as a unit, so without the split the order cannot be honoured"
+        );
+        assert_eq!(classes_held(&buffer), (2, 1));
+    }
+
+    #[test]
+    fn attribution_evidence_survives_while_any_telemetry_remains() {
+        // The acceptance property. Overflow by batch count, feeding execs first
+        // so a purely oldest-first policy would shed exactly the wrong ones.
+        let mut buffer = RetryBuffer::new(RetryBufferConfig {
+            max_batches: 4,
+            ..RetryBufferConfig::default()
+        });
+
+        for i in 0..4 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(i)]), 0);
+        }
+        for i in 0..8 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![chatter(100 + i)]), 0);
+        }
+
+        let (reliability, attribution) = classes_held(&buffer);
+        assert_eq!(
+            attribution, 4,
+            "every exec must still be held: they were the oldest, and oldest-first \
+             alone would have shed all four to make room for tcp.close chatter"
+        );
+        assert_eq!(reliability + attribution, 4, "the bound still holds");
+    }
+
+    #[test]
+    fn attribution_evidence_sheds_only_when_nothing_else_is_left() {
+        let mut buffer = RetryBuffer::new(RetryBufferConfig {
+            max_batches: 2,
+            ..RetryBufferConfig::default()
+        });
+        for i in 0..6 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(i)]), 0);
+        }
+        assert_eq!(
+            classes_held(&buffer),
+            (0, 2),
+            "with only attribution evidence held, the buffer still respects its \
+             bound — the order is a preference, not an exemption"
+        );
+    }
+
+    #[test]
+    fn every_shed_still_produces_a_gap_and_names_the_class() {
+        let mut buffer = RetryBuffer::new(RetryBufferConfig {
+            max_batches: 1,
+            ..RetryBufferConfig::default()
+        });
+        buffer.enqueue(
+            EvidenceBatch::new(producer(), vec![chatter(1), chatter(2)]),
+            0,
+        );
+        let gaps = buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(3)]), 0);
+
+        assert_eq!(gaps.len(), 1, "a shed is never silent");
+        let gap = &gaps[0];
+        assert_eq!(gap.cause, "retry_buffer_overflow");
+        assert_eq!(gap.dropped_records, 2);
+        assert_eq!(
+            (gap.dropped_reliability, gap.dropped_attribution),
+            (2, 0),
+            "\"we dropped 4,000 tcp.close events\" and \"we dropped 3 execs\" are \
+             the same byte count and completely different incidents"
+        );
+    }
+
+    #[test]
+    fn the_gap_occurrence_carries_the_class_split() {
+        let gap = GapReport {
+            cause: "retry_buffer_overflow".into(),
+            dropped_records: 7,
+            gap_start_ns: 1,
+            gap_end_ns: 9,
+            dropped_reliability: 5,
+            dropped_attribution: 2,
+        };
+        let batch = gap.into_batch(producer());
+        let labels = &batch.records[0].occurrence.labels;
+        assert_eq!(
+            labels.get("dropped_reliability").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            labels.get("dropped_attribution").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn delivery_order_stays_fifo_regardless_of_class() {
+        // Only the *shed* choice is class-aware. Reordering delivery would make
+        // a drain unreconstructible downstream, and #39/#40 both depend on
+        // head-of-line order.
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        buffer.enqueue(EvidenceBatch::new(producer(), vec![chatter(1)]), 0);
+        buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(2)]), 0);
+        assert_eq!(
+            buffer.front().map(|b| b.records[0].observed_at_ns),
+            Some(1),
+            "the oldest batch is delivered first even though it is the one that \
+             would be shed first"
+        );
     }
 }
