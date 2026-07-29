@@ -197,7 +197,9 @@ impl BtfData {
             .ok_or_else(|| CodegenError::BtfType("func type missing".into()))?;
 
         if func_type.kind != BTF_KIND_FUNC {
-            return Err(CodegenError::BtfType(format!("{function} is not a function")));
+            return Err(CodegenError::BtfType(format!(
+                "{function} is not a function"
+            )));
         }
 
         // Func points to a FuncProto.
@@ -243,8 +245,7 @@ impl BtfData {
         let mut total_offset: u32 = 0;
 
         for (i, part) in parts.iter().enumerate() {
-            let (member_type_id, member_offset) =
-                self.find_member_recursive(current_id, part)?;
+            let (member_type_id, member_offset) = self.find_member_recursive(current_id, part)?;
 
             total_offset += member_offset;
 
@@ -417,9 +418,24 @@ fn parse_types(data: &[u8]) -> Result<Vec<BtfTypeEntry>, CodegenError> {
     let mut offset = 0;
 
     while offset + 12 <= data.len() {
-        let name_off = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-        let info = u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
-        let size_or_type = u32::from_le_bytes([data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11]]);
+        let name_off = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        let info = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        let size_or_type = u32::from_le_bytes([
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+        ]);
 
         let kind = (info >> 24) & 0x1f;
         let vlen = info & 0xffff;
@@ -429,29 +445,52 @@ fn parse_types(data: &[u8]) -> Result<Vec<BtfTypeEntry>, CodegenError> {
         // Each BTF kind has a specific amount of extra data after the 12-byte header.
         // Getting this wrong misaligns all subsequent types.
         let extra = match kind {
-            0 => TypeExtra::None,                    // UNKN
-            BTF_KIND_INT => {                        // 1: +4 bytes
+            0 => TypeExtra::None, // UNKN
+            BTF_KIND_INT => {
+                // 1: +4 bytes
                 if offset + 4 > data.len() {
                     return Err(CodegenError::BtfType("truncated INT".into()));
                 }
-                let int_data = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+                let int_data = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
                 offset += 4;
                 TypeExtra::IntData(int_data)
             }
-            BTF_KIND_PTR => TypeExtra::None,         // 2: no extra
-            3 => {                                   // ARRAY: +12 bytes (3 x u32)
+            BTF_KIND_PTR => TypeExtra::None, // 2: no extra
+            3 => {
+                // ARRAY: +12 bytes (3 x u32)
                 offset += 12;
                 TypeExtra::None
             }
-            BTF_KIND_STRUCT | BTF_KIND_UNION => {    // 4, 5: +vlen*12 (members)
+            BTF_KIND_STRUCT | BTF_KIND_UNION => {
+                // 4, 5: +vlen*12 (members)
                 let mut members = Vec::with_capacity(vlen as usize);
                 for _ in 0..vlen {
                     if offset + 12 > data.len() {
                         return Err(CodegenError::BtfType("truncated member".into()));
                     }
-                    let mn = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-                    let mt = u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
-                    let mo = u32::from_le_bytes([data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11]]);
+                    let mn = u32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    let mt = u32::from_le_bytes([
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
+                    ]);
+                    let mo = u32::from_le_bytes([
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
+                    ]);
                     offset += 12;
                     members.push(BtfMember {
                         name_off: mn,
@@ -461,24 +500,36 @@ fn parse_types(data: &[u8]) -> Result<Vec<BtfTypeEntry>, CodegenError> {
                 }
                 TypeExtra::Members(members)
             }
-            BTF_KIND_ENUM => {                       // 6: +vlen*8 (name_off + val)
+            BTF_KIND_ENUM => {
+                // 6: +vlen*8 (name_off + val)
                 offset += vlen as usize * 8;
                 TypeExtra::None
             }
-            7 => TypeExtra::None,                    // FWD: no extra
-            BTF_KIND_TYPEDEF | BTF_KIND_VOLATILE
-            | BTF_KIND_CONST | BTF_KIND_RESTRICT => { // 8-11: no extra
+            7 => TypeExtra::None, // FWD: no extra
+            BTF_KIND_TYPEDEF | BTF_KIND_VOLATILE | BTF_KIND_CONST | BTF_KIND_RESTRICT => {
+                // 8-11: no extra
                 TypeExtra::None
             }
-            BTF_KIND_FUNC => TypeExtra::None,        // 12: no extra
-            BTF_KIND_FUNC_PROTO => {                 // 13: +vlen*8 (params)
+            BTF_KIND_FUNC => TypeExtra::None, // 12: no extra
+            BTF_KIND_FUNC_PROTO => {
+                // 13: +vlen*8 (params)
                 let mut params = Vec::with_capacity(vlen as usize);
                 for _ in 0..vlen {
                     if offset + 8 > data.len() {
                         return Err(CodegenError::BtfType("truncated param".into()));
                     }
-                    let pn = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-                    let pt = u32::from_le_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+                    let pn = u32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]);
+                    let pt = u32::from_le_bytes([
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
+                    ]);
                     offset += 8;
                     params.push(BtfParam {
                         name_off: pn,
@@ -487,25 +538,29 @@ fn parse_types(data: &[u8]) -> Result<Vec<BtfTypeEntry>, CodegenError> {
                 }
                 TypeExtra::Params(params)
             }
-            14 => {                                  // VAR: +4 bytes
+            14 => {
+                // VAR: +4 bytes
                 offset += 4;
                 TypeExtra::None
             }
-            15 => {                                  // DATASEC: +vlen*12
+            15 => {
+                // DATASEC: +vlen*12
                 offset += vlen as usize * 12;
                 TypeExtra::None
             }
-            16 => TypeExtra::None,                   // FLOAT: no extra
-            17 => {                                  // DECL_TAG: +4 bytes
+            16 => TypeExtra::None, // FLOAT: no extra
+            17 => {
+                // DECL_TAG: +4 bytes
                 offset += 4;
                 TypeExtra::None
             }
-            18 => TypeExtra::None,                   // TYPE_TAG: no extra
-            BTF_KIND_ENUM64 => {                     // 19: +vlen*12
+            18 => TypeExtra::None, // TYPE_TAG: no extra
+            BTF_KIND_ENUM64 => {
+                // 19: +vlen*12
                 offset += vlen as usize * 12;
                 TypeExtra::None
             }
-            _ => TypeExtra::None,                    // Unknown future kinds — no extra (best effort)
+            _ => TypeExtra::None, // Unknown future kinds — no extra (best effort)
         };
 
         types.push(BtfTypeEntry {
@@ -614,7 +669,9 @@ mod tests {
             None => return,
         };
 
-        let sig = btf.resolve_function("inet_csk_accept").expect("should exist");
+        let sig = btf
+            .resolve_function("inet_csk_accept")
+            .expect("should exist");
         assert!(!sig.params.is_empty());
     }
 

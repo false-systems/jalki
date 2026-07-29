@@ -252,8 +252,14 @@ mod tests {
     #[test]
     fn push_and_query() {
         let store = EventStore::new(100);
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 8080, 1234, "nginx"));
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.3", 5432, 1234, "nginx"));
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 8080, 1234, "nginx"),
+        );
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.3", 5432, 1234, "nginx"),
+        );
 
         let results = store.query("tcp_connect", &EventFilter::default());
         assert_eq!(results.len(), 2);
@@ -262,9 +268,18 @@ mod tests {
     #[test]
     fn filter_by_dst_port() {
         let store = EventStore::new(100);
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 8080, 1, "a"));
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 5432, 2, "b"));
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 5432, 3, "c"));
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 8080, 1, "a"),
+        );
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 5432, 2, "b"),
+        );
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 5432, 3, "c"),
+        );
 
         let results = store.query(
             "tcp_connect",
@@ -279,8 +294,14 @@ mod tests {
     #[test]
     fn filter_by_pid() {
         let store = EventStore::new(100);
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 80, 100, "nginx"));
-        store.push("tcp_connect", make_occ("10.0.0.1", "10.0.0.2", 80, 200, "curl"));
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 80, 100, "nginx"),
+        );
+        store.push(
+            "tcp_connect",
+            make_occ("10.0.0.1", "10.0.0.2", 80, 200, "curl"),
+        );
 
         let results = store.query(
             "tcp_connect",
@@ -303,7 +324,10 @@ mod tests {
         let results = store.query("p", &EventFilter::default());
         assert_eq!(results.len(), 3);
         // Oldest should be pid=2 (pid=1 was evicted).
-        let pids: Vec<u32> = results.iter().map(|o| o.process_data.as_ref().unwrap().pid).collect();
+        let pids: Vec<u32> = results
+            .iter()
+            .map(|o| o.process_data.as_ref().unwrap().pid)
+            .collect();
         assert_eq!(pids, vec![2, 3, 4]);
     }
 

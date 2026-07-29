@@ -57,9 +57,7 @@ fn build_ebpf(release: bool) -> Result<()> {
         cmd.arg("--release");
     }
 
-    let status = cmd
-        .status()
-        .context("failed to run cargo build for eBPF")?;
+    let status = cmd.status().context("failed to run cargo build for eBPF")?;
     if !status.success() {
         bail!("eBPF build failed");
     }

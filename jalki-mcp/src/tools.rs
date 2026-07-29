@@ -254,7 +254,10 @@ impl JalkiState {
 
         let fields = EventFields {
             ret: args.get("ret").and_then(|v| v.as_i64()).map(|v| v as i32),
-            tcp_state: args.get("tcp_state").and_then(|v| v.as_u64()).map(|v| v as u8),
+            tcp_state: args
+                .get("tcp_state")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u8),
         };
 
         let interpretations = self.kb.explain(function, &fields);

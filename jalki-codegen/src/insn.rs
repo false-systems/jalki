@@ -263,7 +263,10 @@ mod tests {
         let bytes = insn.to_bytes();
         // code = BPF_JMP | BPF_CALL = 0x05 | 0x80 = 0x85
         assert_eq!(bytes[0], 0x85);
-        assert_eq!(i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 14);
+        assert_eq!(
+            i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            14
+        );
     }
 
     #[test]

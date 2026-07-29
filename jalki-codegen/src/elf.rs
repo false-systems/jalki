@@ -6,7 +6,9 @@
 /// - License section ("GPL")
 /// - Relocations for map FD references
 use object::write::{Object, Symbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+use object::{
+    Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+};
 
 use crate::error::CodegenError;
 use crate::insn::{encode, BpfInsn};
@@ -113,11 +115,7 @@ pub fn generate_elf(
     });
 
     // === License section ===
-    let license_section = obj.add_section(
-        Vec::new(),
-        b"license".to_vec(),
-        SectionKind::Data,
-    );
+    let license_section = obj.add_section(Vec::new(), b"license".to_vec(), SectionKind::Data);
     obj.set_section_data(license_section, b"GPL\0", 1);
 
     // === Program section ===
@@ -172,7 +170,8 @@ pub fn generate_elf(
     }
 
     // === Write ELF ===
-    obj.write().map_err(|e| CodegenError::Elf(format!("write ELF: {e}")))
+    obj.write()
+        .map_err(|e| CodegenError::Elf(format!("write ELF: {e}")))
 }
 
 #[cfg(test)]

@@ -62,7 +62,9 @@ impl Probe for FileOpenAttempt {
     }
 
     fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
-        Ok(KernelEvent::FileOpenAttempt(FileOpenEvent::from_bytes(raw)?))
+        Ok(KernelEvent::FileOpenAttempt(FileOpenEvent::from_bytes(
+            raw,
+        )?))
     }
 }
 

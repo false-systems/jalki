@@ -9,10 +9,7 @@ pub enum CodegenError {
     StructNotFound(String),
 
     #[error("field '{field}' not found in struct '{struct_name}'")]
-    FieldNotFound {
-        struct_name: String,
-        field: String,
-    },
+    FieldNotFound { struct_name: String, field: String },
 
     #[error("BTF type error: {0}")]
     BtfType(String),

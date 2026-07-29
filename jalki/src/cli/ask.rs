@@ -84,16 +84,16 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
 
     let ask_params = Value::Map(vec![
         (msgpack_str("question"), msgpack_str(question)),
-        (msgpack_str("collect_seconds"), Value::Integer(collect_seconds.into())),
+        (
+            msgpack_str("collect_seconds"),
+            Value::Integer(collect_seconds.into()),
+        ),
         (msgpack_str("max_events"), Value::Integer(100.into())),
     ]);
     let resp = ipc::call_native(METHOD_ASK, ask_params).await?;
 
     if !resp.ok {
-        eprintln!(
-            "Failed: {}",
-            resp.error.unwrap_or_default()
-        );
+        eprintln!("Failed: {}", resp.error.unwrap_or_default());
         return Ok(());
     }
 
@@ -134,7 +134,10 @@ pub async fn run(question: &str, collect_seconds: u64) -> Result<()> {
     // Print summary header.
     println!("# Question: {}", question);
     println!();
-    println!("## Events observed ({} total in {}s)", total, collect_seconds);
+    println!(
+        "## Events observed ({} total in {}s)",
+        total, collect_seconds
+    );
     println!();
 
     for (source, events) in &by_source {
@@ -210,11 +213,7 @@ fn print_kb_answer(
         println!("{}", probe.use_when);
         println!();
 
-        let important_fields: Vec<_> = probe
-            .fields
-            .iter()
-            .filter(|f| f.important)
-            .collect();
+        let important_fields: Vec<_> = probe.fields.iter().filter(|f| f.important).collect();
         if !important_fields.is_empty() {
             println!("Key fields:");
             for f in &important_fields {
@@ -231,7 +230,10 @@ fn print_kb_answer(
         if !probe.interpretations.is_empty() {
             println!("What to look for:");
             for interp in &probe.interpretations {
-                println!("  [{}] {} → {}", interp.severity, interp.pattern, interp.conclusion);
+                println!(
+                    "  [{}] {} → {}",
+                    interp.severity, interp.pattern, interp.conclusion
+                );
                 println!("    Action: {}", interp.action);
             }
             println!();

@@ -106,7 +106,9 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                     size: 16,
                     field_type: FieldType::U8, // byte array, not a scalar
                 });
-                field_reads.push(FieldRead::Comm { event_offset: offset });
+                field_reads.push(FieldRead::Comm {
+                    event_offset: offset,
+                });
                 offset += 16;
             }
             "ret" => {
@@ -256,7 +258,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
     // if r0 != NULL, this is our own PID — exit
     insns.push(jne_imm(R0, 0, 2)); // skip 2 insns to exit
     insns.push(ja(1)); // jump over the exit
-    // exit path:
+                       // exit path:
     insns.push(mov64_imm(R0, 0));
     // We need a jump target. Let me restructure:
     // Actually, simpler:
@@ -346,7 +348,11 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                 // For fexit: ret is ctx->args[n_params]
                 let ctx_off = (*arg_index as i16) * 8;
                 insns.push(ldx_dw(R1, R7, ctx_off));
-                insns.push(stx_w(R10, R1, (event_base_off + *event_offset as i32) as i16));
+                insns.push(stx_w(
+                    R10,
+                    R1,
+                    (event_base_off + *event_offset as i32) as i16,
+                ));
             }
             FieldRead::DirectArg {
                 event_offset,
@@ -356,10 +362,26 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                 let ctx_off = (*arg_index as i16) * 8;
                 insns.push(ldx_dw(R1, R7, ctx_off));
                 match size {
-                    8 => insns.push(stx_dw(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    4 => insns.push(stx_w(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    2 => insns.push(stx_h(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    1 => insns.push(stx_b(R10, R1, (event_base_off + *event_offset as i32) as i16)),
+                    8 => insns.push(stx_dw(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    4 => insns.push(stx_w(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    2 => insns.push(stx_h(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    1 => insns.push(stx_b(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
                     _ => return Err(CodegenError::UnsupportedType(format!("{size}-byte direct"))),
                 }
             }
@@ -415,7 +437,10 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
         });
     }
 
-    let map_name = format!("{}_EVENTS", spec.function.to_uppercase().replace("_SKB", ""));
+    let map_name = format!(
+        "{}_EVENTS",
+        spec.function.to_uppercase().replace("_SKB", "")
+    );
 
     Ok(GeneratedProgram {
         instructions: insns,
@@ -485,7 +510,7 @@ mod tests {
         assert_eq!(program.relocations.len(), 2);
         // Field layout should include header + requested fields.
         assert!(program.field_layout.len() >= 6); // timestamp, pid, tid, + requested
-        // Event size should be > 0 and aligned to 8.
+                                                  // Event size should be > 0 and aligned to 8.
         assert!(program.event_size > 0);
         assert_eq!(program.event_size % 8, 0);
     }
