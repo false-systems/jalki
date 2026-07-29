@@ -158,6 +158,57 @@ pub struct EvidenceRecord {
     pub binding: Option<RuntimeBinding>,
 }
 
+/// Which evidence a bounded buffer gives up first (vartio ADR-0009 contract 5).
+///
+/// Ordering is the contract: `Reliability < Attribution`, so "shed the smallest
+/// class still present" is the whole policy.
+///
+/// **This mirrors Vartio's `Importer.Jalki` mapping** (`@attribution_types` /
+/// `@reliability_types`) and is deliberately a second copy, because the shed
+/// decision happens in this process, long before anything reaches Vartio —
+/// contract 5 says the producer encodes the order, and the producer is here.
+/// The duplication is a drift risk with teeth: if Vartio promotes a type to
+/// attribution and jälki still calls it reliability, jälki will quietly shed
+/// evidence Vartio considers attribution-critical, and the only symptom is a
+/// chain that never forms. Same coordination rule as
+/// `VARTIO_SUPPORTED_TYPES` — change Vartio first, then here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EvidenceClass {
+    /// Telemetry about how connections behaved. Useful, reconstructible,
+    /// and the first thing to go under scarcity.
+    Reliability,
+    /// What attribution chains are built from. An exec that never arrives is
+    /// an actor that cannot be identified, and no later evidence recovers it.
+    Attribution,
+}
+
+impl EvidenceClass {
+    /// Unknown types classify as `Attribution`. Failing safe matters more than
+    /// being right: a new probe whose type nobody has classified yet should be
+    /// kept rather than silently shed.
+    pub fn of(occurrence_type: &str) -> Self {
+        match occurrence_type {
+            "kernel.tcp.close" | "kernel.tcp.retransmit" => Self::Reliability,
+            _ => Self::Attribution,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reliability => "reliability",
+            Self::Attribution => "attribution",
+        }
+    }
+}
+
+impl EvidenceRecord {
+    /// Derived from the occurrence type rather than stored, so it cannot go
+    /// stale relative to the record it describes.
+    pub fn evidence_class(&self) -> EvidenceClass {
+        EvidenceClass::of(self.occurrence.occurrence_type.as_str())
+    }
+}
+
 impl EvidenceRecord {
     pub fn with_runtime_binding(mut self, binding: RuntimeBinding) -> Self {
         self.binding = Some(binding);

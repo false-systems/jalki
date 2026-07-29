@@ -18,13 +18,13 @@ pub use event::{
     TcpRetransmitEvent, TcpState,
 };
 pub use evidence::{
-    BindingProvenance, EvidenceBatch, EvidenceRecord, HookKind, NormalizedEvidence, ProbeMetadata,
-    ProducerMetadata, RuntimeBinding, UnboundReason,
+    BindingProvenance, EvidenceBatch, EvidenceClass, EvidenceRecord, HookKind, NormalizedEvidence,
+    ProbeMetadata, ProducerMetadata, RuntimeBinding, UnboundReason,
 };
 pub use normalize::errno_name;
 pub use retry::{
-    DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff, RetryBackoffConfig, RetryBuffer,
-    RetryBufferConfig,
+    gap_for_batch, DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff, RetryBackoffConfig,
+    RetryBuffer, RetryBufferConfig,
 };
 pub use sink::{
     AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, PipelineClient,
