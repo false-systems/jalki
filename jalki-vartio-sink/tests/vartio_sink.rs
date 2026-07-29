@@ -3,13 +3,14 @@
 //! fail-fast identity, the Plane-B boundary, and the ADR-0004 config surface
 //! (bearer auth + native payload shape).
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jalki_evidence::{
-    BindingProvenance, EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind, KernelEvent,
-    ProbeMetadata, ProducerMetadata, RetryBuffer, RuntimeBinding, SinkError, TcpConnectEvent,
-    UnboundReason,
+    AppendResult, BindingProvenance, EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind,
+    KernelEvent, ProbeMetadata, ProducerMetadata, RetryBuffer, RuntimeBinding, SinkError,
+    TcpConnectEvent, UnboundReason,
 };
 use jalki_vartio_sink::proto::source_ingress_server::{SourceIngress, SourceIngressServer};
 use jalki_vartio_sink::proto::{
@@ -80,6 +81,34 @@ struct ReceiverHandle {
 }
 
 async fn spawn_receiver(retryable: bool, duplicates: u32, rejected: u32) -> ReceiverHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_receiver(listener, retryable, duplicates, rejected)
+}
+
+/// Reserve an ephemeral port and release it, yielding an address nothing is
+/// listening on — a sink's target that is *down*, without waiting on a timeout.
+async fn reserved_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+/// Bring a receiver up on a previously reserved address — used to let a sink
+/// meet its target *after* it has already failed against it.
+async fn spawn_receiver_at(addr: SocketAddr, retryable: bool) -> ReceiverHandle {
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("reserved port is free to rebind");
+    serve_receiver(listener, retryable, 0, 0)
+}
+
+fn serve_receiver(
+    listener: TcpListener,
+    retryable: bool,
+    duplicates: u32,
+    rejected: u32,
+) -> ReceiverHandle {
     let received = Arc::new(Mutex::new(Vec::new()));
     let auth_headers = Arc::new(Mutex::new(Vec::new()));
     let receiver = TestReceiver {
@@ -89,7 +118,6 @@ async fn spawn_receiver(retryable: bool, duplicates: u32, rejected: u32) -> Rece
         duplicates,
         rejected,
     };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
@@ -105,14 +133,13 @@ async fn spawn_receiver(retryable: bool, duplicates: u32, rejected: u32) -> Rece
     }
 }
 
+/// Connect is lazy (jalki #38), so this no longer has to poll until the test
+/// receiver is up — construction cannot fail on a reachable-or-not endpoint,
+/// only on a malformed one.
 async fn connect_cfg(cfg: VartioSinkConfig) -> VartioSink {
-    for _ in 0..40 {
-        if let Ok(s) = VartioSink::connect(cfg.clone()).await {
-            return s;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("could not connect to test receiver");
+    VartioSink::connect(cfg)
+        .await
+        .expect("construction must succeed for a well-formed endpoint")
 }
 
 async fn connect(endpoint: String) -> VartioSink {
@@ -491,5 +518,120 @@ async fn permanent_rejects_fail_the_batch_as_partial_failure() {
             );
         }
         other => panic!("expected PartialFailure, got {other:?}"),
+    }
+}
+
+// ── jalki #38: a sink that is down at *startup* is a value, not a crash ──────
+//
+// Mid-run outages were always graceful (retryable error → RetryBuffer). Startup
+// was not: one eager dial, and its failure propagated to a process exit, so any
+// restart during a Vartio outage — OOM, drain, rollout — became a crash loop
+// with kubelet backoff as the only retry. These pin the two paths together.
+
+/// A config aimed at an address with no listener. The short timeout means a
+/// genuine hang fails the test rather than stalling it; a refused connection
+/// returns immediately anyway.
+fn down_cfg(addr: SocketAddr) -> VartioSinkConfig {
+    let mut cfg = VartioSinkConfig::new(format!("http://{addr}"), "jalki-adapter-1");
+    cfg.timeout = Duration::from_secs(2);
+    cfg
+}
+
+/// What the runtime sink loop does with a retryable error, condensed: hold the
+/// batch and re-offer it until the sink takes it.
+async fn retry_until_delivered(sink: &VartioSink, batch: EvidenceBatch) -> AppendResult {
+    for _ in 0..40 {
+        match sink.append_batch(batch.clone()).await {
+            Ok(result) => return result,
+            Err(err) => {
+                assert!(
+                    RetryBuffer::should_retry(&err),
+                    "a returning sink must never produce a terminal error: {err:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("sink never recovered after the receiver came back");
+}
+
+#[tokio::test]
+async fn construction_succeeds_while_the_sink_is_down() {
+    let addr = reserved_addr().await;
+    let result = VartioSink::connect(down_cfg(addr)).await;
+    assert!(
+        result.is_ok(),
+        "startup must survive a sink outage, got {:?}",
+        result.err()
+    );
+}
+
+#[tokio::test]
+async fn a_sink_that_has_never_connected_does_not_claim_health() {
+    let addr = reserved_addr().await;
+    let sink = VartioSink::connect(down_cfg(addr)).await.unwrap();
+    assert!(
+        !sink.health().await.is_healthy(),
+        "lazy connect proves nothing at construction, so health must not claim it does"
+    );
+}
+
+#[tokio::test]
+async fn first_append_against_a_down_sink_is_retryable_not_terminal() {
+    let addr = reserved_addr().await;
+    let sink = VartioSink::connect(down_cfg(addr)).await.unwrap();
+
+    let err = sink
+        .append_batch(EvidenceBatch::new(producer(), vec![bound_record()]))
+        .await
+        .unwrap_err();
+    assert!(
+        RetryBuffer::should_retry(&err),
+        "a startup outage must reach the retry buffer, not drop the batch: {err:?}"
+    );
+}
+
+/// The acceptance criterion: start with the sink down, hold the evidence, and
+/// deliver it when the sink returns.
+#[tokio::test]
+async fn evidence_survives_a_startup_outage_and_lands_when_vartio_returns() {
+    let addr = reserved_addr().await;
+    let sink = VartioSink::connect(down_cfg(addr)).await.unwrap();
+    let batch = EvidenceBatch::new(producer(), vec![bound_record()]);
+
+    let err = sink.append_batch(batch.clone()).await.unwrap_err();
+    assert!(
+        RetryBuffer::should_retry(&err),
+        "expected the batch to be held, got {err:?}"
+    );
+
+    // Vartio comes back at the address jälki was already pointed at.
+    let rx = spawn_receiver_at(addr, false).await;
+
+    let result = retry_until_delivered(&sink, batch).await;
+    assert_eq!(result.accepted_count, 1, "the held batch is delivered");
+    assert!(
+        sink.health().await.is_healthy(),
+        "a settled batch is what earns the healthy claim"
+    );
+    assert_eq!(
+        rx.received.lock().unwrap().len(),
+        1,
+        "delivered exactly once"
+    );
+}
+
+#[tokio::test]
+async fn misconfiguration_still_fails_fast() {
+    for (label, endpoint) in [("empty", ""), ("unparseable", "not a uri at all")] {
+        let result = VartioSink::connect(VartioSinkConfig::new(endpoint, "jalki-adapter-1")).await;
+        match result {
+            Err(SinkError::Misconfigured { .. }) => {}
+            Err(other) => panic!(
+                "{label} endpoint: no retry fixes a bad endpoint, so it must be \
+                 Misconfigured — got {other:?}"
+            ),
+            Ok(_) => panic!("{label} endpoint must be refused at construction"),
+        }
     }
 }

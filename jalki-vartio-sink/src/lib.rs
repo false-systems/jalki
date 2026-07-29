@@ -26,6 +26,11 @@
 //! - **bounded-and-lossy is the caller's policy** (ADR-0003 §D3): this sink
 //!   classifies errors as retryable/terminal; the retry budget and the visible
 //!   drop live in the runtime sink loop, not here.
+//! - **lazy connect** (jalki #38): [`VartioSink::connect`] never
+//!   dials, so a sink that is down at startup is indistinguishable from one
+//!   that goes down mid-run — both surface as a retryable error on the first
+//!   `append_batch` and neither can exit the daemon. Only misconfiguration
+//!   fails fast.
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -153,6 +158,27 @@ pub struct VartioSink {
 }
 
 impl VartioSink {
+    /// Build the sink. **Lazy by design** (jalki #38): the channel is created
+    /// without a wire round-trip, so a Vartio outage at startup is a *value*
+    /// the retry path already handles — never a process exit.
+    ///
+    /// Before this, a single eager `Endpoint::connect()` here returned
+    /// `Unavailable`, which `main` propagated to `main() -> Result` and hence a
+    /// non-zero exit — so any restart while Vartio was down (OOM, drain,
+    /// rollout) became a crash loop, with kubelet backoff as the only retry.
+    /// An outage *mid-run* was already graceful: `classify_status` marks the
+    /// failure retryable and the runtime's `RetryBuffer` holds the batch. That
+    /// asymmetry was the bug; lazy connect makes startup and mid-run one path.
+    /// (Vartio ADR-0009 contract 2: a dependency outage is a value, not a
+    /// crash.)
+    ///
+    /// True misconfiguration still fails fast, because no amount of retrying
+    /// fixes an empty or unparseable endpoint.
+    ///
+    /// Stays `async` although nothing awaits: this is the documented seam for
+    /// mTLS, whose cert loading will await, and the signature is load-bearing
+    /// for callers.
+    #[allow(clippy::unused_async)]
     pub async fn connect(cfg: VartioSinkConfig) -> Result<Self, SinkError> {
         cfg.validate()?;
         let channel = Endpoint::try_from(cfg.endpoint.clone())
@@ -161,16 +187,21 @@ impl VartioSink {
                 message: format!("invalid endpoint {}: {e}", cfg.endpoint),
             })?
             .timeout(cfg.timeout)
-            .connect()
-            .await
-            .map_err(|e| SinkError::Unavailable {
-                sink: SINK_NAME.to_string(),
-                message: e.to_string(),
-            })?;
+            .connect_lazy();
         Ok(Self {
             client: SourceIngressClient::new(channel),
             cfg,
-            health: Mutex::new(HealthStatus::Healthy),
+            // Not `Healthy`: eager connect used to *prove* the lane worked
+            // before this returned, and that proof is what justified the claim.
+            // Lazy connect removes the proof, so the claim goes with it —
+            // reporting Healthy here would mean a jälki whose Vartio has been
+            // down since boot advertises a working lane until the first batch
+            // (ADR-0009 contract 6). `Degraded`, not `Unhealthy`: nothing is
+            // known to be broken, we just have not shown it works yet. The
+            // first settled batch sets `Healthy`.
+            health: Mutex::new(HealthStatus::Degraded {
+                reason: "sink not yet exercised: no batch delivered".to_string(),
+            }),
         })
     }
 
