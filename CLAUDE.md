@@ -57,7 +57,7 @@ kernel fn returns → #[fexit]/#[fentry] eBPF program (jalki-ebpf)
   → Runtime sink loop wraps in EvidenceBatch → EvidenceSink::append_batch  (jalki/src/runtime.rs)
 ```
 
-- `Runtime` (builder) assembles the daemon: load eBPF + attach via BTF (`loader.rs`), spawn one `Reader` per probe, build `DaemonHandle`, serve IPC, run the sink loop + Prometheus on `:9090`.
+- `Runtime` (builder) assembles the daemon: load eBPF + attach via BTF (`loader.rs`), spawn one `Reader` per probe, build `DaemonHandle`, serve IPC, run the sink loop + the observability server on `:9090` (`/metrics`, `/healthz`, `/readyz`).
 - `DaemonHandle::deploy_probe` is the runtime-attach path: precompiled probes take a fast path; otherwise `jalki-codegen` generates BPF bytecode from BTF and attaches it as a `GeneratedProbeReader`.
 - **Self-filter**: jälki's own PID is inserted into the `PID_FILTER` BPF map *before* attach, so its own syscalls never enter the ring buffers.
 - The map name ↔ probe binding is declarative (`Probe::ring_buffer_map()`), so the loader/reader are probe-agnostic — adding a probe needs no loader change.

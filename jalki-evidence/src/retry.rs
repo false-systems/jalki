@@ -334,6 +334,18 @@ impl RetryBuffer {
         gaps
     }
 
+    /// How long the oldest queued batch has been waiting, or `None` when the
+    /// buffer is empty.
+    ///
+    /// Depth alone does not say how bad an outage is: a hundred batches queued
+    /// a second ago is a blip, one batch queued twenty minutes ago is a sink
+    /// that is gone. Age is what readiness and alerting key off (jalki #42).
+    pub fn oldest_age_ms(&self, now_ms: u64) -> Option<u64> {
+        self.batches
+            .front()
+            .map(|b| now_ms.saturating_sub(b.enqueued_at_ms))
+    }
+
     pub fn front(&self) -> Option<&EvidenceBatch> {
         self.batches.front().map(|b| &b.batch)
     }

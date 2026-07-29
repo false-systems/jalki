@@ -77,6 +77,17 @@ pub struct Metrics {
     pub unbound_dropped_total: Family<UnboundDropLabel, Counter>,
     pub binding_cache_entries: Gauge,
     pub binding_cache_hit_ratio: Gauge<f64, AtomicU64>,
+    /// Retry-buffer depth and age (jalki #42). Before these, buffer state was
+    /// visible only in log lines, so "is this agent holding evidence it cannot
+    /// deliver?" was not a question Prometheus could answer or alert on — and
+    /// during the Jul 28-29 incident the only failure signal jälki gave was
+    /// process exit.
+    pub retry_queued_batches: Gauge,
+    pub retry_queued_records: Gauge,
+    pub retry_queued_bytes: Gauge,
+    /// Age of the oldest queued batch. The one to alert on: depth says how much
+    /// is waiting, age says whether anything is moving.
+    pub retry_oldest_age_seconds: Gauge<f64, AtomicU64>,
 }
 
 impl Metrics {
@@ -132,6 +143,35 @@ impl Metrics {
             binding_cache_hit_ratio.clone(),
         );
 
+        let retry_queued_batches = Gauge::default();
+        registry.register(
+            "jalki_retry_queued_batches",
+            "Evidence batches held in the retry buffer awaiting delivery",
+            retry_queued_batches.clone(),
+        );
+
+        let retry_queued_records = Gauge::default();
+        registry.register(
+            "jalki_retry_queued_records",
+            "Evidence records held in the retry buffer awaiting delivery",
+            retry_queued_records.clone(),
+        );
+
+        let retry_queued_bytes = Gauge::default();
+        registry.register(
+            "jalki_retry_queued_bytes",
+            "Approximate bytes held in the retry buffer (the bound that keeps a \
+             sink outage from OOMing the agent)",
+            retry_queued_bytes.clone(),
+        );
+
+        let retry_oldest_age_seconds = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "jalki_retry_oldest_age_seconds",
+            "Age of the oldest batch in the retry buffer; 0 when empty",
+            retry_oldest_age_seconds.clone(),
+        );
+
         Self {
             registry,
             events_total,
@@ -141,6 +181,10 @@ impl Metrics {
             unbound_dropped_total,
             binding_cache_entries,
             binding_cache_hit_ratio,
+            retry_queued_batches,
+            retry_queued_records,
+            retry_queued_bytes,
+            retry_oldest_age_seconds,
         }
     }
 

@@ -72,7 +72,7 @@ The kernel knew the answer all along. 35 retransmits in ESTABLISHED state on the
    │  probes     → raw bytes → FALSE Protocol JSON   │
    │  sinks      → stdout / file / composite         │
    │  IPC server → /run/jalki/jalki.sock             │
-   │  metrics    → Prometheus :9090                  │
+   │  metrics    → :9090 /metrics /healthz /readyz    │
    └────────────────────┬───────────────────────────┘
                         │
    ┌────────────────────▼───────────────────────────┐
