@@ -1869,11 +1869,16 @@ mod tests {
     /// it still passes, because the fresh evidence lands while the loop is at a
     /// select decision point rather than inside a flush, and `select!` then
     /// picks the channel branch immediately regardless of how long a flush
-    /// would have run. Making it deterministic needs the send to land
-    /// mid-flush, which there is no cheap hook for.
+    /// would have run.
     ///
-    /// What it does hold: a drain under a slow sink delivers the backlog *and*
-    /// everything that arrived during it, losing nothing.
+    /// The property is proved instead by
+    /// `one_flush_returns_while_the_backlog_still_has_work`, which tests the
+    /// mechanism rather than the symptom: a flush that hands back control with
+    /// work outstanding is *why* the loop can yield, and that is directly
+    /// observable with no scheduler races involved (#53).
+    ///
+    /// What this one holds on its own: a drain under a slow sink delivers the
+    /// backlog *and* everything that arrived during it, losing nothing.
     #[tokio::test(start_paused = true)]
     async fn a_slow_drain_loses_neither_the_backlog_nor_what_arrives_during_it() {
         let h = spawn_loop_full(
@@ -1925,5 +1930,133 @@ mod tests {
 
         drop(h.tx);
         let _ = h.handle.await;
+    }
+
+    // ── the drain yields (jalki #53) ────────────────────────────────────────
+
+    /// A drain must hand the loop back before the buffer is empty, so
+    /// `rx.recv()` gets polled and the channel does not fill — otherwise jälki
+    /// drops *fresh* evidence to pay for delivering old evidence.
+    ///
+    /// #40 tried to prove this at the loop level and could not: the fresh
+    /// evidence lands while the loop sits at a `select!` decision point rather
+    /// than inside a flush, so `select!` takes the channel branch immediately
+    /// whether or not a flush would have run long. Three framings all passed
+    /// against an unpaced build (issue #53).
+    ///
+    /// This tests the mechanism instead of the symptom. "The flush returns
+    /// while work remains" is the whole reason the loop can yield, and it is
+    /// directly observable — no scheduler races involved. The loop-level
+    /// consequence follows structurally: a flush that returns means another
+    /// `select!` iteration, and `select!` polls `rx`.
+    #[tokio::test(start_paused = true)]
+    async fn one_flush_returns_while_the_backlog_still_has_work() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let metrics = Arc::new(Metrics::new());
+        let sink = ControlledSink {
+            up: Arc::new(AtomicBool::new(true)),
+            overloaded: Arc::new(AtomicBool::new(false)),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            delivered: Arc::new(StdMutex::new(Vec::new())),
+            append_cost: Duration::ZERO,
+        };
+        let attempts = sink.attempts.clone();
+
+        let mut retry_buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut pending_gaps = PendingGaps::default();
+        for _ in 0..200 {
+            retry_buffer.enqueue(EvidenceBatch::new(producer.clone(), one_record()), 0);
+        }
+        let queued_before = retry_buffer.len_batches();
+        assert!(queued_before >= 200, "precondition: a real backlog");
+
+        // 5 batches/second, so one second of burst is 5 batches.
+        let mut pacer = DrainPacer::new(DrainPaceConfig {
+            max_bytes_per_sec: u64::MAX / 4,
+            max_batches_per_sec: 5,
+            ..DrainPaceConfig::default()
+        });
+
+        let outcome = flush_retry_buffer(
+            &sink,
+            &mut retry_buffer,
+            &mut pending_gaps,
+            &metrics,
+            &producer,
+            &mut pacer,
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DrainOutcome::Paced { .. }),
+            "the flush must hand back control with work outstanding, got {outcome:?}"
+        );
+        assert!(
+            !retry_buffer.is_empty(),
+            "an unpaced flush drains to empty in one call and never yields —              that is the bug this pins"
+        );
+        let sent = attempts.load(Ordering::SeqCst);
+        assert!(
+            sent <= 6,
+            "one slice is one second of budget, not the whole backlog: sent {sent} of {queued_before}"
+        );
+        assert!(sent > 0, "but it must make progress, or the drain stalls");
+    }
+
+    /// And the slices compose: repeated flushes still finish the backlog.
+    /// Bounding each call is only correct if the total still converges.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_slices_still_finish_the_backlog() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let metrics = Arc::new(Metrics::new());
+        let sink = ControlledSink {
+            up: Arc::new(AtomicBool::new(true)),
+            overloaded: Arc::new(AtomicBool::new(false)),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            delivered: Arc::new(StdMutex::new(Vec::new())),
+            append_cost: Duration::ZERO,
+        };
+        let delivered = sink.delivered.clone();
+
+        let mut retry_buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut pending_gaps = PendingGaps::default();
+        for _ in 0..40 {
+            retry_buffer.enqueue(EvidenceBatch::new(producer.clone(), one_record()), 0);
+        }
+        let mut pacer = DrainPacer::new(DrainPaceConfig {
+            max_bytes_per_sec: u64::MAX / 4,
+            max_batches_per_sec: 5,
+            ..DrainPaceConfig::default()
+        });
+
+        let mut now_ms = 0;
+        let mut slices = 0;
+        while !retry_buffer.is_empty() && slices < 100 {
+            if let DrainOutcome::Paced { wait_ms } = flush_retry_buffer(
+                &sink,
+                &mut retry_buffer,
+                &mut pending_gaps,
+                &metrics,
+                &producer,
+                &mut pacer,
+                now_ms,
+            )
+            .await
+            {
+                now_ms += wait_ms;
+            }
+            slices += 1;
+        }
+
+        assert!(
+            retry_buffer.is_empty(),
+            "the backlog drains, just not at once"
+        );
+        assert!(
+            slices > 1,
+            "if one slice emptied it, the bound is not doing anything"
+        );
+        assert_eq!(delivered.lock().unwrap().len(), 40, "and nothing is lost");
     }
 }
