@@ -2,14 +2,15 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
-    EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport, HookKind, ProbeMetadata,
-    ProducerMetadata, RetryBackoff, RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError,
+    DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport, HookKind,
+    Pace, ProbeMetadata, ProducerMetadata, RetryBackoff, RetryBackoffConfig, RetryBuffer,
+    RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant as Deadline;
@@ -219,6 +220,20 @@ impl Runtime {
                  (set JALKI_NAMESPACES to scope the whole-node firehose)"
             ),
         }
+        let pace_config = DrainPaceConfig::from_env();
+        info!(
+            max_bytes_per_sec = pace_config.max_bytes_per_sec,
+            max_batches_per_sec = pace_config.max_batches_per_sec,
+            "post-outage backlog drains are rate-bounded and back off on sink \
+             backpressure (tune via JALKI_DRAIN_MAX_{{BYTES,BATCHES}}_PER_SEC)"
+        );
+        let pace_config = DrainPaceConfig::from_env();
+        info!(
+            max_bytes_per_sec = pace_config.max_bytes_per_sec,
+            max_batches_per_sec = pace_config.max_batches_per_sec,
+            "post-outage backlog drains are rate-bounded and back off on sink \
+             backpressure (tune via JALKI_DRAIN_MAX_{{BYTES,BATCHES}}_PER_SEC)"
+        );
         let backoff_config = RetryBackoffConfig::from_env();
         info!(
             base_ms = backoff_config.base_ms,
@@ -236,6 +251,7 @@ impl Runtime {
             namespace_allowlist,
             retry_config,
             backoff_config,
+            pace_config,
         }));
 
         // Spawn metrics server.
@@ -425,6 +441,7 @@ pub(crate) struct SinkLoop {
     pub namespace_allowlist: Option<HashSet<String>>,
     pub retry_config: RetryBufferConfig,
     pub backoff_config: RetryBackoffConfig,
+    pub pace_config: DrainPaceConfig,
 }
 
 /// One `EvidenceBatch` per ring-buffer drain cycle, with a bounded retry buffer
@@ -439,12 +456,14 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         namespace_allowlist,
         retry_config,
         backoff_config,
+        pace_config,
     } = loop_state;
 
     let mut retry_buffer = RetryBuffer::new(retry_config);
     let mut backoff = RetryBackoff::new(backoff_config);
+    let mut pacer = DrainPacer::new(pace_config);
     let mut pending_gaps = PendingGaps::default();
-    let retry_clock_start = Instant::now();
+    let retry_clock_start = Deadline::now();
     // Absolute deadline of the next retry sweep; `None` means there is
     // no backlog and the timer arm stays disabled, so an idle agent
     // costs nothing. Absolute rather than a duration because `select!`
@@ -551,12 +570,14 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                 pending_gaps.extend(retry_buffer.drop_expired(now_ms));
 
                 let before = backlog_len(&retry_buffer, &pending_gaps);
-                flush_retry_buffer(
+                let outcome = flush_retry_buffer(
                     sink.as_ref(),
                     &mut retry_buffer,
                     &mut pending_gaps,
                     &metrics_clone,
                     &producer_for_sink,
+                    &mut pacer,
+                    now_ms,
                 )
                 .await;
 
@@ -567,26 +588,45 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                     backoff.reset();
                 }
                 publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
-                next_retry = schedule_retry(
-                    None,
-                    &mut backoff,
-                    has_backlog(&retry_buffer, &pending_gaps),
-                    sink.name(),
-                );
+
+                next_retry = match outcome {
+                    // Rate-limited, not refused. Come back when the pacer
+                    // allows, rather than climbing the failure ladder —
+                    // treating "going slowly on purpose" as an outage would
+                    // stretch a paced drain out exponentially.
+                    DrainOutcome::Paced { wait_ms } => {
+                        Some(Deadline::now() + Duration::from_millis(wait_ms))
+                    }
+                    DrainOutcome::SinkRefused | DrainOutcome::Empty => schedule_retry(
+                        None,
+                        &mut backoff,
+                        has_backlog(&retry_buffer, &pending_gaps),
+                        sink.name(),
+                    ),
+                };
             }
         }
     }
 
     while !retry_buffer.is_empty() || !pending_gaps.is_empty() {
         let before = (retry_buffer.len_batches(), pending_gaps.len());
-        flush_retry_buffer(
+        // Shutdown honours the pace too — a process exiting is no reason to
+        // hand a recovering sink everything at once — but bounded, so a slow
+        // pace cannot hold the daemon open indefinitely.
+        if let DrainOutcome::Paced { wait_ms } = flush_retry_buffer(
             sink.as_ref(),
             &mut retry_buffer,
             &mut pending_gaps,
             &metrics_clone,
             &producer_for_sink,
+            &mut pacer,
+            elapsed_ms(retry_clock_start),
         )
-        .await;
+        .await
+        {
+            tokio::time::sleep(Duration::from_millis(wait_ms.min(1_000))).await;
+            continue;
+        }
         publish_backlog_metrics(&metrics_clone, &retry_buffer, elapsed_ms(retry_clock_start));
         if (retry_buffer.len_batches(), pending_gaps.len()) == before {
             break;
@@ -654,27 +694,62 @@ fn schedule_retry(
     Some(Deadline::now() + Duration::from_millis(delay_ms))
 }
 
+/// What a drain pass ended on, so the loop knows when to come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// Nothing left to send.
+    Empty,
+    /// Backlog remains and the pacer says wait — the sink is fine, we are
+    /// deliberately going slower.
+    Paced { wait_ms: u64 },
+    /// The sink refused; the backoff ladder owns the next attempt.
+    SinkRefused,
+}
+
+/// Drain as much of the backlog as the pacer currently permits, then return.
+///
+/// It returns rather than looping to empty for two reasons. The rate limit is
+/// the headline one (jalki #40): draining at line rate is what took Ahti from
+/// 0.24Gi to its 4Gi OOM limit in 90 minutes once Vartio came back. The other
+/// is that a flush which loops until empty holds the `select!` loop for the
+/// whole drain, so `rx.recv()` is never polled, the channel fills, and the ring
+/// buffer readers start dropping fresh evidence — losing new events to pay for
+/// old ones.
 async fn flush_retry_buffer(
     sink: &dyn EvidenceSink,
     retry_buffer: &mut RetryBuffer,
     pending_gaps: &mut PendingGaps,
     metrics: &Metrics,
     producer: &ProducerMetadata,
-) {
+    pacer: &mut DrainPacer,
+    now_ms: u64,
+) -> DrainOutcome {
     while let Some(batch) = pending_gaps.front(producer) {
+        // Gap reports are tiny and describe evidence already lost; pace them
+        // with everything else so they cannot themselves become a burst.
+        if let Pace::Wait { ms } = pacer.poll(now_ms, batch.approx_bytes()) {
+            return DrainOutcome::Paced { wait_ms: ms };
+        }
         match sink.append_batch(batch).await {
-            Ok(_) => pending_gaps.pop_front(),
-            Err(err) if RetryBuffer::should_retry(&err) => {
-                record_sink_error(metrics, sink.name());
-                warn!(
-                    sink = sink.name(),
-                    error = %err,
-                    "gap evidence delivery failed; retrying later"
-                );
-                return;
+            Ok(_) => {
+                pacer.on_delivered();
+                pending_gaps.pop_front();
             }
             Err(err) => {
+                let retriable = RetryBuffer::should_retry(&err);
+                if matches!(err, SinkError::Backpressure { .. }) {
+                    pacer.on_backpressure();
+                }
                 record_sink_error(metrics, sink.name());
+                if retriable {
+                    warn!(
+                        sink = sink.name(),
+                        error = %err,
+                        drain_scale = pacer.scale(),
+                        "gap evidence delivery failed; retrying later"
+                    );
+                    return DrainOutcome::SinkRefused;
+                }
                 error!(
                     sink = sink.name(),
                     error = %err,
@@ -686,37 +761,54 @@ async fn flush_retry_buffer(
     }
 
     while let Some(batch) = retry_buffer.front().cloned() {
+        if let Pace::Wait { ms } = pacer.poll(now_ms, batch.approx_bytes()) {
+            return DrainOutcome::Paced { wait_ms: ms };
+        }
         match sink.append_batch(batch).await {
             Ok(_) => {
+                pacer.on_delivered();
                 retry_buffer.pop_delivered();
             }
-            Err(err) if RetryBuffer::should_retry(&err) => {
-                record_sink_error(metrics, sink.name());
-                warn!(
-                    sink = sink.name(),
-                    error = %err,
-                    queued_batches = retry_buffer.len_batches(),
-                    queued_records = retry_buffer.len_records(),
-                    queued_bytes = retry_buffer.len_bytes(),
-                    "evidence sink append failed; retrying later"
-                );
-                break;
-            }
             Err(err) => {
+                let retriable = RetryBuffer::should_retry(&err);
+                // ADR-0009 contract 1: RESOURCE_EXHAUSTED means *slow down*,
+                // not merely *try again shortly*. Without this the sink's only
+                // way to shed load is to keep refusing, and we keep asking at
+                // the same rate.
+                if matches!(err, SinkError::Backpressure { .. }) {
+                    pacer.on_backpressure();
+                    warn!(
+                        sink = sink.name(),
+                        drain_scale = pacer.scale(),
+                        "sink signalled backpressure; halving the drain rate"
+                    );
+                }
                 record_sink_error(metrics, sink.name());
+                if retriable {
+                    warn!(
+                        sink = sink.name(),
+                        error = %err,
+                        queued_batches = retry_buffer.len_batches(),
+                        queued_records = retry_buffer.len_records(),
+                        queued_bytes = retry_buffer.len_bytes(),
+                        "evidence sink append failed; retrying later"
+                    );
+                    return DrainOutcome::SinkRefused;
+                }
                 error!(
                     sink = sink.name(),
                     error = %err,
                     "evidence sink append failed permanently; dropping batch"
                 );
-                let dropped = retry_buffer.pop_delivered();
-                if let Some(dropped) = dropped {
+                if let Some(dropped) = retry_buffer.pop_delivered() {
                     pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &dropped));
                 }
-                break;
+                return DrainOutcome::SinkRefused;
             }
         }
     }
+
+    DrainOutcome::Empty
 }
 
 #[derive(Default)]
@@ -771,6 +863,366 @@ fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
     }
 }
 
+fn record_sink_error(metrics: &Metrics, sink: &str) {
+    metrics
+        .sink_errors
+        .get_or_create(&SinkLabel { sink: sink.into() })
+        .inc();
+}
+
+fn record_unbound_drops(metrics: &Metrics, records: &[EvidenceRecord]) {
+    for record in records {
+        if let Some(reason) = record.plane_b_drop_reason() {
+            metrics
+                .unbound_dropped_total
+                .get_or_create(&UnboundDropLabel {
+                    reason: reason.as_str().into(),
+                })
+                .inc();
+        }
+    }
+}
+
+fn refresh_binding_cache_metrics(metrics: &Metrics, enricher: &dyn RuntimeEnricher) {
+    if let Some(stats) = enricher.binding_cache_stats() {
+        metrics.binding_cache_entries.set(stats.entries as i64);
+        metrics.binding_cache_hit_ratio.set(stats.hit_ratio);
+    }
+}
+
+fn terminal_gap_cause(error: &SinkError) -> &'static str {
+    match error {
+        SinkError::InvalidRecord { .. } => "sink_invalid_record",
+        SinkError::Rejected { .. } => "sink_rejected",
+        SinkError::Unauthorized { .. } => "sink_unauthorized",
+        SinkError::Misconfigured { .. } => "sink_misconfigured",
+        SinkError::PartialFailure { .. } => "sink_partial_failure",
+        SinkError::Unsupported { .. } => "sink_unsupported",
+        SinkError::Unavailable { .. }
+        | SinkError::Timeout { .. }
+        | SinkError::Backpressure { .. } => "sink_retryable_failure",
+    }
+}
+
+/// Loop clock, on tokio's timebase rather than `std::time::Instant`.
+///
+/// Identical in production — tokio's clock *is* the system clock unless paused.
+/// It matters for tests: the retry deadline already runs on tokio's clock, so a
+/// std-based `now_ms` meant the buffer's age and the drain pacer's token
+/// buckets stood still while the retry timer advanced. Under `start_paused`
+/// that stalls a paced drain outright, and it made `max_age_ms` expiry
+/// untestable.
+fn elapsed_ms(start: Deadline) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Map knowledge base field names to BTF field paths.
+///
+/// KB fields like "src_ip", "dst_port" are human-friendly.
+/// BTF needs "sk.__sk_common.skc_rcv_saddr", etc.
+fn map_kb_fields_to_btf(
+    function: &str,
+    kb_fields: &[String],
+    btf_data: &jalki_codegen::btf::BtfData,
+) -> Vec<String> {
+    let mut result = Vec::new();
+
+    // Check if the function's first param is a sock pointer.
+    let has_sock = btf_data
+        .resolve_function(function)
+        .ok()
+        .and_then(|sig| sig.params.first().cloned())
+        .map(|p| p.name == "sk")
+        .unwrap_or(false);
+
+    for field in kb_fields {
+        match field.as_str() {
+            "src_ip" if has_sock => result.push("sk.__sk_common.skc_rcv_saddr".into()),
+            "dst_ip" if has_sock => result.push("sk.__sk_common.skc_daddr".into()),
+            "src_port" if has_sock => result.push("sk.__sk_common.skc_num".into()),
+            "dst_port" if has_sock => result.push("sk.__sk_common.skc_dport".into()),
+            "tcp_state" if has_sock => result.push("sk.__sk_common.skc_state".into()),
+            "pid" | "tid" | "timestamp_ns" => {} // always included in header
+            "command" | "comm" => result.push("comm".into()),
+            "ret" => result.push("ret".into()),
+            // Pass through anything that looks like a BTF path already.
+            other if other.contains('.') => result.push(other.to_string()),
+            _ => {
+                // Unknown field — try "comm" as a safe default.
+                // Don't add unknown fields that would cause codegen to fail.
+            }
+        }
+    }
+
+    // Always include comm if not already present.
+    if !result.iter().any(|f| f == "comm") {
+        result.push("comm".into());
+    }
+
+    result
+}
+
+/// Periodically check probe stats and emit self-observability Occurrences.
+///
+/// If AHTI sees a gap in events and doesn't know jälki dropped them,
+/// it will misdiagnose. These events close that gap.
+async fn emit_self_observability(
+    stats_map: Vec<(String, Arc<ProbeStats>)>,
+    tx: mpsc::Sender<Vec<EvidenceRecord>>,
+    cluster: &str,
+) {
+    let mut prev_dropped: Vec<u64> = vec![0; stats_map.len()];
+    let mut prev_errors: Vec<u64> = vec![0; stats_map.len()];
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        for (i, (probe_name, stats)) in stats_map.iter().enumerate() {
+            let dropped = stats.events_dropped.load(Ordering::Relaxed);
+            let errors = stats.parse_errors.load(Ordering::Relaxed);
+
+            let new_drops = dropped - prev_dropped[i];
+            let new_errors = errors - prev_errors[i];
+
+            if new_drops > 0 {
+                warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
+                let occ = Occurrence::new("jalki/self", "jalki.probe.events_dropped")
+                    .severity(Severity::Warning)
+                    .in_cluster(cluster);
+                // Best-effort — if the channel is full, we can't do anything about it.
+                let _ = tx.try_send(vec![self_observability_record(occ)]);
+            }
+
+            if new_errors > 0 {
+                warn!(probe = %probe_name, errors = new_errors, "parse errors detected");
+                let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
+                    .severity(Severity::Warning)
+                    .in_cluster(cluster);
+                let _ = tx.try_send(vec![self_observability_record(occ)]);
+            }
+
+            prev_dropped[i] = dropped;
+            prev_errors[i] = errors;
+        }
+    }
+}
+
+fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
+    EvidenceRecord {
+        observed_at_ns: 0,
+        pid: 0,
+        cgroup_id: 0,
+        probe: ProbeMetadata {
+            probe_id: "jalki_self".into(),
+            probe_version: "1".into(),
+            probe_family: "agent".into(),
+            hook_kind: HookKind::Fentry,
+            kernel_function: "jalki_self_observability".into(),
+        },
+        occurrence,
+        binding: None,
+    }
+}
+
+/// Serve Prometheus metrics on :9090/metrics.
+/// A queued batch older than this makes the agent NotReady: it is holding
+/// evidence it cannot deliver. Well above the backoff cap so an ordinary blip —
+/// which #39 clears in well under a second — never flaps the probe.
+const DEFAULT_READY_MAX_BACKLOG_AGE_SECS: u64 = 60;
+
+fn ready_max_backlog_age_secs() -> u64 {
+    std::env::var("JALKI_READY_MAX_BACKLOG_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_READY_MAX_BACKLOG_AGE_SECS)
+}
+
+/// Serves `/metrics`, `/healthz` and `/readyz` on :9090 (jalki #42).
+///
+/// Deliberately split, and the split is the point (vartio ADR-0009 rejects
+/// sink-health-fed liveness probes):
+///
+/// - `/healthz` — **process alive only**. It must never consult the sink. A
+///   liveness probe that fails during a downstream outage tells the kubelet to
+///   restart the agent, which destroys the buffered evidence the outage is
+///   exactly when we need, and turns one incident into a crash loop.
+/// - `/readyz` — reports whether evidence is *flowing*. NotReady is a visible,
+///   alertable, harmless state for a DaemonSet with no Service in front of it.
+///
+/// Readiness keys off backlog **age**, not the sink's `health()`. Two reasons:
+/// `HealthStatus::Degraded` is overloaded (it covers "never exercised", a
+/// transport error, and permanent per-item rejects alike), and a node whose
+/// namespaces are simply quiet has nothing to deliver — reporting it NotReady
+/// would be indistinguishable from a real outage. "Holding undeliverable
+/// evidence for more than a minute" is the condition an operator actually
+/// wants.
+async fn serve_metrics(metrics: Arc<Metrics>) -> Result<()> {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("0.0.0.0:9090").await?;
+    let max_backlog_age = ready_max_backlog_age_secs();
+    info!(
+        ready_max_backlog_age_secs = max_backlog_age,
+        "observability server listening on :9090 (/metrics, /healthz, /readyz)"
+    );
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // A per-connection accept error (fd exhaustion, a peer that
+                // vanished) used to propagate out of this function and take the
+                // whole server with it — silently removing the probe surface
+                // the kubelet is about to depend on.
+                warn!(error = %e, "observability server accept failed; continuing");
+                continue;
+            }
+        };
+        let metrics = metrics.clone();
+        // Per connection: a serial loop lets one slow scraper block every
+        // subsequent request, and once probes point here that is a restart.
+        tokio::spawn(async move {
+            if let Err(e) = handle_observability_request(stream, &metrics, max_backlog_age).await {
+                tracing::debug!(error = %e, "observability request failed");
+            }
+        });
+    }
+}
+
+async fn handle_observability_request(
+    mut stream: tokio::net::TcpStream,
+    metrics: &Metrics,
+    max_backlog_age_secs: u64,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let raw = tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut stream))
+        .await
+        .context("timed out reading request")??;
+    let path = request_path(&raw);
+
+    let (status, content_type, body) = match path.as_deref() {
+        Some("/metrics") => (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics.encode(),
+        ),
+        // No sink call, no buffer inspection, no dependency of any kind: if
+        // this task is scheduled to answer, the process is alive, and that is
+        // the entire claim.
+        Some("/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
+        Some("/readyz") => {
+            let age = metrics.retry_oldest_age_seconds.get();
+            let batches = metrics.retry_queued_batches.get();
+            let stalled = age > max_backlog_age_secs as f64;
+            let body = format!(
+                "queued_batches={batches}\nqueued_records={}\nqueued_bytes={}\n\
+                 oldest_age_seconds={age:.1}\nmax_backlog_age_seconds={max_backlog_age_secs}\n\
+                 status={}\n",
+                metrics.retry_queued_records.get(),
+                metrics.retry_queued_bytes.get(),
+                if stalled { "stalled" } else { "ok" },
+            );
+            let status = if stalled {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            (status, "text/plain; charset=utf-8", body)
+        }
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        ),
+    };
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Overall budget for receiving a request, not a per-read one: a peer that
+/// dribbles a byte at a time must not pin the task indefinitely.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Enough for a request line plus any probe's or scraper's headers. A peer that
+/// sends more just gets answered on what arrived first.
+const MAX_REQUEST_BYTES: usize = 2048;
+
+/// Read until the end of the HTTP request line.
+///
+/// A single `read()` is **not** enough, and the failure it produces is nasty:
+/// TCP may split `GET /healthz HTTP/1.1\r\n` across segments, and the kubelet's
+/// probe reaches this over the pod network rather than loopback. A short read
+/// yields a truncated path like `/healt`, which routes to 404, which fails the
+/// liveness probe, which restarts the agent — the exact outcome the probe was
+/// added to prevent.
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 512];
+    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_BYTES {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break; // peer closed; answer on what we have
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
+/// Path from an HTTP request line (`GET /readyz HTTP/1.1`), query string
+/// stripped. `None` for anything that isn't one.
+fn request_path(raw: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(raw).ok()?.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    Some(target.split('?').next().unwrap_or(target).to_string())
+}
+
+/// Publish retry-buffer state so `/readyz` and Prometheus can see it. Called
+/// wherever the buffer changes — the loop is the only writer.
+fn publish_backlog_metrics(metrics: &Metrics, retry_buffer: &RetryBuffer, now_ms: u64) {
+    metrics
+        .retry_queued_batches
+        .set(retry_buffer.len_batches() as i64);
+    metrics
+        .retry_queued_records
+        .set(retry_buffer.len_records() as i64);
+    metrics
+        .retry_queued_bytes
+        .set(retry_buffer.len_bytes() as i64);
+    metrics.retry_oldest_age_seconds.set(
+        retry_buffer
+            .oldest_age_ms(now_ms)
+            .map(|ms| ms as f64 / 1000.0)
+            .unwrap_or(0.0),
+    );
+}
+
+/// Convenience function matching the design doc's API.
+pub async fn run<F>(configure: F) -> Result<()>
+where
+    F: FnOnce(Runtime) -> Runtime,
+{
+    let ebpf_path = std::env::var("JALKI_EBPF_PATH")
+        .unwrap_or_else(|_| "jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf".into());
+
+    let runtime = Runtime::new(ebpf_path);
+    let runtime = configure(runtime);
+    runtime.run().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +1262,13 @@ mod tests {
     /// A sink whose availability the test controls, counting every attempt.
     struct ControlledSink {
         up: Arc<AtomicBool>,
+        /// When set, the sink accepts nothing and answers Backpressure — the
+        /// RESOURCE_EXHAUSTED case, distinct from being down.
+        overloaded: Arc<AtomicBool>,
+        /// Per-append cost. A real sink is not instant, and without this the
+        /// difference between "drains a slice and yields" and "drains to empty
+        /// while nothing else runs" is invisible on a paused clock.
+        append_cost: Duration,
         attempts: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<String>>>,
     }
@@ -822,6 +1281,15 @@ mod tests {
 
         async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.append_cost.is_zero() {
+                tokio::time::sleep(self.append_cost).await;
+            }
+            if self.overloaded.load(Ordering::SeqCst) {
+                return Err(SinkError::Backpressure {
+                    sink: "controlled".into(),
+                    message: "test sink is overloaded".into(),
+                });
+            }
             if !self.up.load(Ordering::SeqCst) {
                 return Err(SinkError::Unavailable {
                     sink: "controlled".into(),
@@ -849,6 +1317,7 @@ mod tests {
     struct Harness {
         tx: mpsc::Sender<Vec<EvidenceRecord>>,
         up: Arc<AtomicBool>,
+        overloaded: Arc<AtomicBool>,
         attempts: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<String>>>,
         metrics: Arc<Metrics>,
@@ -856,8 +1325,31 @@ mod tests {
     }
 
     fn spawn_loop(backoff_config: RetryBackoffConfig) -> Harness {
+        spawn_loop_paced(
+            backoff_config,
+            DrainPaceConfig {
+                max_bytes_per_sec: u64::MAX / 4,
+                max_batches_per_sec: u64::MAX / 4,
+                ..DrainPaceConfig::default()
+            },
+        )
+    }
+
+    fn spawn_loop_paced(
+        backoff_config: RetryBackoffConfig,
+        pace_config: DrainPaceConfig,
+    ) -> Harness {
+        spawn_loop_full(backoff_config, pace_config, Duration::ZERO)
+    }
+
+    fn spawn_loop_full(
+        backoff_config: RetryBackoffConfig,
+        pace_config: DrainPaceConfig,
+        append_cost: Duration,
+    ) -> Harness {
         let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(64);
         let up = Arc::new(AtomicBool::new(false));
+        let overloaded = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         let delivered = Arc::new(StdMutex::new(Vec::new()));
         let metrics = Arc::new(Metrics::new());
@@ -865,6 +1357,8 @@ mod tests {
             rx,
             sink: Box::new(ControlledSink {
                 up: up.clone(),
+                overloaded: overloaded.clone(),
+                append_cost,
                 attempts: attempts.clone(),
                 delivered: delivered.clone(),
             }),
@@ -874,10 +1368,12 @@ mod tests {
             namespace_allowlist: None,
             retry_config: RetryBufferConfig::default(),
             backoff_config,
+            pace_config,
         }));
         Harness {
             tx,
             up,
+            overloaded,
             attempts,
             delivered,
             metrics,
@@ -898,6 +1394,19 @@ mod tests {
         }
         for _ in 0..64 {
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Advance the paused clock in slices, letting the loop run between them.
+    /// A paced drain needs many timer ticks — each pass sends what its tokens
+    /// allow and reschedules — so a single large `advance` only ever fires the
+    /// first one.
+    async fn advance_draining(h: &Harness, total: Duration, step: Duration) {
+        let mut elapsed = Duration::ZERO;
+        while elapsed < total {
+            tokio::time::advance(step).await;
+            drain(h).await;
+            elapsed += step;
         }
     }
 
@@ -1248,356 +1757,180 @@ mod tests {
         drop(h.tx);
         let _ = h.handle.await;
     }
-}
+    // ── paced drain (jalki #40) ─────────────────────────────────────────────
+    //
+    // The amplification step of the Jul 28-29 incident: Vartio returned at
+    // 21:34, jälki's backlog drained at line rate, and Ahti went 0.24Gi → its
+    // 4Gi OOM limit inside 90 minutes. The outage was survivable; the recovery
+    // was not.
 
-fn record_sink_error(metrics: &Metrics, sink: &str) {
-    metrics
-        .sink_errors
-        .get_or_create(&SinkLabel { sink: sink.into() })
-        .inc();
-}
+    /// The headline criterion: a recovering sink is fed at the configured rate,
+    /// not as fast as it will accept.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_sink_is_not_handed_the_whole_backlog_at_once() {
+        let h = spawn_loop_paced(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            DrainPaceConfig {
+                max_bytes_per_sec: 4 * 1024,
+                max_batches_per_sec: 4,
+                ..DrainPaceConfig::default()
+            },
+        );
 
-fn record_unbound_drops(metrics: &Metrics, records: &[EvidenceRecord]) {
-    for record in records {
-        if let Some(reason) = record.plane_b_drop_reason() {
-            metrics
-                .unbound_dropped_total
-                .get_or_create(&UnboundDropLabel {
-                    reason: reason.as_str().into(),
-                })
-                .inc();
+        // Build a backlog against a down sink.
+        for _ in 0..60 {
+            h.tx.send(one_record()).await.unwrap();
         }
-    }
-}
+        drain(&h).await;
+        assert!(
+            h.metrics.retry_queued_batches.get() >= 50,
+            "precondition: a backlog"
+        );
 
-fn refresh_binding_cache_metrics(metrics: &Metrics, enricher: &dyn RuntimeEnricher) {
-    if let Some(stats) = enricher.binding_cache_stats() {
-        metrics.binding_cache_entries.set(stats.entries as i64);
-        metrics.binding_cache_hit_ratio.set(stats.hit_ratio);
-    }
-}
+        // Sink returns. Give it one second of simulated time.
+        h.up.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drain(&h).await;
 
-fn terminal_gap_cause(error: &SinkError) -> &'static str {
-    match error {
-        SinkError::InvalidRecord { .. } => "sink_invalid_record",
-        SinkError::Rejected { .. } => "sink_rejected",
-        SinkError::Unauthorized { .. } => "sink_unauthorized",
-        SinkError::Misconfigured { .. } => "sink_misconfigured",
-        SinkError::PartialFailure { .. } => "sink_partial_failure",
-        SinkError::Unsupported { .. } => "sink_unsupported",
-        SinkError::Unavailable { .. }
-        | SinkError::Timeout { .. }
-        | SinkError::Backpressure { .. } => "sink_retryable_failure",
-    }
-}
+        let delivered = h.delivered.lock().unwrap().len();
+        assert!(
+            delivered <= 12,
+            "one second at 4 batches/s (plus a one-second burst) must not \
+             deliver the whole backlog; got {delivered}"
+        );
+        assert!(delivered > 0, "but it must make progress; got {delivered}");
 
-fn elapsed_ms(start: Instant) -> u64 {
-    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-}
+        // And it does finish, given time — pacing slows recovery, never stalls it.
+        advance_draining(&h, Duration::from_secs(60), Duration::from_millis(250)).await;
+        assert_eq!(
+            h.metrics.retry_queued_batches.get(),
+            0,
+            "a paced drain still completes"
+        );
 
-/// Map knowledge base field names to BTF field paths.
-///
-/// KB fields like "src_ip", "dst_port" are human-friendly.
-/// BTF needs "sk.__sk_common.skc_rcv_saddr", etc.
-fn map_kb_fields_to_btf(
-    function: &str,
-    kb_fields: &[String],
-    btf_data: &jalki_codegen::btf::BtfData,
-) -> Vec<String> {
-    let mut result = Vec::new();
-
-    // Check if the function's first param is a sock pointer.
-    let has_sock = btf_data
-        .resolve_function(function)
-        .ok()
-        .and_then(|sig| sig.params.first().cloned())
-        .map(|p| p.name == "sk")
-        .unwrap_or(false);
-
-    for field in kb_fields {
-        match field.as_str() {
-            "src_ip" if has_sock => result.push("sk.__sk_common.skc_rcv_saddr".into()),
-            "dst_ip" if has_sock => result.push("sk.__sk_common.skc_daddr".into()),
-            "src_port" if has_sock => result.push("sk.__sk_common.skc_num".into()),
-            "dst_port" if has_sock => result.push("sk.__sk_common.skc_dport".into()),
-            "tcp_state" if has_sock => result.push("sk.__sk_common.skc_state".into()),
-            "pid" | "tid" | "timestamp_ns" => {} // always included in header
-            "command" | "comm" => result.push("comm".into()),
-            "ret" => result.push("ret".into()),
-            // Pass through anything that looks like a BTF path already.
-            other if other.contains('.') => result.push(other.to_string()),
-            _ => {
-                // Unknown field — try "comm" as a safe default.
-                // Don't add unknown fields that would cause codegen to fail.
-            }
-        }
+        drop(h.tx);
+        let _ = h.handle.await;
     }
 
-    // Always include comm if not already present.
-    if !result.iter().any(|f| f == "comm") {
-        result.push("comm".into());
-    }
-
-    result
-}
-
-/// Periodically check probe stats and emit self-observability Occurrences.
-///
-/// If AHTI sees a gap in events and doesn't know jälki dropped them,
-/// it will misdiagnose. These events close that gap.
-async fn emit_self_observability(
-    stats_map: Vec<(String, Arc<ProbeStats>)>,
-    tx: mpsc::Sender<Vec<EvidenceRecord>>,
-    cluster: &str,
-) {
-    let mut prev_dropped: Vec<u64> = vec![0; stats_map.len()];
-    let mut prev_errors: Vec<u64> = vec![0; stats_map.len()];
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-
-    loop {
-        interval.tick().await;
-
-        for (i, (probe_name, stats)) in stats_map.iter().enumerate() {
-            let dropped = stats.events_dropped.load(Ordering::Relaxed);
-            let errors = stats.parse_errors.load(Ordering::Relaxed);
-
-            let new_drops = dropped - prev_dropped[i];
-            let new_errors = errors - prev_errors[i];
-
-            if new_drops > 0 {
-                warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
-                let occ = Occurrence::new("jalki/self", "jalki.probe.events_dropped")
-                    .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                // Best-effort — if the channel is full, we can't do anything about it.
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
-            }
-
-            if new_errors > 0 {
-                warn!(probe = %probe_name, errors = new_errors, "parse errors detected");
-                let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
-                    .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
-            }
-
-            prev_dropped[i] = dropped;
-            prev_errors[i] = errors;
-        }
-    }
-}
-
-fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
-    EvidenceRecord {
-        observed_at_ns: 0,
-        pid: 0,
-        cgroup_id: 0,
-        probe: ProbeMetadata {
-            probe_id: "jalki_self".into(),
-            probe_version: "1".into(),
-            probe_family: "agent".into(),
-            hook_kind: HookKind::Fentry,
-            kernel_function: "jalki_self_observability".into(),
-        },
-        occurrence,
-        binding: None,
-    }
-}
-
-/// Serve Prometheus metrics on :9090/metrics.
-/// A queued batch older than this makes the agent NotReady: it is holding
-/// evidence it cannot deliver. Well above the backoff cap so an ordinary blip —
-/// which #39 clears in well under a second — never flaps the probe.
-const DEFAULT_READY_MAX_BACKLOG_AGE_SECS: u64 = 60;
-
-fn ready_max_backlog_age_secs() -> u64 {
-    std::env::var("JALKI_READY_MAX_BACKLOG_AGE_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_READY_MAX_BACKLOG_AGE_SECS)
-}
-
-/// Serves `/metrics`, `/healthz` and `/readyz` on :9090 (jalki #42).
-///
-/// Deliberately split, and the split is the point (vartio ADR-0009 rejects
-/// sink-health-fed liveness probes):
-///
-/// - `/healthz` — **process alive only**. It must never consult the sink. A
-///   liveness probe that fails during a downstream outage tells the kubelet to
-///   restart the agent, which destroys the buffered evidence the outage is
-///   exactly when we need, and turns one incident into a crash loop.
-/// - `/readyz` — reports whether evidence is *flowing*. NotReady is a visible,
-///   alertable, harmless state for a DaemonSet with no Service in front of it.
-///
-/// Readiness keys off backlog **age**, not the sink's `health()`. Two reasons:
-/// `HealthStatus::Degraded` is overloaded (it covers "never exercised", a
-/// transport error, and permanent per-item rejects alike), and a node whose
-/// namespaces are simply quiet has nothing to deliver — reporting it NotReady
-/// would be indistinguishable from a real outage. "Holding undeliverable
-/// evidence for more than a minute" is the condition an operator actually
-/// wants.
-async fn serve_metrics(metrics: Arc<Metrics>) -> Result<()> {
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("0.0.0.0:9090").await?;
-    let max_backlog_age = ready_max_backlog_age_secs();
-    info!(
-        ready_max_backlog_age_secs = max_backlog_age,
-        "observability server listening on :9090 (/metrics, /healthz, /readyz)"
-    );
-
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                // A per-connection accept error (fd exhaustion, a peer that
-                // vanished) used to propagate out of this function and take the
-                // whole server with it — silently removing the probe surface
-                // the kubelet is about to depend on.
-                warn!(error = %e, "observability server accept failed; continuing");
-                continue;
-            }
-        };
-        let metrics = metrics.clone();
-        // Per connection: a serial loop lets one slow scraper block every
-        // subsequent request, and once probes point here that is a restart.
-        tokio::spawn(async move {
-            if let Err(e) = handle_observability_request(stream, &metrics, max_backlog_age).await {
-                tracing::debug!(error = %e, "observability request failed");
-            }
-        });
-    }
-}
-
-async fn handle_observability_request(
-    mut stream: tokio::net::TcpStream,
-    metrics: &Metrics,
-    max_backlog_age_secs: u64,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
-    let raw = tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut stream))
-        .await
-        .context("timed out reading request")??;
-    let path = request_path(&raw);
-
-    let (status, content_type, body) = match path.as_deref() {
-        Some("/metrics") => (
-            "200 OK",
-            "text/plain; version=0.0.4; charset=utf-8",
-            metrics.encode(),
-        ),
-        // No sink call, no buffer inspection, no dependency of any kind: if
-        // this task is scheduled to answer, the process is alive, and that is
-        // the entire claim.
-        Some("/healthz") => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
-        Some("/readyz") => {
-            let age = metrics.retry_oldest_age_seconds.get();
-            let batches = metrics.retry_queued_batches.get();
-            let stalled = age > max_backlog_age_secs as f64;
-            let body = format!(
-                "queued_batches={batches}\nqueued_records={}\nqueued_bytes={}\n\
-                 oldest_age_seconds={age:.1}\nmax_backlog_age_seconds={max_backlog_age_secs}\n\
-                 status={}\n",
-                metrics.retry_queued_records.get(),
-                metrics.retry_queued_bytes.get(),
-                if stalled { "stalled" } else { "ok" },
+    /// ADR-0009 contract 1: RESOURCE_EXHAUSTED means *slow down*, not merely
+    /// *try again shortly*. Asserted comparatively — two identical drains, one
+    /// preceded by an overload episode — because "scale() changed" is a claim
+    /// about a field, while "less data moved" is a claim about behaviour.
+    #[tokio::test(start_paused = true)]
+    async fn backpressure_from_the_sink_slows_the_later_drain() {
+        async fn delivered_after(overload: bool) -> usize {
+            let h = spawn_loop_paced(
+                RetryBackoffConfig {
+                    base_ms: 10,
+                    max_ms: 10,
+                },
+                DrainPaceConfig {
+                    max_bytes_per_sec: 64 * 1024,
+                    max_batches_per_sec: 64,
+                    ..DrainPaceConfig::default()
+                },
             );
-            let status = if stalled {
-                "503 Service Unavailable"
-            } else {
-                "200 OK"
-            };
-            (status, "text/plain; charset=utf-8", body)
+            for _ in 0..200 {
+                h.tx.send(one_record()).await.unwrap();
+            }
+            drain(&h).await;
+
+            if overload {
+                h.overloaded.store(true, Ordering::SeqCst);
+                advance_draining(&h, Duration::from_secs(1), Duration::from_millis(50)).await;
+                h.overloaded.store(false, Ordering::SeqCst);
+            }
+
+            h.up.store(true, Ordering::SeqCst);
+            advance_draining(&h, Duration::from_secs(2), Duration::from_millis(50)).await;
+            let n = h.delivered.lock().unwrap().len();
+            drop(h.tx);
+            let _ = h.handle.await;
+            n
         }
-        _ => (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            "not found\n".to_string(),
-        ),
-    };
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
-}
+        let baseline = delivered_after(false).await;
+        let after_backpressure = delivered_after(true).await;
 
-/// Overall budget for receiving a request, not a per-read one: a peer that
-/// dribbles a byte at a time must not pin the task indefinitely.
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Enough for a request line plus any probe's or scraper's headers. A peer that
-/// sends more just gets answered on what arrived first.
-const MAX_REQUEST_BYTES: usize = 2048;
-
-/// Read until the end of the HTTP request line.
-///
-/// A single `read()` is **not** enough, and the failure it produces is nasty:
-/// TCP may split `GET /healthz HTTP/1.1\r\n` across segments, and the kubelet's
-/// probe reaches this over the pod network rather than loopback. A short read
-/// yields a truncated path like `/healt`, which routes to 404, which fails the
-/// liveness probe, which restarts the agent — the exact outcome the probe was
-/// added to prevent.
-async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = Vec::with_capacity(256);
-    let mut chunk = [0u8; 512];
-    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_BYTES {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break; // peer closed; answer on what we have
-        }
-        buf.extend_from_slice(&chunk[..n]);
+        assert!(
+            after_backpressure * 2 < baseline,
+            "a sink that answered RESOURCE_EXHAUSTED must be fed more slowly \
+             afterwards: {after_backpressure} delivered vs {baseline} without \
+             the overload episode"
+        );
     }
-    Ok(buf)
-}
 
-/// Path from an HTTP request line (`GET /readyz HTTP/1.1`), query string
-/// stripped. `None` for anything that isn't one.
-fn request_path(raw: &[u8]) -> Option<String> {
-    let line = std::str::from_utf8(raw).ok()?.lines().next()?;
-    let mut parts = line.split_whitespace();
-    let _method = parts.next()?;
-    let target = parts.next()?;
-    Some(target.split('?').next().unwrap_or(target).to_string())
-}
+    /// Regression guard, **not** a proof of interleaving — say so plainly,
+    /// because the name it deserves is the one it cannot earn.
+    ///
+    /// The property that matters is that a flush must not monopolise the
+    /// `select!` loop: one that runs to empty leaves `rx.recv()` unpolled for
+    /// the whole drain, the channel fills, and the ring-buffer readers start
+    /// dropping — losing new events to pay for old ones. The implementation has
+    /// that property (the pacer returns after a slice).
+    ///
+    /// This test does not establish it. Verified by removing both pacer gates:
+    /// it still passes, because the fresh evidence lands while the loop is at a
+    /// select decision point rather than inside a flush, and `select!` then
+    /// picks the channel branch immediately regardless of how long a flush
+    /// would have run. Making it deterministic needs the send to land
+    /// mid-flush, which there is no cheap hook for.
+    ///
+    /// What it does hold: a drain under a slow sink delivers the backlog *and*
+    /// everything that arrived during it, losing nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_drain_loses_neither_the_backlog_nor_what_arrives_during_it() {
+        let h = spawn_loop_full(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            DrainPaceConfig {
+                max_bytes_per_sec: 8 * 1024,
+                max_batches_per_sec: 8,
+                ..DrainPaceConfig::default()
+            },
+            // A real sink is not instant. 20ms x 60 batches is 1.2s of drain
+            // that an unpaced flush would hold the loop for in one go.
+            Duration::from_millis(20),
+        );
 
-/// Publish retry-buffer state so `/readyz` and Prometheus can see it. Called
-/// wherever the buffer changes — the loop is the only writer.
-fn publish_backlog_metrics(metrics: &Metrics, retry_buffer: &RetryBuffer, now_ms: u64) {
-    metrics
-        .retry_queued_batches
-        .set(retry_buffer.len_batches() as i64);
-    metrics
-        .retry_queued_records
-        .set(retry_buffer.len_records() as i64);
-    metrics
-        .retry_queued_bytes
-        .set(retry_buffer.len_bytes() as i64);
-    metrics.retry_oldest_age_seconds.set(
-        retry_buffer
-            .oldest_age_ms(now_ms)
-            .map(|ms| ms as f64 / 1000.0)
-            .unwrap_or(0.0),
-    );
-}
+        for _ in 0..60 {
+            h.tx.send(one_record()).await.unwrap();
+        }
+        drain(&h).await;
+        h.up.store(true, Ordering::SeqCst);
 
-/// Convenience function matching the design doc's API.
-pub async fn run<F>(configure: F) -> Result<()>
-where
-    F: FnOnce(Runtime) -> Runtime,
-{
-    let ebpf_path = std::env::var("JALKI_EBPF_PATH")
-        .unwrap_or_else(|_| "jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf".into());
+        // Kick the drain off, then post fresh evidence into the middle of it.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        for _ in 0..8 {
+            h.tx.send(one_record()).await.unwrap();
+        }
 
-    let runtime = Runtime::new(ebpf_path);
-    let runtime = configure(runtime);
-    runtime.run().await
+        let filled = h.tx.capacity();
+        let mut waited = Duration::ZERO;
+        while h.tx.capacity() == filled && waited < Duration::from_secs(30) {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            waited += Duration::from_millis(10);
+        }
+        assert!(
+            h.tx.capacity() > filled,
+            "the loop never came back for the fresh evidence"
+        );
+
+        advance_draining(&h, Duration::from_secs(60), Duration::from_millis(100)).await;
+        assert_eq!(
+            h.delivered.lock().unwrap().len(),
+            68,
+            "backlog and the evidence that arrived during it all land"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
 }
