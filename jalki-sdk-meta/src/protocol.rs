@@ -59,7 +59,9 @@ pub const POS_INTERP: usize = 11; // [str, str]|nil — [conclusion, action]
 // REQUEST payload: [request_id: u32, method: u8, params: msgpack_value]
 // RESPONSE payload: [request_id: u32, ok: bool, result_or_error: msgpack_value]
 // STREAM_START payload: [probe_names: [str]] — probe name table
-// STREAM_END payload: [] — empty
+// STREAM_END payload: [probe_id: str] — which stream ended. Was `[]`; a
+// client with more than one live subscription could not tell which stream the
+// frame referred to (jalki #51). Additive: the Python SDK ignores the payload.
 // ERROR payload: [code: str, message: str]
 // PING/PONG payload: [] — empty
 

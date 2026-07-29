@@ -22,7 +22,24 @@ IMAGE="${JALKI_TEST_IMAGE:-rust:1.97-bookworm}"
 
 CMD="${JALKI_CARGO_CMD:-test}"
 
+# The target dir is a shared named volume and cargo locks it exclusively, so a
+# second concurrent run serialises behind the first with no output of its own.
+# Refuse instead, so a wait is never mistaken for a hang.
+#
+# (I first wrote this comment claiming a 33-minute silent block had been
+# *observed* from that lock. It had not: the container was running a test that
+# hung. Guard kept, claim corrected — an unverified cause in a comment is how
+# the next person misdiagnoses the same symptom.)
+if [ -n "$(docker ps -q --filter "label=jalki-linux-test" 2>/dev/null)" ]; then
+  echo "error: another scripts/linux-test.sh is already running." >&2
+  echo "       They share a cargo target volume; a second run would block on" >&2
+  echo "       cargo's lock with no output. Wait, or:" >&2
+  echo "         docker ps --filter label=jalki-linux-test" >&2
+  exit 1
+fi
+
 exec docker run --rm -t \
+  --label jalki-linux-test \
   --platform linux/arm64 \
   -v "$REPO:/w" -w /w \
   -v jalki-linux-test-registry:/usr/local/cargo/registry \
