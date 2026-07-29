@@ -55,8 +55,7 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<(u8, u8, 
     let mut header = [0u8; FRAME_HEADER_LEN];
     reader.read_exact(&mut header).await?;
 
-    let frame_len =
-        u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let frame_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
     let msg_type = header[4];
     let flags = header[5];
 
@@ -196,8 +195,8 @@ async fn handle_connection(stream: UnixStream, handle: Arc<DaemonHandle>) -> Res
     }
 
     // Clean up subscriptions.
-    for (_, abort) in conn.subscriptions.drain() {
-        abort.abort();
+    for (_, sub) in conn.subscriptions.drain() {
+        sub.abort.abort();
     }
 
     drop(tx);
@@ -208,10 +207,41 @@ async fn handle_connection(stream: UnixStream, handle: Arc<DaemonHandle>) -> Res
 
 // --- Connection handler ---
 
+/// A live stream, keyed by its `stream_id`.
+///
+/// The probe id is stored, not just the abort handle. Without it
+/// `handle_unsubscribe` cannot honour the probe it is given — which is how it
+/// came to abort an arbitrary stream instead (#51).
+struct Subscription {
+    probe_id: String,
+    abort: tokio::task::AbortHandle,
+}
+
 struct ConnectionHandler {
     handle: Arc<DaemonHandle>,
-    subscriptions: HashMap<String, tokio::task::AbortHandle>,
+    subscriptions: HashMap<String, Subscription>,
     tx: mpsc::Sender<Vec<u8>>,
+}
+
+/// Abort every stream for `probe_id`, returning how many were stopped.
+///
+/// Split out from the handler so the routing can be tested without a socket:
+/// the bug this fixes was pure routing, and nothing covered it.
+fn abort_subscriptions_for(
+    subscriptions: &mut HashMap<String, Subscription>,
+    probe_id: &str,
+) -> usize {
+    let mut stopped = 0;
+    subscriptions.retain(|_, sub| {
+        if sub.probe_id == probe_id {
+            sub.abort.abort();
+            stopped += 1;
+            false
+        } else {
+            true
+        }
+    });
+    stopped
 }
 
 impl ConnectionHandler {
@@ -264,9 +294,10 @@ impl ConnectionHandler {
                     (msgpack_str("event_type"), msgpack_str(&probe.event_type)),
                     (msgpack_str("why"), msgpack_str(&probe.use_when)),
                     (msgpack_str("fields"), Value::Array(fields)),
-                    (msgpack_str("combine_with"), Value::Array(
-                        probe.combine_with.iter().map(|s| msgpack_str(s)).collect(),
-                    )),
+                    (
+                        msgpack_str("combine_with"),
+                        Value::Array(probe.combine_with.iter().map(|s| msgpack_str(s)).collect()),
+                    ),
                 ])
             })
             .collect();
@@ -279,7 +310,10 @@ impl ConnectionHandler {
         let sample_rate = get_f64(params, "sample_rate").unwrap_or(1.0);
 
         if self.handle.kb.get_probe(&function).is_none() {
-            return Err(format!("unknown function '{}' — use find() to search", function));
+            return Err(format!(
+                "unknown function '{}' — use find() to search",
+                function
+            ));
         }
 
         let probe_id = self
@@ -295,29 +329,25 @@ impl ConnectionHandler {
         ]))
     }
 
-    async fn handle_subscribe(
-        &mut self,
-        request_id: u32,
-        params: &Value,
-        flags: u8,
-    ) -> Vec<u8> {
+    async fn handle_subscribe(&mut self, request_id: u32, params: &Value, flags: u8) -> Vec<u8> {
         let probe_id = match get_str(params, "probe_id") {
             Some(id) => id,
             None => return encode_response(request_id, Err("missing 'probe_id'".into())),
         };
 
         let filter = parse_event_filter(params);
-        let interpreted = (flags & FLAG_INTERPRETED != 0)
-            || get_bool(params, "interpreted").unwrap_or(false);
+        let interpreted =
+            (flags & FLAG_INTERPRETED != 0) || get_bool(params, "interpreted").unwrap_or(false);
 
         let stream_id = ulid::Ulid::new().to_string();
 
         // Send response first.
         let response = encode_response(
             request_id,
-            Ok(Value::Map(vec![
-                (msgpack_str("stream_id"), msgpack_str(&stream_id)),
-            ])),
+            Ok(Value::Map(vec![(
+                msgpack_str("stream_id"),
+                msgpack_str(&stream_id),
+            )])),
         );
 
         let tx = self.tx.clone();
@@ -338,15 +368,13 @@ impl ConnectionHandler {
             let poll_interval = std::time::Duration::from_millis(50);
 
             loop {
-                let events = handle.store.query_since(
-                    &probe_id_clone,
-                    last_seen_id.as_deref(),
-                    &filter,
-                );
+                let events =
+                    handle
+                        .store
+                        .query_since(&probe_id_clone, last_seen_id.as_deref(), &filter);
 
                 for occ in &events {
-                    let event_frame =
-                        encode_stream_event(occ, 0, &kb, interpreted);
+                    let event_frame = encode_stream_event(occ, 0, &kb, interpreted);
                     if tx.send(event_frame).await.is_err() {
                         return;
                     }
@@ -361,8 +389,13 @@ impl ConnectionHandler {
             }
         });
 
-        self.subscriptions
-            .insert(stream_id, task.abort_handle());
+        self.subscriptions.insert(
+            stream_id,
+            Subscription {
+                probe_id,
+                abort: task.abort_handle(),
+            },
+        );
 
         response
     }
@@ -370,23 +403,31 @@ impl ConnectionHandler {
     async fn handle_unsubscribe(&mut self, params: &Value) -> Result<Value, String> {
         let probe_id = get_str(params, "probe_id").ok_or("missing 'probe_id'")?;
 
-        // Find and abort the subscription by iterating (stream_id is internal).
-        let mut found = false;
-        self.subscriptions.retain(|_, abort| {
-            if !found {
-                abort.abort();
-                found = true;
-                false
-            } else {
-                true
-            }
-        });
+        // Stop the streams for *this* probe. Previously this aborted whichever
+        // entry `retain` reached first and ignored `probe_id` entirely, so
+        // unsubscribing one probe could silently kill another's stream — and
+        // `HashMap` iteration order is randomised per process, so which one it
+        // killed varied between runs (#51).
+        let stopped = abort_subscriptions_for(&mut self.subscriptions, &probe_id);
 
-        // Send STREAM_END.
-        let end_frame = encode_frame(MSG_STREAM_END, 0, &encode_msgpack(&Value::Array(vec![])));
-        let _ = self.tx.send(end_frame).await;
+        // Only when something actually stopped. Sending STREAM_END regardless
+        // was the same bug wearing a different hat: a client unsubscribing a
+        // probe it never subscribed to would see its *other* stream terminate.
+        if stopped > 0 {
+            // Payload mirrors STREAM_START's `[probe_id]`, so a client can tell
+            // which stream ended rather than inferring it.
+            let end_arr = Value::Array(vec![msgpack_str(&probe_id)]);
+            let end_frame = encode_frame(MSG_STREAM_END, 0, &encode_msgpack(&end_arr));
+            let _ = self.tx.send(end_frame).await;
+        }
 
-        Ok(Value::Map(vec![(msgpack_str("ok"), Value::Boolean(true))]))
+        // Unsubscribing something that is not subscribed is a no-op, not an
+        // error: it leaves the caller in the state it asked for, and makes
+        // retries safe.
+        Ok(Value::Map(vec![
+            (msgpack_str("ok"), Value::Boolean(true)),
+            (msgpack_str("stopped"), Value::Integer(stopped.into())),
+        ]))
     }
 
     async fn handle_status(&self) -> Result<Value, String> {
@@ -397,10 +438,19 @@ impl ConnectionHandler {
                 Value::Map(vec![
                     (msgpack_str("probe_id"), msgpack_str(&s.probe_id)),
                     (msgpack_str("function"), msgpack_str(&s.function)),
-                    (msgpack_str("events_total"), Value::Integer(s.events_total.into())),
-                    (msgpack_str("ring_buffer_drops"), Value::Integer(s.ring_buffer_drops.into())),
+                    (
+                        msgpack_str("events_total"),
+                        Value::Integer(s.events_total.into()),
+                    ),
+                    (
+                        msgpack_str("ring_buffer_drops"),
+                        Value::Integer(s.ring_buffer_drops.into()),
+                    ),
                     (msgpack_str("sample_rate"), Value::F64(s.sample_rate)),
-                    (msgpack_str("attached_since"), msgpack_str(&s.attached_since.to_rfc3339())),
+                    (
+                        msgpack_str("attached_since"),
+                        msgpack_str(&s.attached_since.to_rfc3339()),
+                    ),
                 ])
             })
             .collect();
@@ -445,7 +495,11 @@ impl ConnectionHandler {
         }
 
         if deployed.is_empty() {
-            return Ok(encode_ask_result_kb_only(&question, &selected, &self.handle.kb));
+            return Ok(encode_ask_result_kb_only(
+                &question,
+                &selected,
+                &self.handle.kb,
+            ));
         }
 
         // 3. Collect events.
@@ -480,10 +534,7 @@ impl ConnectionHandler {
                     "critical" => 3,
                     _ => 0,
                 };
-                let compact = events
-                    .iter()
-                    .map(|e| encode_compact_event(e, kb))
-                    .collect();
+                let compact = events.iter().map(|e| encode_compact_event(e, kb)).collect();
                 return Ok(encode_ask_result(
                     &interp.conclusion,
                     sev,
@@ -495,12 +546,12 @@ impl ConnectionHandler {
             }
         }
 
-        let compact = events
-            .iter()
-            .map(|e| encode_compact_event(e, kb))
-            .collect();
+        let compact = events.iter().map(|e| encode_compact_event(e, kb)).collect();
         Ok(encode_ask_result(
-            &format!("Collected {} events but no specific interpretation matched.", events.len()),
+            &format!(
+                "Collected {} events but no specific interpretation matched.",
+                events.len()
+            ),
             0,
             "Review the events manually.",
             compact,
@@ -596,9 +647,10 @@ pub fn get_bool(v: &Value, key: &str) -> Option<bool> {
 
 fn parse_event_filter(params: &Value) -> EventFilter {
     let filter_val = match params {
-        Value::Map(pairs) => {
-            pairs.iter().find(|(k, _)| k.as_str() == Some("filter")).map(|(_, v)| v)
-        }
+        Value::Map(pairs) => pairs
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("filter"))
+            .map(|(_, v)| v),
         _ => None,
     };
 
@@ -644,9 +696,10 @@ fn encode_stream_event(
         .network_data
         .as_ref()
         .map(|n| format!("{}:{}", n.dst_ip, n.dst_port));
-    let proto: Option<u8> = occ.network_data.as_ref().map(|n| {
-        if n.protocol == "tcp" { 0 } else { 1 }
-    });
+    let proto: Option<u8> = occ
+        .network_data
+        .as_ref()
+        .map(|n| if n.protocol == "tcp" { 0 } else { 1 });
 
     let pid = occ.process_data.as_ref().map(|p| p.pid);
     let cmd = occ.process_data.as_ref().map(|p| p.command.clone());
@@ -665,9 +718,9 @@ fn encode_stream_event(
     let interp = if interpreted {
         let function = occ.source.strip_prefix("jalki/").unwrap_or(&occ.source);
         let fields = extract_event_fields(occ);
-        kb.explain(function, &fields).first().map(|i| {
-            Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)])
-        })
+        kb.explain(function, &fields)
+            .first()
+            .map(|i| Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)]))
     } else {
         None
     };
@@ -680,7 +733,9 @@ fn encode_stream_event(
         Value::Integer(outcome.into()),
         net_src.map(|s| msgpack_str(&s)).unwrap_or(Value::Nil),
         net_dst.map(|s| msgpack_str(&s)).unwrap_or(Value::Nil),
-        proto.map(|p| Value::Integer(p.into())).unwrap_or(Value::Nil),
+        proto
+            .map(|p| Value::Integer(p.into()))
+            .unwrap_or(Value::Nil),
         pid.map(|p| Value::Integer(p.into())).unwrap_or(Value::Nil),
         cmd.map(|c| msgpack_str(&c)).unwrap_or(Value::Nil),
         labels,
@@ -711,9 +766,10 @@ fn encode_compact_event(
     };
 
     let fields = extract_event_fields(occ);
-    let interp = kb.explain(probe, &fields).first().map(|i| {
-        Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)])
-    });
+    let interp = kb
+        .explain(probe, &fields)
+        .first()
+        .map(|i| Value::Array(vec![msgpack_str(&i.conclusion), msgpack_str(&i.action)]));
 
     Value::Array(vec![
         msgpack_str(&occ.id.to_string()),
@@ -744,7 +800,12 @@ fn encode_compact_event(
         if occ.labels.is_empty() {
             Value::Nil
         } else {
-            Value::Map(occ.labels.iter().map(|(k, v)| (msgpack_str(k), msgpack_str(v))).collect())
+            Value::Map(
+                occ.labels
+                    .iter()
+                    .map(|(k, v)| (msgpack_str(k), msgpack_str(v)))
+                    .collect(),
+            )
         },
         interp.unwrap_or(Value::Nil),
     ])
@@ -763,7 +824,10 @@ fn encode_ask_result(
         (msgpack_str("severity"), Value::Integer(severity.into())),
         (msgpack_str("action"), msgpack_str(action)),
         (msgpack_str("events"), Value::Array(events)),
-        (msgpack_str("probes_used"), Value::Array(probes_used.iter().map(|s| msgpack_str(s)).collect())),
+        (
+            msgpack_str("probes_used"),
+            Value::Array(probes_used.iter().map(|s| msgpack_str(s)).collect()),
+        ),
         (msgpack_str("kb_only"), Value::Boolean(kb_only)),
     ])
 }
@@ -775,7 +839,10 @@ fn encode_ask_result_kb_only(
 ) -> Value {
     let mut parts = Vec::new();
     for probe in selected {
-        parts.push(format!("**{}** ({}): {}", probe.function, probe.attachment, probe.use_when));
+        parts.push(format!(
+            "**{}** ({}): {}",
+            probe.function, probe.attachment, probe.use_when
+        ));
     }
     let interpretation = parts.join("\n\n");
 
@@ -811,11 +878,9 @@ fn extract_event_fields(occ: &false_protocol::Occurrence) -> EventFields {
 /// Backwards-compatible client: speaks binary frames but presents JSON interface.
 /// CLI and MCP call this with method name strings and get JSON back.
 pub async fn connect() -> Result<UnixStream> {
-    UnixStream::connect(SOCKET_PATH)
-        .await
-        .with_context(|| format!(
-            "failed to connect to jalki daemon at {SOCKET_PATH}. Is the daemon running?"
-        ))
+    UnixStream::connect(SOCKET_PATH).await.with_context(|| {
+        format!("failed to connect to jalki daemon at {SOCKET_PATH}. Is the daemon running?")
+    })
 }
 
 /// IPC response — carries native msgpack values, no JSON conversion.
@@ -828,11 +893,19 @@ pub struct Response {
 
 impl Response {
     fn success(result: Value) -> Self {
-        Self { ok: true, result: Some(result), error: None }
+        Self {
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
     }
 
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, result: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+        }
     }
 
     /// Get a string field from the result map.
@@ -852,7 +925,10 @@ impl Response {
 
     /// Get the result as an array slice.
     pub fn as_array(&self) -> Option<&[Value]> {
-        self.result.as_ref().and_then(|v| v.as_array()).map(|v| v.as_slice())
+        self.result
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|v| v.as_slice())
     }
 
     /// Convert result to JSON (for MCP compatibility layer).
@@ -885,7 +961,9 @@ pub async fn call_native(method: u8, params: Value) -> Result<Response> {
     let (msg_type, _flags, resp_payload) = read_frame(&mut reader).await?;
 
     if msg_type != MSG_RESPONSE {
-        return Ok(Response::err(format!("unexpected response type: {msg_type}")));
+        return Ok(Response::err(format!(
+            "unexpected response type: {msg_type}"
+        )));
     }
 
     let resp_value = decode_msgpack(&resp_payload)?;
@@ -939,16 +1017,12 @@ fn json_to_msgpack(v: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => msgpack_str(s),
-        serde_json::Value::Array(arr) => {
-            Value::Array(arr.iter().map(json_to_msgpack).collect())
-        }
-        serde_json::Value::Object(map) => {
-            Value::Map(
-                map.iter()
-                    .map(|(k, v)| (msgpack_str(k), json_to_msgpack(v)))
-                    .collect(),
-            )
-        }
+        serde_json::Value::Array(arr) => Value::Array(arr.iter().map(json_to_msgpack).collect()),
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (msgpack_str(k), json_to_msgpack(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -969,9 +1043,7 @@ fn msgpack_to_json(v: &Value) -> serde_json::Value {
         Value::F64(f) => serde_json::json!(*f),
         Value::String(s) => serde_json::Value::String(s.as_str().unwrap_or("").to_string()),
         Value::Binary(b) => serde_json::Value::String(String::from_utf8_lossy(b).to_string()),
-        Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(msgpack_to_json).collect())
-        }
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(msgpack_to_json).collect()),
         Value::Map(pairs) => {
             let mut map = serde_json::Map::new();
             for (k, v) in pairs {
@@ -990,6 +1062,7 @@ fn msgpack_to_json(v: &Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn encode_decode_frame_roundtrip() {
@@ -1033,6 +1106,99 @@ mod tests {
                 _ => 0,
             },
             METHOD_DEPLOY
+        );
+    }
+
+    // ── unsubscribe routing (jalki #51) ─────────────────────────────────────
+
+    /// A subscription whose task never completes on its own, so "was it
+    /// aborted?" is answerable from the `JoinHandle`. Asserting via a `Drop`
+    /// guard does not work: a spawned task that is aborted before it is first
+    /// polled never runs its body at all.
+    /// Assert a task was aborted, bounded. Awaiting an un-aborted `pending()`
+    /// task blocks forever, so a routing regression would hang the suite rather
+    /// than fail it — which is exactly what happened the first time I tested
+    /// this against the pre-fix code: the run sat for over half an hour looking
+    /// like an infrastructure problem.
+    async fn assert_aborted(task: tokio::task::JoinHandle<()>, which: &str) {
+        match tokio::time::timeout(Duration::from_secs(2), task).await {
+            Ok(joined) => assert!(
+                joined.unwrap_err().is_cancelled(),
+                "{which} finished instead of being aborted"
+            ),
+            Err(_) => panic!("{which} was never aborted — unsubscribe stopped the wrong stream"),
+        }
+    }
+
+    fn sub(probe_id: &str) -> (Subscription, tokio::task::JoinHandle<()>) {
+        let task = tokio::spawn(std::future::pending::<()>());
+        (
+            Subscription {
+                probe_id: probe_id.to_string(),
+                abort: task.abort_handle(),
+            },
+            task,
+        )
+    }
+
+    /// The bug: `probe_id` was required, then ignored, and whichever entry
+    /// `HashMap` iteration reached first was aborted. Unsubscribing one probe
+    /// could kill another's stream — non-deterministically, since Rust
+    /// randomises `HashMap` order per process.
+    #[tokio::test]
+    async fn unsubscribe_stops_only_the_named_probe() {
+        let mut subs = HashMap::new();
+        let (a, a_task) = sub("tcp_connect");
+        let (b, b_task) = sub("tcp_retransmit");
+        subs.insert("stream-a".to_string(), a);
+        subs.insert("stream-b".to_string(), b);
+
+        let stopped = abort_subscriptions_for(&mut subs, "tcp_retransmit");
+
+        assert_eq!(stopped, 1);
+        assert_aborted(b_task, "the probe that was asked for").await;
+        assert!(
+            !a_task.is_finished(),
+            "the probe that was NOT asked for must keep streaming"
+        );
+        assert!(subs.contains_key("stream-a"));
+        assert!(!subs.contains_key("stream-b"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_stops_every_stream_for_that_probe() {
+        // Two subscriptions to the same probe: stopping "an arbitrary one" is
+        // not what the caller asked for.
+        let mut subs = HashMap::new();
+        let (a, a_task) = sub("tcp_connect");
+        let (b, b_task) = sub("tcp_connect");
+        let (c, c_task) = sub("process_exec");
+        subs.insert("s1".to_string(), a);
+        subs.insert("s2".to_string(), b);
+        subs.insert("s3".to_string(), c);
+
+        assert_eq!(abort_subscriptions_for(&mut subs, "tcp_connect"), 2);
+
+        assert_aborted(a_task, "first tcp_connect stream").await;
+        assert_aborted(b_task, "second tcp_connect stream").await;
+        assert!(!c_task.is_finished(), "the unrelated probe keeps streaming");
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_an_unsubscribed_probe_touches_nothing() {
+        let mut subs = HashMap::new();
+        let (a, a_task) = sub("tcp_connect");
+        subs.insert("s1".to_string(), a);
+
+        assert_eq!(abort_subscriptions_for(&mut subs, "never_subscribed"), 0);
+
+        assert_eq!(subs.len(), 1);
+        assert!(
+            !a_task.is_finished(),
+            "an unrelated unsubscribe must not disturb a live stream — and \
+             because 0 stopped means no STREAM_END is sent, the client's other \
+             stream is not told it ended either"
         );
     }
 }
