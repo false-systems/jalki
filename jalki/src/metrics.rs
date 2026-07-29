@@ -92,6 +92,9 @@ pub struct Metrics {
     /// agent could not resolve its own cgroup, which is a real state and not
     /// the same as "no pressure" — the startup log says which.
     pub memory_usage_ratio: Gauge<f64, AtomicU64>,
+    /// Bytes of backlog currently on disk (jalki #33). 0 means either nothing
+    /// buffered or no spool — `/readyz` and the log distinguish them.
+    pub spool_bytes: Gauge,
 }
 
 impl Default for Metrics {
@@ -182,6 +185,13 @@ impl Metrics {
             retry_oldest_age_seconds.clone(),
         );
 
+        let spool_bytes = Gauge::default();
+        registry.register(
+            "jalki_spool_bytes",
+            "Bytes of undelivered evidence persisted to disk",
+            spool_bytes.clone(),
+        );
+
         let memory_usage_ratio = Gauge::<f64, AtomicU64>::default();
         registry.register(
             "jalki_memory_usage_ratio",
@@ -204,6 +214,7 @@ impl Metrics {
             retry_queued_bytes,
             retry_oldest_age_seconds,
             memory_usage_ratio,
+            spool_bytes,
         }
     }
 

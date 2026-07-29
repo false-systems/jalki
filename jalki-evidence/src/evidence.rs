@@ -6,6 +6,7 @@
 //! on the [`EvidenceBatch`]; fields constant per probe, plus the observed time,
 //! live on each [`EvidenceRecord`]. A sink projects both onto the final record.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use false_protocol::{Occurrence, Severity};
@@ -18,7 +19,7 @@ use false_protocol::{Occurrence, Severity};
 pub const SCHEMA_VERSION: &str = "1";
 
 /// How a probe attaches to the kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HookKind {
     Fentry,
     Fexit,
@@ -38,7 +39,7 @@ impl HookKind {
 }
 
 /// Metadata constant for the lifetime of an agent process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProducerMetadata {
     pub producer: String,
     pub producer_version: String,
@@ -67,7 +68,7 @@ impl ProducerMetadata {
 }
 
 /// Metadata constant for a given probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeMetadata {
     pub probe_id: String,
     pub probe_version: String,
@@ -81,7 +82,7 @@ pub struct ProbeMetadata {
 /// Plane B requires a strong binding (`pod_uid` or `container_id`) before an
 /// event is forwarded to Vartio. Plane A may still retain unbound events for
 /// local debugging.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeBinding {
     Bound {
         container_id: String,
@@ -117,7 +118,7 @@ impl RuntimeBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindingProvenance {
     Observed,
     DerivedFromCache,
@@ -132,7 +133,7 @@ impl BindingProvenance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum UnboundReason {
     HostProcess,
     CacheMiss,
@@ -156,7 +157,7 @@ impl UnboundReason {
 /// `observed_at_ns` is the kernel's monotonic timestamp (CLOCK_BOOTTIME-domain),
 /// preserved verbatim. Wall-clock correlation and Ahti's ingest-time
 /// (`Occurrence.received_at`) are added downstream; jälki never sets ingest-time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceRecord {
     pub observed_at_ns: u64,
     pub pid: u32,
@@ -413,7 +414,7 @@ impl NormalizedEvidence {
 }
 
 /// A batch of records ready to hand to a sink.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceBatch {
     pub batch_id: String,
     pub producer: ProducerMetadata,

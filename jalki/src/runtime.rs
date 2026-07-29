@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
     gap_for_batch, DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink,
     GapReport, HookKind, MemoryPressure, Pace, ProbeMetadata, ProducerMetadata, RetryBackoff,
-    RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError,
+    RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError, Spool, SpoolConfig,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant as Deadline;
@@ -261,6 +261,18 @@ impl Runtime {
                  Set JALKI_MEMORY_LIMIT_BYTES (downward API: resources.limits.memory)"
             ),
         }
+        let spool = spool_from_env();
+        match &spool {
+            Some(s) => info!(
+                path = %s.path().display(),
+                existing_bytes = s.bytes(),
+                "backlog spool armed: buffered evidence survives a restart"
+            ),
+            None => info!(
+                "backlog spool OFF (set JALKI_SPOOL_PATH): an OOM or restart \
+                 during a sink outage loses whatever is buffered"
+            ),
+        }
         let backoff_config = RetryBackoffConfig::from_env();
         info!(
             base_ms = backoff_config.base_ms,
@@ -280,6 +292,7 @@ impl Runtime {
             backoff_config,
             pace_config,
             memory_pressure,
+            spool,
         }));
 
         // Spawn metrics server.
@@ -507,6 +520,9 @@ pub(crate) struct SinkLoop {
     /// feature is off, and the startup log says so rather than leaving it to
     /// look like permanent headroom.
     pub memory_pressure: Option<MemoryPressure>,
+    /// `None` when no spool location is usable — delivery works without it,
+    /// just without surviving a restart.
+    pub spool: Option<Spool>,
 }
 
 /// One `EvidenceBatch` per ring-buffer drain cycle, with a bounded retry buffer
@@ -523,13 +539,45 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         backoff_config,
         pace_config,
         memory_pressure,
+        mut spool,
     } = loop_state;
     let memory_high_watermark = memory_high_watermark();
 
     let mut retry_buffer = RetryBuffer::new(retry_config);
     let mut backoff = RetryBackoff::new(backoff_config);
     let mut pacer = DrainPacer::new(pace_config);
+
     let mut pending_gaps = PendingGaps::default();
+
+    // Anything a previous process was still holding. This runs before the first
+    // event is taken, so replayed evidence keeps its place at the head of the
+    // queue rather than landing behind whatever arrives next.
+    if let Some(spool) = &mut spool {
+        let (batches, report) = Spool::replay(spool.path());
+        if report.batches > 0 || report.torn_tail_bytes > 0 {
+            info!(
+                batches = report.batches,
+                records = report.records,
+                torn_tail_bytes = report.torn_tail_bytes,
+                "recovered spooled evidence from a previous run"
+            );
+        }
+        if report.torn_tail_bytes > 0 {
+            // Expected — the process was killed mid-write, which is the whole
+            // scenario — but it is still lost evidence and gets a gap.
+            warn!(
+                torn_tail_bytes = report.torn_tail_bytes,
+                "spool tail was incomplete; those bytes are lost"
+            );
+        }
+        for batch in batches {
+            pending_gaps.extend(retry_buffer.enqueue(batch, 0));
+        }
+        // Rewrite from what actually made it into the buffer: replay may have
+        // over-filled it, and the shed that followed must not be re-replayed on
+        // the next restart.
+        spool.compact(retry_buffer.iter_batches());
+    }
     let retry_clock_start = Deadline::now();
     // Absolute deadline of the next retry sweep; `None` means there is
     // no backlog and the timer arm stays disabled, so an idle agent
@@ -629,6 +677,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         &metrics_clone,
                     );
                 }
+                sync_spool(&mut spool, &retry_buffer, &metrics_clone);
                 publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
                 next_retry = schedule_retry(
                     next_retry,
@@ -672,6 +721,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         &metrics_clone,
                     );
                 }
+                sync_spool(&mut spool, &retry_buffer, &metrics_clone);
                 publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
 
                 next_retry = match outcome {
@@ -718,6 +768,8 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         }
     }
 
+    sync_spool(&mut spool, &retry_buffer, &metrics_clone);
+
     if !retry_buffer.is_empty() || !pending_gaps.is_empty() {
         // The sink is still refusing at shutdown, so this evidence dies with
         // the process. It is a real loss and it gets said out loud — silence
@@ -730,11 +782,57 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
             lost_records = retry_buffer.len_records(),
             lost_bytes = retry_buffer.len_bytes(),
             pending_gap_reports = pending_gaps.len(),
-            "sink loop exiting with an undeliverable backlog; this evidence is lost"
+            spooled = spool.as_ref().map(|s| s.bytes()).unwrap_or(0),
+            "sink loop exiting with an undeliverable backlog"
         );
+        if spool.is_none() {
+            error!("no spool configured, so that backlog is lost with this process");
+        }
     }
 
     info!("sink loop finished");
+}
+
+/// Rewrite the spool to match the buffer.
+///
+/// Compaction rather than an append/cursor scheme. The buffer is small and
+/// bounded, so rewriting is cheap, and "the file is exactly what is still
+/// undelivered" is an invariant that cannot drift — whereas an offset into an
+/// append log has to stay correct across shedding, expiry and partial drains,
+/// each of which is a chance to replay evidence twice or lose it.
+fn sync_spool(spool: &mut Option<Spool>, retry_buffer: &RetryBuffer, metrics: &Metrics) {
+    let Some(s) = spool else { return };
+    if s.is_disabled() {
+        return;
+    }
+    s.compact(retry_buffer.iter_batches());
+    metrics.spool_bytes.set(s.bytes() as i64);
+    if let Some(reason) = s.disabled_reason() {
+        // Once, on the transition: delivery continues without a spool, but an
+        // operator should not have to infer that from a missing file.
+        warn!(
+            error = reason,
+            "backlog spool failed and is now off; evidence no longer survives a restart"
+        );
+    }
+}
+
+/// Open the on-disk backlog if a location is configured.
+///
+/// Off unless `JALKI_SPOOL_PATH` is set: it needs a writable volume, and
+/// silently writing into the container's ephemeral root would be worse than
+/// not spooling at all — it fills the node's ephemeral storage and gets the
+/// pod evicted, which is the failure being avoided, reached differently.
+fn spool_from_env() -> Option<Spool> {
+    let path = std::env::var("JALKI_SPOOL_PATH").ok()?;
+    let max_bytes = std::env::var("JALKI_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(256 * 1024 * 1024);
+    Spool::open(SpoolConfig {
+        path: PathBuf::from(path),
+        max_bytes,
+    })
 }
 
 /// Shed the retry buffer once the cgroup passes this fraction of its limit.
@@ -1359,6 +1457,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jalki_evidence::{Spool, SpoolConfig};
 
     #[test]
     fn pending_gap_retries_keep_the_same_ids() {
@@ -1505,6 +1604,7 @@ mod tests {
             backoff_config,
             pace_config,
             memory_pressure: None,
+            spool: None,
         }));
         Harness {
             tx,
@@ -2270,5 +2370,134 @@ mod tests {
             metrics.memory_usage_ratio.get() > 0.0,
             "but it is still measured"
         );
+    }
+
+    // ── the backlog outlives the process (jalki #33) ────────────────────────
+
+    fn spool_at(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("jalki-loop-spool-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("backlog.spool")
+    }
+
+    fn spool_loop(path: &std::path::Path) -> Harness {
+        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(64);
+        let up = Arc::new(AtomicBool::new(false));
+        let overloaded = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(StdMutex::new(Vec::new()));
+        let metrics = Arc::new(Metrics::new());
+        let handle = tokio::spawn(run_sink_loop(SinkLoop {
+            rx,
+            sink: Box::new(ControlledSink {
+                up: up.clone(),
+                overloaded: overloaded.clone(),
+                attempts: attempts.clone(),
+                delivered: delivered.clone(),
+                append_cost: Duration::ZERO,
+            }),
+            metrics: metrics.clone(),
+            producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
+            enricher: Arc::new(NoopEnricher),
+            namespace_allowlist: None,
+            retry_config: RetryBufferConfig::default(),
+            backoff_config: RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            pace_config: DrainPaceConfig {
+                max_bytes_per_sec: u64::MAX / 4,
+                max_batches_per_sec: u64::MAX / 4,
+                ..DrainPaceConfig::default()
+            },
+            memory_pressure: None,
+            spool: Spool::open(SpoolConfig {
+                path: path.to_path_buf(),
+                max_bytes: 16 * 1024 * 1024,
+            }),
+        }));
+        Harness {
+            tx,
+            up,
+            overloaded,
+            attempts,
+            delivered,
+            metrics,
+            handle,
+        }
+    }
+
+    /// #33's outstanding acceptance criterion since it was filed: restart
+    /// mid-outage and the evidence buffered before the restart still gets
+    /// delivered. Until now an OOM kill during an outage destroyed exactly the
+    /// evidence that outage produced.
+    #[tokio::test(start_paused = true)]
+    async fn evidence_buffered_before_a_restart_is_delivered_after_it() {
+        let path = spool_at("restart");
+
+        // First process: sink is down, evidence accumulates, process ends.
+        {
+            let h = spool_loop(&path);
+            for _ in 0..6 {
+                h.tx.send(one_record()).await.unwrap();
+            }
+            drain(&h).await;
+            assert!(
+                h.metrics.spool_bytes.get() > 0,
+                "the backlog reached disk while the sink was down"
+            );
+            assert!(
+                h.delivered.lock().unwrap().is_empty(),
+                "nothing got through"
+            );
+            drop(h.tx);
+            let _ = h.handle.await;
+        }
+
+        // Second process: same spool, sink is back.
+        {
+            let h = spool_loop(&path);
+            h.up.store(true, Ordering::SeqCst);
+            h.tx.send(one_record()).await.unwrap();
+            advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
+
+            assert_eq!(
+                h.delivered.lock().unwrap().len(),
+                7,
+                "all six recovered batches, plus the new one"
+            );
+            drop(h.tx);
+            let _ = h.handle.await;
+        }
+
+        // And nothing is left to replay a third time.
+        let (remaining, _) = Spool::replay(&path);
+        assert!(
+            remaining.is_empty(),
+            "delivered evidence must not be re-delivered on the next restart"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delivered_backlog_leaves_nothing_on_disk() {
+        let path = spool_at("drains");
+        let h = spool_loop(&path);
+        h.up.store(true, Ordering::SeqCst);
+        for _ in 0..5 {
+            h.tx.send(one_record()).await.unwrap();
+        }
+        advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
+
+        assert_eq!(h.delivered.lock().unwrap().len(), 5);
+        assert_eq!(
+            h.metrics.spool_bytes.get(),
+            0,
+            "a healthy sink leaves no disk residue to replay"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
     }
 }

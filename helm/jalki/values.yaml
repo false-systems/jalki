@@ -63,6 +63,18 @@ retry:
 memory:
   highWatermark: ""
 
+# On-disk mirror of the retry buffer, so an OOM kill or restart during a sink
+# outage does not destroy the evidence that outage produced. Backed by an
+# emptyDir: survives container restarts, not rescheduling.
+spool:
+  enabled: true
+  mountPath: /var/lib/jalki
+  # The agent stops appending here; the in-memory bounds still apply.
+  maxBytes: 268435456
+  # The kubelet's own cap on the volume. Above maxBytes so the agent's bound
+  # is the one that engages — hitting this one evicts the pod.
+  sizeLimit: 512Mi
+
 # /readyz reports NotReady once undeliverable evidence has been held this long.
 # Keep it comfortably above retry.backoffMaxMs so a blip cannot flap the probe.
 readiness:
