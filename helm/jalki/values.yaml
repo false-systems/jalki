@@ -56,6 +56,13 @@ retry:
   backoffBaseMs: ""
   backoffMaxMs: ""
 
+# Fraction of the pod memory limit at which the agent starts shedding buffered
+# evidence itself. Empty uses the binary default (0.8). Shedding deliberately
+# costs some records and emits gap evidence; being OOM-killed costs the entire
+# backlog and reports nothing.
+memory:
+  highWatermark: ""
+
 # /readyz reports NotReady once undeliverable evidence has been held this long.
 # Keep it comfortably above retry.backoffMaxMs so a blip cannot flap the probe.
 readiness:

@@ -35,6 +35,10 @@ retry:
   maxBytes: 67108864
   maxRecords: 120000
 
+# Binary default (0.8); false-infra does not override it.
+memory:
+  highWatermark: ""
+
 # The published image is arm64-only; the control-plane node is amd64.
 nodeSelector:
   kubernetes.io/arch: arm64

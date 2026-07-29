@@ -9,8 +9,8 @@ use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
     gap_for_batch, DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink,
-    GapReport, HookKind, Pace, ProbeMetadata, ProducerMetadata, RetryBackoff, RetryBackoffConfig,
-    RetryBuffer, RetryBufferConfig, SinkError,
+    GapReport, HookKind, MemoryPressure, Pace, ProbeMetadata, ProducerMetadata, RetryBackoff,
+    RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant as Deadline;
@@ -235,6 +235,32 @@ impl Runtime {
             "post-outage backlog drains are rate-bounded and back off on sink \
              backpressure (tune via JALKI_DRAIN_MAX_{{BYTES,BATCHES}}_PER_SEC)"
         );
+        let declared_limit = std::env::var("JALKI_MEMORY_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let memory_pressure = MemoryPressure::detect(
+            Path::new(
+                &std::env::var("JALKI_CGROUP_ROOT").unwrap_or_else(|_| "/sys/fs/cgroup".into()),
+            ),
+            declared_limit,
+        );
+        match &memory_pressure {
+            Some(p) => info!(
+                limit_bytes = p.limit_bytes(),
+                source = ?p.source(),
+                watermark = memory_high_watermark(),
+                "self-shedding armed: buffered evidence is given up before the \
+                 kernel OOM-kills the agent (an OOM loses the whole backlog and \
+                 reports nothing)"
+            ),
+            // Loud, because the failure mode is silent: jälki mounts the host
+            // cgroupfs, so an unresolved limit reads as the node root — which
+            // is unbounded, and would look like endless headroom.
+            None => warn!(
+                "self-shedding OFF: could not establish this agent's memory limit. \
+                 Set JALKI_MEMORY_LIMIT_BYTES (downward API: resources.limits.memory)"
+            ),
+        }
         let backoff_config = RetryBackoffConfig::from_env();
         info!(
             base_ms = backoff_config.base_ms,
@@ -253,6 +279,7 @@ impl Runtime {
             retry_config,
             backoff_config,
             pace_config,
+            memory_pressure,
         }));
 
         // Spawn metrics server.
@@ -476,6 +503,10 @@ pub(crate) struct SinkLoop {
     pub retry_config: RetryBufferConfig,
     pub backoff_config: RetryBackoffConfig,
     pub pace_config: DrainPaceConfig,
+    /// `None` when the agent could not establish its own memory limit — the
+    /// feature is off, and the startup log says so rather than leaving it to
+    /// look like permanent headroom.
+    pub memory_pressure: Option<MemoryPressure>,
 }
 
 /// One `EvidenceBatch` per ring-buffer drain cycle, with a bounded retry buffer
@@ -491,7 +522,9 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         retry_config,
         backoff_config,
         pace_config,
+        memory_pressure,
     } = loop_state;
+    let memory_high_watermark = memory_high_watermark();
 
     let mut retry_buffer = RetryBuffer::new(retry_config);
     let mut backoff = RetryBackoff::new(backoff_config);
@@ -587,6 +620,15 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                     pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
                 }
 
+                if let Some(pressure) = &memory_pressure {
+                    shed_under_memory_pressure(
+                        pressure,
+                        memory_high_watermark,
+                        &mut retry_buffer,
+                        &mut pending_gaps,
+                        &metrics_clone,
+                    );
+                }
                 publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
                 next_retry = schedule_retry(
                     next_retry,
@@ -620,6 +662,15 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                 // the ladder rather than wherever this one ended.
                 if backlog_len(&retry_buffer, &pending_gaps) < before {
                     backoff.reset();
+                }
+                if let Some(pressure) = &memory_pressure {
+                    shed_under_memory_pressure(
+                        pressure,
+                        memory_high_watermark,
+                        &mut retry_buffer,
+                        &mut pending_gaps,
+                        &metrics_clone,
+                    );
                 }
                 publish_backlog_metrics(&metrics_clone, &retry_buffer, now_ms);
 
@@ -684,6 +735,63 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
     }
 
     info!("sink loop finished");
+}
+
+/// Shed the retry buffer once the cgroup passes this fraction of its limit.
+/// 0.8 leaves room for the shed itself to be observed and for the working set
+/// to spike while it happens.
+const DEFAULT_MEMORY_HIGH_WATERMARK: f64 = 0.8;
+
+/// Shed down to this fraction of the buffer's current size when it triggers.
+/// Shedding a slice rather than everything keeps a brief spike from costing the
+/// whole backlog.
+const MEMORY_SHED_FRACTION: f64 = 0.5;
+
+fn memory_high_watermark() -> f64 {
+    std::env::var("JALKI_MEMORY_HIGH_WATERMARK")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(DEFAULT_MEMORY_HIGH_WATERMARK)
+}
+
+/// Give back buffer memory before the kernel takes the process.
+///
+/// An OOM kill loses the entire backlog *and* produces no gap evidence — the
+/// one loss the pipeline cannot describe afterwards. Shedding deliberately
+/// costs the same records and says so.
+fn shed_under_memory_pressure(
+    pressure: &MemoryPressure,
+    high_watermark: f64,
+    retry_buffer: &mut RetryBuffer,
+    pending_gaps: &mut PendingGaps,
+    metrics: &Metrics,
+) {
+    let Some(ratio) = pressure.ratio() else {
+        return;
+    };
+    metrics.memory_usage_ratio.set(ratio);
+    if ratio < high_watermark || retry_buffer.is_empty() {
+        return;
+    }
+
+    let before = retry_buffer.len_bytes();
+    let target = (before as f64 * MEMORY_SHED_FRACTION) as usize;
+    let gaps = retry_buffer.shed_to(target);
+    if gaps.is_empty() {
+        return;
+    }
+
+    let dropped: usize = gaps.iter().map(|g| g.dropped_records).sum();
+    warn!(
+        memory_ratio = ratio,
+        limit_bytes = pressure.limit_bytes(),
+        dropped_records = dropped,
+        freed_bytes = before.saturating_sub(retry_buffer.len_bytes()),
+        "shedding buffered evidence under memory pressure; an OOM kill would \
+         have cost the whole backlog and reported nothing"
+    );
+    pending_gaps.extend(gaps);
 }
 
 /// How far out to park the retry timer when there is no backlog. Never elapses
@@ -1396,6 +1504,7 @@ mod tests {
             retry_config: RetryBufferConfig::default(),
             backoff_config,
             pace_config,
+            memory_pressure: None,
         }));
         Harness {
             tx,
@@ -2092,5 +2201,74 @@ mod tests {
             "if one slice emptied it, the bound is not doing anything"
         );
         assert_eq!(delivered.lock().unwrap().len(), 40, "and nothing is lost");
+    }
+
+    // ── self-shedding under memory pressure (jalki #33) ─────────────────────
+
+    fn fake_cgroup(name: &str, current: u64, max: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jalki-rt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
+        std::fs::write(dir.join("memory.max"), format!("{max}\n")).unwrap();
+        dir
+    }
+
+    /// The whole point: an OOM kill costs the entire backlog *and* reports
+    /// nothing, which is the one loss the pipeline cannot describe afterwards.
+    /// Shedding deliberately costs some of the same records and says so.
+    #[test]
+    fn pressure_above_the_watermark_sheds_and_reports() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        for _ in 0..20 {
+            buffer.enqueue(EvidenceBatch::new(producer.clone(), one_record()), 0);
+        }
+        let before = buffer.len_bytes();
+
+        // 900Mi of a 1Gi limit.
+        let dir = fake_cgroup("high", 943_718_400, "1073741824");
+        let pressure = MemoryPressure::detect(&dir, None).expect("detected");
+
+        shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
+
+        assert!(buffer.len_bytes() < before, "it gave memory back");
+        assert!(!gaps.is_empty(), "and the loss is reported, not silent");
+        assert!(
+            metrics.memory_usage_ratio.get() > 0.8,
+            "the ratio is exported so an operator can see it coming"
+        );
+    }
+
+    #[test]
+    fn pressure_below_the_watermark_keeps_the_backlog() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        for _ in 0..20 {
+            buffer.enqueue(EvidenceBatch::new(producer.clone(), one_record()), 0);
+        }
+        let before = buffer.len_bytes();
+
+        // 300Mi of 1Gi — comfortable. Buffered evidence is the thing we are
+        // trying to deliver; shedding it early would be self-defeating.
+        let dir = fake_cgroup("low", 314_572_800, "1073741824");
+        let pressure = MemoryPressure::detect(&dir, None).expect("detected");
+
+        shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
+
+        assert_eq!(
+            buffer.len_bytes(),
+            before,
+            "nothing shed under normal usage"
+        );
+        assert!(gaps.is_empty());
+        assert!(
+            metrics.memory_usage_ratio.get() > 0.0,
+            "but it is still measured"
+        );
     }
 }

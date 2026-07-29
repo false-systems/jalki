@@ -7,12 +7,14 @@
 //!
 //! See `docs/jalki/adr/0001-evidence-sinks-and-probe-intelligence.md` (decision D3).
 
+pub mod cgroup;
 pub mod event;
 pub mod evidence;
 pub mod normalize;
 pub mod retry;
 pub mod sink;
 
+pub use cgroup::{LimitSource, MemoryPressure};
 pub use event::{
     DecodeError, FileOpenEvent, KernelEvent, ProcessExecEvent, TcpCloseEvent, TcpConnectEvent,
     TcpRetransmitEvent, TcpState,
