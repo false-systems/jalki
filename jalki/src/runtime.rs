@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -169,6 +169,7 @@ impl Runtime {
             cluster: self.cluster.clone(),
             enricher: self.enricher.clone(),
             sensitive_path_matcher: sensitive_path_matcher.clone(),
+            generated_probes: Mutex::new(HashMap::new()),
         });
 
         // Spawn self-observability: periodically emit drops/errors as evidence.
@@ -294,6 +295,19 @@ pub struct DaemonHandle {
     pub cluster: String,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_path_matcher: Arc<sensitive_paths::SensitivePathMatcher>,
+    /// BPF objects for runtime-generated probes, keyed by kernel function.
+    ///
+    /// Owned rather than forgotten. `deploy_codegen` used to end in
+    /// `std::mem::forget(gen_ebpf)` to keep the loaded programs alive, which
+    /// kept them alive by *leaking* them: programs and maps stayed resident
+    /// with no owner and no way to unload them, one per distinct function
+    /// deployed over IPC/MCP, for the life of the process (#19).
+    ///
+    /// Holding them here means they are released when the handle drops, and —
+    /// more to the point — that a detach path has something to release. There
+    /// is no detach path yet; that is the other half of #19's acceptance and
+    /// needs its own change.
+    generated_probes: Mutex<HashMap<String, Ebpf>>,
 }
 
 impl DaemonHandle {
@@ -409,10 +423,30 @@ impl DaemonHandle {
             self.sensitive_path_matcher.clone(),
         )?;
 
-        // Keep the generated Ebpf object alive (it owns the loaded programs).
-        // TODO: Store in a Vec<Ebpf> on DaemonHandle to prevent drop.
-        // For now, leak it — this is correct but not ideal.
-        std::mem::forget(gen_ebpf);
+        // Take ownership of the generated object; it owns the loaded programs
+        // and maps, so it has to outlive the probe. Previously this was
+        // `std::mem::forget`, which achieved that by leaking (#19).
+        //
+        // Note the ordering: `registry.attach` above refuses a probe whose name
+        // is already attached, and its `?` drops `gen_ebpf` normally — so a
+        // rejected redeploy already unloaded correctly. Only successful deploys
+        // reached the forget, which is why the leak was one object per distinct
+        // function rather than one per call.
+        if let Some(previous) = self
+            .generated_probes
+            .lock()
+            .await
+            .insert(function.to_string(), gen_ebpf)
+        {
+            // Unreachable while the registry rejects duplicate names; if that
+            // guarantee ever changes, drop the old object rather than silently
+            // replacing it and leaking again.
+            warn!(
+                function = function,
+                "replaced an existing generated probe; unloading the previous BPF object"
+            );
+            drop(previous);
+        }
 
         Ok(probe_id.to_string())
     }
