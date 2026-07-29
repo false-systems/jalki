@@ -1,31 +1,89 @@
 image:
   repository: ghcr.io/false-systems/jalki
-  tag: "0.1.0"
-  pullPolicy: IfNotPresent
+  # Track the branch tag by default; pin a digest for reproducibility. If you
+  # pin one, it must be the multi-arch **index** digest, not a per-platform
+  # digest — a platform digest works only until the pod reschedules onto the
+  # other architecture, then ImagePullBackOff.
+  tag: "main"
+  # `main` is mutable: without Always, nodes keep whatever digest they first
+  # pulled and a rollout restart silently reuses it.
+  pullPolicy: Always
+  # The GHCR package is private.
+  pullSecrets:
+    - name: ghcr-pull
 
+# Cluster name stamped into every FALSE Protocol Occurrence.
 cluster: ""
 
-emit: "stdout"
+# Primary evidence sink: "stdout", "file", "vartio", or a file path.
+sink: "stdout"
+
+vartio:
+  # gRPC source-ingress endpoint, e.g. http://vartio.vartio.svc.cluster.local:50061.
+  # Required when sink is "vartio".
+  endpoint: ""
+  adapterId: "jalki"
+  # Ship the kernel.file.* family. Off by default: the receiving Importer.Jalki
+  # must accept these types first (ADR-0005 §4), and file opens are far more
+  # frequent than exec/connect — this is the knob most likely to multiply
+  # evidence volume.
+  fileTypes: false
+  # Bearer token for SourceIngress (ADR-0004 D1-a). Created out of band; the
+  # value must never appear in this chart.
+  ingressTokenSecret:
+    name: jalki-vartio-token
+    key: ingress-token
+
+# Pod/container enrichment via a node-scoped pod watcher. Requires the pods
+# get/list/watch rule in rbac and the cgroupfs mount, both of which follow this
+# flag.
+k8sEnrichment: false
+
+# Source-side volume control: deliver only evidence bound to these namespaces.
+# Empty means the whole-node firehose, which OOM-spiralled Ahti on 2026-07-18 —
+# widen deliberately.
+namespaces: []
+
+# Retry-buffer bounds while the sink is unavailable. The byte budget is the
+# binding constraint: a record-count cap alone never engages before the kernel
+# OOM-kills the agent. Size it well under the memory limit minus the ~150-260Mi
+# steady-state baseline.
+retry:
+  maxBytes: 67108864
+  maxRecords: 120000
+  # Empty values fall through to the binary's defaults.
+  maxAgeMs: ""
+  backoffBaseMs: ""
+  backoffMaxMs: ""
+
+# /readyz reports NotReady once undeliverable evidence has been held this long.
+# Keep it comfortably above retry.backoffMaxMs so a blip cannot flap the probe.
+readiness:
+  maxBacklogAgeSeconds: 60
+
+logLevel: "jalki=info"
 
 # MCP server configuration
 mcp:
   enabled: true
   port: 7777
 
-# Resource limits
+# requests == limits → Guaranteed QoS: last on the kernel OOM list and never
+# node-pressure-evicted. An evidence collector has to outlive the incidents it
+# records.
 resources:
   limits:
     cpu: 500m
-    memory: 256Mi
+    memory: 1Gi
   requests:
-    cpu: 50m
-    memory: 64Mi
+    cpu: 500m
+    memory: 1Gi
 
-# Node selector for targeting specific nodes
+# The published image is arm64-only; pin to matching nodes on mixed clusters.
 nodeSelector: {}
 
 tolerations:
   - operator: Exists
 
-# Additional environment variables
+# Additional environment variables, appended verbatim.
 env: []
