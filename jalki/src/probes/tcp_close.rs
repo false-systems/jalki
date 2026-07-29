@@ -6,6 +6,12 @@ pub struct TcpClose {
     attachments: Vec<Attachment>,
 }
 
+impl Default for TcpClose {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TcpClose {
     pub fn new() -> Self {
         Self {

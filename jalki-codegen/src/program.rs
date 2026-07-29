@@ -250,7 +250,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
 
     // r2 = &pid_key (on stack)
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, pid_key_off as i32));
+    insns.push(add64_imm(R2, pid_key_off));
 
     // r0 = bpf_map_lookup_elem(r1, r2)
     insns.push(call(BPF_FUNC_MAP_LOOKUP_ELEM));
@@ -280,7 +280,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
     relocs.push((map_fd_offset, MAP_IDX_PID_FILTER));
 
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, pid_key_off as i32));
+    insns.push(add64_imm(R2, pid_key_off));
     insns.push(call(BPF_FUNC_MAP_LOOKUP_ELEM));
 
     // if r0 != 0 (found in filter): exit
@@ -394,7 +394,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
             } => {
                 // r1 = &event[event_offset] (dst)
                 insns.push(mov64_reg(R1, R10));
-                insns.push(add64_imm(R1, event_base_off as i32 + *event_offset as i32));
+                insns.push(add64_imm(R1, event_base_off + *event_offset as i32));
                 // r2 = size
                 insns.push(mov64_imm(R2, *size as i32));
                 // r3 = ctx->args[arg_index] + struct_offset (src)
@@ -417,7 +417,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
 
     // r2 = &event (on stack)
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, event_base_off as i32));
+    insns.push(add64_imm(R2, event_base_off));
     // r3 = event_size
     insns.push(mov64_imm(R3, event_size as i32));
     // r4 = flags (0)

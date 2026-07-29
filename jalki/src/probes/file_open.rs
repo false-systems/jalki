@@ -6,6 +6,12 @@ pub struct FileOpen {
     attachments: Vec<Attachment>,
 }
 
+impl Default for FileOpen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileOpen {
     pub fn new() -> Self {
         Self {

@@ -21,6 +21,12 @@ pub struct ProbeStats {
     pub parse_errors: AtomicU64,
 }
 
+impl Default for ProbeStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProbeStats {
     pub fn new() -> Self {
         Self {
@@ -103,7 +109,7 @@ fn drain_loop(
             // Apply sampling before parsing — skip the conversion cost too.
             if do_sampling {
                 counter = counter.wrapping_add(1);
-                if counter % sample_every != 0 {
+                if !counter.is_multiple_of(sample_every) {
                     stats.events_sampled_out.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }

@@ -6,6 +6,12 @@ pub struct TcpRetransmit {
     attachments: Vec<Attachment>,
 }
 
+impl Default for TcpRetransmit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TcpRetransmit {
     pub fn new() -> Self {
         Self {

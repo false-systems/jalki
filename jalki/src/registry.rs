@@ -59,6 +59,12 @@ pub struct ProbeRegistry {
     next_id: AtomicU64,
 }
 
+impl Default for ProbeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProbeRegistry {
     pub fn new() -> Self {
         Self {

@@ -59,7 +59,7 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<(u8, u8, 
     let msg_type = header[4];
     let flags = header[5];
 
-    if frame_len < 2 || frame_len > FRAME_MAX_LEN {
+    if !(2..=FRAME_MAX_LEN).contains(&frame_len) {
         anyhow::bail!("invalid frame_len: {frame_len}");
     }
 
@@ -656,7 +656,7 @@ fn parse_event_filter(params: &Value) -> EventFilter {
 
     let f = filter_val.unwrap_or(&Value::Nil);
     EventFilter {
-        last_seconds: get_u64(f, "last_seconds").or(Some(60)).map(|v| v as u64),
+        last_seconds: get_u64(f, "last_seconds").or(Some(60)).map(|v| v),
         src_ip: get_str(f, "src_ip"),
         dst_ip: get_str(f, "dst_ip"),
         src_port: get_u64(f, "src_port").map(|v| v as u16),

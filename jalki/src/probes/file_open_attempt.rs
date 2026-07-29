@@ -13,6 +13,12 @@ pub struct FileOpenAttempt {
     attachments: Vec<Attachment>,
 }
 
+impl Default for FileOpenAttempt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileOpenAttempt {
     pub fn new() -> Self {
         Self {
