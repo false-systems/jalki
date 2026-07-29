@@ -107,6 +107,20 @@ spec:
             {{- end }}
             - name: JALKI_READY_MAX_BACKLOG_AGE_SECS
               value: {{ .Values.readiness.maxBacklogAgeSeconds | int64 | quote }}
+            # Self-shedding needs this agent's own memory limit, and it cannot
+            # read it from the cgroup: the DaemonSet bind-mounts the *host's*
+            # /sys/fs/cgroup, so the resolvable limit is the node root's, which
+            # is unbounded. Without this the feature stays off — safely, and
+            # loudly, but off. See jalki #33.
+            - name: JALKI_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: jalki
+                  resource: limits.memory
+            {{- with .Values.memory.highWatermark }}
+            - name: JALKI_MEMORY_HIGH_WATERMARK
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

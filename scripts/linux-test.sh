@@ -40,6 +40,11 @@ fi
 
 exec docker run --rm -t \
   --label jalki-linux-test \
+  `# Host cgroup namespace, so /proc/self/cgroup reports a nested path the way` \
+  `# it does on a CI runner rather than the bare "/" a namespaced container` \
+  `# sees. Without it this rehearsal disagrees with CI about anything that` \
+  `# reads that file — which it did, and CI caught what the rehearsal missed.` \
+  --cgroupns=host \
   --platform linux/arm64 \
   -v "$REPO:/w" -w /w \
   -v jalki-linux-test-registry:/usr/local/cargo/registry \

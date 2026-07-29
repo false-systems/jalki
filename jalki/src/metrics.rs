@@ -88,6 +88,10 @@ pub struct Metrics {
     /// Age of the oldest queued batch. The one to alert on: depth says how much
     /// is waiting, age says whether anything is moving.
     pub retry_oldest_age_seconds: Gauge<f64, AtomicU64>,
+    /// Fraction of the pod's memory limit in use (jalki #33). Stays 0 when the
+    /// agent could not resolve its own cgroup, which is a real state and not
+    /// the same as "no pressure" — the startup log says which.
+    pub memory_usage_ratio: Gauge<f64, AtomicU64>,
 }
 
 impl Default for Metrics {
@@ -178,6 +182,14 @@ impl Metrics {
             retry_oldest_age_seconds.clone(),
         );
 
+        let memory_usage_ratio = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "jalki_memory_usage_ratio",
+            "Fraction of the pod memory limit in use; 0 when the cgroup limit \
+             could not be resolved",
+            memory_usage_ratio.clone(),
+        );
+
         Self {
             registry,
             events_total,
@@ -191,6 +203,7 @@ impl Metrics {
             retry_queued_records,
             retry_queued_bytes,
             retry_oldest_age_seconds,
+            memory_usage_ratio,
         }
     }
 

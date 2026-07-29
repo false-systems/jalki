@@ -528,6 +528,30 @@ impl RetryBuffer {
         gaps
     }
 
+    /// Shed until at most `target_bytes` remain, reliability evidence first.
+    ///
+    /// The buffer's own bounds are a *budget*; this is a *reaction*. They are
+    /// different questions: the budget asks "is this queue bigger than we
+    /// planned for", and 64Mi of queue is fine right up until the rest of the
+    /// process needs the room. Under real memory pressure the queue has to give
+    /// ground even when it is inside its budget, because the alternative is the
+    /// kernel taking the whole process and the entire backlog with it — and
+    /// that loss produces no gap evidence at all (jalki #33).
+    pub fn shed_to(&mut self, target_bytes: usize) -> Vec<GapReport> {
+        let mut gaps = Vec::new();
+        while self.bytes > target_bytes {
+            match self.shed_one() {
+                Some(dropped) => gaps.push(gap_for_shed(
+                    "memory_pressure",
+                    dropped.class,
+                    &dropped.batch,
+                )),
+                None => break,
+            }
+        }
+        gaps
+    }
+
     /// Give up the least valuable batch: oldest reliability evidence if any is
     /// held, oldest attribution evidence only when nothing else remains
     /// (vartio ADR-0009 contract 5).
@@ -1365,5 +1389,85 @@ mod tests {
             "the oldest batch is delivered first even though it is the one that \
              would be shed first"
         );
+    }
+
+    #[test]
+    fn memory_pressure_sheds_telemetry_first() {
+        // Same order as an overflow shed — pressure is a different trigger, not
+        // a different policy. Losing an exec to save tcp.close chatter would be
+        // the wrong trade under any trigger.
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        for i in 0..4 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(i)]), 0);
+        }
+        for i in 0..4 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![chatter(100 + i)]), 0);
+        }
+        let full = buffer.len_bytes();
+
+        // A modest reduction, satisfiable from telemetry alone.
+        let gaps = buffer.shed_to(full * 9 / 10);
+
+        assert!(!gaps.is_empty(), "shedding under pressure is never silent");
+        assert!(buffer.len_bytes() <= full * 9 / 10);
+        assert!(
+            gaps.iter().all(|g| g.cause == "memory_pressure"),
+            "the cause distinguishes this from an overflow, which is a different \
+             operational story"
+        );
+        assert_eq!(
+            gaps.iter().map(|g| g.dropped_attribution).sum::<usize>(),
+            0,
+            "attribution evidence must survive while telemetry is still there to give"
+        );
+    }
+
+    #[test]
+    fn deep_pressure_reaches_attribution_but_only_after_all_telemetry() {
+        // The order is a preference, not an exemption: if the process is about
+        // to be OOM-killed, keeping an exec is not worth losing every record.
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        for i in 0..4 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(i)]), 0);
+        }
+        for i in 0..4 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![chatter(100 + i)]), 0);
+        }
+
+        let gaps = buffer.shed_to(0);
+        assert!(buffer.is_empty());
+
+        // Everything went, so ordering is the claim: no attribution record was
+        // shed before the last reliability one.
+        let first_attribution = gaps.iter().position(|g| g.dropped_attribution > 0);
+        let last_reliability = gaps.iter().rposition(|g| g.dropped_reliability > 0);
+        assert!(
+            matches!((first_attribution, last_reliability), (Some(a), Some(r)) if a > r),
+            "attribution evidence was shed before telemetry ran out: {gaps:#?}"
+        );
+    }
+
+    #[test]
+    fn shedding_to_zero_empties_the_buffer_and_reports_all_of_it() {
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        for i in 0..5 {
+            buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(i)]), 0);
+        }
+        let gaps = buffer.shed_to(0);
+        assert!(buffer.is_empty());
+        assert_eq!(
+            gaps.iter().map(|g| g.dropped_records).sum::<usize>(),
+            5,
+            "every dropped record is accounted for, even when everything goes"
+        );
+    }
+
+    #[test]
+    fn shedding_below_the_current_size_is_a_no_op() {
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        buffer.enqueue(EvidenceBatch::new(producer(), vec![exec(1)]), 0);
+        let before = buffer.len_bytes();
+        assert!(buffer.shed_to(before + 1).is_empty());
+        assert_eq!(buffer.len_bytes(), before);
     }
 }
