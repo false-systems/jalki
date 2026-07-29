@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod normalize;
 pub mod retry;
 pub mod sink;
+pub mod spool;
 
 pub use cgroup::{LimitSource, MemoryPressure};
 pub use event::{
@@ -32,3 +33,4 @@ pub use sink::{
     AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, PipelineClient,
     PipelineError, PipelineResponse, PipelineSink, SinkError, StdoutSink,
 };
+pub use spool::{ReplayReport, Spool, SpoolConfig};

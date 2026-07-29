@@ -612,6 +612,12 @@ impl RetryBuffer {
             .map(|b| now_ms.saturating_sub(b.enqueued_at_ms))
     }
 
+    /// Every buffered batch, oldest first — what a spool must contain to
+    /// mirror the buffer.
+    pub fn iter_batches(&self) -> impl Iterator<Item = &EvidenceBatch> {
+        self.batches.iter().map(|b| &b.batch)
+    }
+
     pub fn front(&self) -> Option<&EvidenceBatch> {
         self.batches.front().map(|b| &b.batch)
     }

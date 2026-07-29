@@ -39,6 +39,12 @@ retry:
 memory:
   highWatermark: ""
 
+spool:
+  enabled: true
+  mountPath: /var/lib/jalki
+  maxBytes: 268435456
+  sizeLimit: 512Mi
+
 # The published image is arm64-only; the control-plane node is amd64.
 nodeSelector:
   kubernetes.io/arch: arm64

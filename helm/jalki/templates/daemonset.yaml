@@ -121,6 +121,14 @@ spec:
             - name: JALKI_MEMORY_HIGH_WATERMARK
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.spool.enabled }}
+            # Undelivered evidence is mirrored here, so a restart during a sink
+            # outage does not destroy exactly the evidence that outage produced.
+            - name: JALKI_SPOOL_PATH
+              value: {{ printf "%s/backlog.spool" .Values.spool.mountPath | quote }}
+            - name: JALKI_SPOOL_MAX_BYTES
+              value: {{ .Values.spool.maxBytes | int64 | quote }}
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -176,6 +184,10 @@ spec:
               mountPath: /sys/fs/cgroup
               readOnly: true
             {{- end }}
+            {{- if .Values.spool.enabled }}
+            - name: spool
+              mountPath: {{ .Values.spool.mountPath | quote }}
+            {{- end }}
       volumes:
         - name: bpffs
           hostPath:
@@ -190,4 +202,14 @@ spec:
         - name: cgroupfs
           hostPath:
             path: /sys/fs/cgroup
+        {{- end }}
+        {{- if .Values.spool.enabled }}
+        # emptyDir, not hostPath: it survives a container restart — including
+        # an OOM kill, the case this exists for — and is cleaned up when the
+        # pod goes, so a drained node leaves no orphaned evidence behind.
+        # Surviving a *reschedule* would need hostPath and an eviction story
+        # for stale spools; that trade has not been made.
+        - name: spool
+          emptyDir:
+            sizeLimit: {{ .Values.spool.sizeLimit | quote }}
         {{- end }}
