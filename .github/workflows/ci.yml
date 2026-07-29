@@ -1,0 +1,69 @@
+name: CI
+
+# Runs on EVERY pull request, deliberately unfiltered.
+#
+# Until now jälki had no CI at all on source changes: `container.yml` is
+# path-filtered to Dockerfile/Cargo/jalki-ebpf, so a PR touching only `.rs`
+# reported "no checks reported on the branch" (issue #52). That is how an
+# `unused variable: probe_id` warning sat in `ipc.rs` while it was really
+# unsubscribe aborting an arbitrary stream (#51), and why the sink-loop
+# rewrites in #39/#40 had to be verified by hand in a container.
+#
+# This is NOT branch protection. Nothing here is a required check — the org is
+# on GitHub Free and private repos cannot have protection or rulesets at all
+# (false-systems/vartio#254), and we have decided not to pursue enforcement for
+# now. A workflow that merely runs still catches things.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    # arm64 Linux, matching the cluster workers — and Linux is not optional:
+    # `aya` does not build on macOS, so `jalki`, `jalki-codegen` and `jalki-mcp`
+    # simply cannot be checked anywhere else.
+    #
+    # jälki is a PUBLIC repo, so this follows the same trust boundary as
+    # container.yml: pull_request runs fork-controlled code and must never
+    # reach our self-hosted pool. GitHub-hosted arm64 is free for public repos.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'arc-arm64' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      # -D warnings: the whole point is that new warnings stop being invisible.
+      # The workspace was brought to zero in the commits preceding this file, so
+      # anything this reports is genuinely new.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      # Standalone binary, not a workspace member — it validates jälki's public
+      # contract from data files and never imports jalki code, so it needs its
+      # own invocation or it silently never runs.
+      - name: oracle
+        run: cargo test --manifest-path eval/oracle/Cargo.toml
