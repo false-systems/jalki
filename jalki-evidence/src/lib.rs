@@ -22,7 +22,10 @@ pub use evidence::{
     ProducerMetadata, RuntimeBinding, UnboundReason,
 };
 pub use normalize::errno_name;
-pub use retry::{GapReport, RetryBackoff, RetryBackoffConfig, RetryBuffer, RetryBufferConfig};
+pub use retry::{
+    DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff, RetryBackoffConfig, RetryBuffer,
+    RetryBufferConfig,
+};
 pub use sink::{
     AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, PipelineClient,
     PipelineError, PipelineResponse, PipelineSink, SinkError, StdoutSink,

@@ -200,6 +200,179 @@ impl Jitter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrainPaceConfig {
+    pub max_bytes_per_sec: u64,
+    pub max_batches_per_sec: u64,
+    /// Rate multiplier applied on each backpressure signal (multiplicative
+    /// decrease).
+    pub backpressure_decrease: f64,
+    /// Fraction of the full rate recovered per delivered batch (additive
+    /// increase). Deliberately far smaller than the decrease: AIMD converges
+    /// because it gives up rate fast and takes it back slowly.
+    ///
+    /// Per *batch* rather than per second, which makes recovery self-scaling:
+    /// a heavily throttled pacer is sending fewer batches, so it also takes
+    /// longer in wall-clock terms to earn its rate back.
+    pub recovery_increase: f64,
+    /// Floor, so a sustained-backpressure sink still makes progress instead of
+    /// halving toward zero and stalling the drain forever.
+    pub min_scale: f64,
+}
+
+impl Default for DrainPaceConfig {
+    fn default() -> Self {
+        // 2MiB/s drains a full 64Mi retry buffer in ~32s: fast enough that
+        // recovery is not an outage of its own, slow enough that it is a ramp
+        // rather than the burst that took Ahti from 0.24Gi to its 4Gi limit in
+        // 90 minutes on 2026-07-28. Well above jälki's steady-state rate, so
+        // ordinary delivery is untouched — this bounds *recovery*, not traffic.
+        Self {
+            max_bytes_per_sec: 2 * 1024 * 1024,
+            max_batches_per_sec: 20,
+            backpressure_decrease: 0.5,
+            // 0.002 ⇒ ~375 batches from a halved-twice rate back to full.
+            // At the 20 batch/s cap that is ~19s at full speed and ~75s while
+            // still throttled. An earlier 0.02 recovered in ~2s on a busy
+            // drain, which made the backpressure signal decorative.
+            recovery_increase: 0.002,
+            min_scale: 0.05,
+        }
+    }
+}
+
+impl DrainPaceConfig {
+    /// `JALKI_DRAIN_MAX_{BYTES,BATCHES}_PER_SEC`, each falling back to the
+    /// default.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            max_bytes_per_sec: env_parse("JALKI_DRAIN_MAX_BYTES_PER_SEC", d.max_bytes_per_sec)
+                .max(1),
+            max_batches_per_sec: env_parse(
+                "JALKI_DRAIN_MAX_BATCHES_PER_SEC",
+                d.max_batches_per_sec,
+            )
+            .max(1),
+            ..d
+        }
+    }
+}
+
+/// What the pacer says about sending one more batch right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pace {
+    Send,
+    /// Nothing may be sent for this long.
+    Wait {
+        ms: u64,
+    },
+}
+
+/// Rate limit for draining an outage backlog (jalki #40).
+///
+/// The flush loop used to hand the buffer to the sink as fast as it would take
+/// it. That is the amplification step of the Jul 28-29 incident: Vartio came
+/// back at 21:34, jälki's ~13h backlog drained at full speed, and Ahti went from
+/// 0.24Gi to its 4Gi OOM limit inside 90 minutes. The outage was survivable;
+/// the recovery was not. Vartio ADR-0009 contract 4: any client holding an
+/// outage backlog drains it rate-bounded.
+///
+/// Two token buckets (bytes and batches) scaled by an AIMD factor, so a
+/// `RESOURCE_EXHAUSTED`/`Backpressure` reply means *slow down* rather than
+/// merely *try again shortly*. Client-side only — explicitly not a broker tier.
+#[derive(Debug, Clone)]
+pub struct DrainPacer {
+    config: DrainPaceConfig,
+    scale: f64,
+    byte_tokens: f64,
+    batch_tokens: f64,
+    last_refill_ms: Option<u64>,
+}
+
+impl DrainPacer {
+    pub fn new(config: DrainPaceConfig) -> Self {
+        Self {
+            byte_tokens: config.max_bytes_per_sec as f64,
+            batch_tokens: config.max_batches_per_sec as f64,
+            config,
+            scale: 1.0,
+            last_refill_ms: None,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(DrainPaceConfig::from_env())
+    }
+
+    /// Current fraction of the configured rate, after any backpressure.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    fn rates(&self) -> (f64, f64) {
+        (
+            self.config.max_bytes_per_sec as f64 * self.scale,
+            self.config.max_batches_per_sec as f64 * self.scale,
+        )
+    }
+
+    fn refill(&mut self, now_ms: u64) {
+        let last = self.last_refill_ms.unwrap_or(now_ms);
+        let elapsed = now_ms.saturating_sub(last) as f64 / 1000.0;
+        self.last_refill_ms = Some(now_ms);
+        let (byte_rate, batch_rate) = self.rates();
+        // One second of burst: enough that a healthy sink sees no added latency
+        // per batch, not so much that a long idle period banks a flood.
+        self.byte_tokens = (self.byte_tokens + elapsed * byte_rate).min(byte_rate.max(1.0));
+        self.batch_tokens = (self.batch_tokens + elapsed * batch_rate).min(batch_rate.max(1.0));
+    }
+
+    /// May a batch of `bytes` go now? Consumes the tokens when it says `Send`.
+    pub fn poll(&mut self, now_ms: u64, bytes: usize) -> Pace {
+        self.refill(now_ms);
+        let (byte_rate, batch_rate) = self.rates();
+
+        // A batch larger than a whole second of budget can never accumulate
+        // enough tokens. Let it through on a full bucket rather than deadlock
+        // the drain — the bucket goes negative and the next batch simply waits
+        // longer, so the average rate still holds.
+        let bytes = bytes as f64;
+        let affordable = bytes <= byte_rate.max(1.0);
+
+        if self.batch_tokens >= 1.0 && (self.byte_tokens >= bytes || !affordable) {
+            self.batch_tokens -= 1.0;
+            self.byte_tokens -= bytes;
+            return Pace::Send;
+        }
+
+        let byte_wait = if self.byte_tokens >= bytes {
+            0.0
+        } else {
+            (bytes - self.byte_tokens) / byte_rate.max(f64::MIN_POSITIVE)
+        };
+        let batch_wait = if self.batch_tokens >= 1.0 {
+            0.0
+        } else {
+            (1.0 - self.batch_tokens) / batch_rate.max(f64::MIN_POSITIVE)
+        };
+        let wait = byte_wait.max(batch_wait) * 1000.0;
+        Pace::Wait {
+            ms: wait.ceil().clamp(1.0, 60_000.0) as u64,
+        }
+    }
+
+    /// The sink said it is overloaded: give up rate immediately.
+    pub fn on_backpressure(&mut self) {
+        self.scale = (self.scale * self.config.backpressure_decrease).max(self.config.min_scale);
+    }
+
+    /// A batch landed: take rate back, slowly.
+    pub fn on_delivered(&mut self) {
+        self.scale = (self.scale + self.config.recovery_increase).min(1.0);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapReport {
     pub cause: String,
@@ -722,5 +895,152 @@ mod tests {
             5_000,
             "a max below the base must not tighten the schedule below its first step"
         );
+    }
+
+    // ── DrainPacer (jalki #40) ──────────────────────────────────────────────
+
+    fn pacer(bytes_per_sec: u64, batches_per_sec: u64) -> DrainPacer {
+        DrainPacer::new(DrainPaceConfig {
+            max_bytes_per_sec: bytes_per_sec,
+            max_batches_per_sec: batches_per_sec,
+            ..DrainPaceConfig::default()
+        })
+    }
+
+    /// Simulate a drain and report how many bytes actually went out per second
+    /// of simulated time, honouring every wait the pacer asks for.
+    fn drain_bytes_over(p: &mut DrainPacer, batch_bytes: usize, duration_ms: u64) -> u64 {
+        let (mut now, mut sent) = (0u64, 0u64);
+        while now < duration_ms {
+            match p.poll(now, batch_bytes) {
+                Pace::Send => {
+                    sent += batch_bytes as u64;
+                    p.on_delivered();
+                }
+                Pace::Wait { ms } => now += ms,
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn a_backlog_drains_at_the_configured_rate_not_line_rate() {
+        // The incident in one assertion: unbounded, this sends everything at
+        // once; bounded, ten seconds of drain is ten seconds of budget.
+        let mut p = pacer(64 * 1024, 1_000);
+        let sent = drain_bytes_over(&mut p, 4 * 1024, 10_000);
+        let per_sec = sent / 10;
+        assert!(
+            per_sec <= 64 * 1024 + 64 * 1024 / 10,
+            "drain exceeded the byte cap: {per_sec}/s against a 65536/s budget"
+        );
+        assert!(
+            per_sec > 32 * 1024,
+            "the cap must not throttle to a crawl: {per_sec}/s"
+        );
+    }
+
+    #[test]
+    fn the_batch_cap_bounds_rate_independently_of_size() {
+        // Tiny batches cannot evade the limiter by staying under the byte cap.
+        let mut p = pacer(u64::MAX / 2, 10);
+        let (mut now, mut sends) = (0u64, 0);
+        while now < 5_000 {
+            match p.poll(now, 1) {
+                Pace::Send => sends += 1,
+                Pace::Wait { ms } => now += ms,
+            }
+        }
+        // 10 from the initial full bucket (one second of burst, by design)
+        // plus one per 100ms for 5s.
+        assert!(
+            (55..=61).contains(&sends),
+            "expected ~60 = 10 burst + 50 paced over 5s at 10/s, got {sends}"
+        );
+    }
+
+    #[test]
+    fn backpressure_halves_the_rate_and_delivery_wins_it_back_slowly() {
+        let mut p = pacer(1_000_000, 1_000);
+        assert_eq!(p.scale(), 1.0);
+
+        p.on_backpressure();
+        assert!(
+            (p.scale() - 0.5).abs() < f64::EPSILON,
+            "RESOURCE_EXHAUSTED must halve the rate, got {}",
+            p.scale()
+        );
+
+        p.on_backpressure();
+        assert!(p.scale() < 0.3, "sustained backpressure keeps backing off");
+
+        // Additive increase: recovery is deliberately much slower than the
+        // decrease, which is what makes AIMD converge instead of oscillate.
+        let after_backoff = p.scale();
+        p.on_delivered();
+        let gained = p.scale() - after_backoff;
+        assert!(
+            gained > 0.0 && gained < 0.1,
+            "recovery must be gradual: +{gained}"
+        );
+    }
+
+    #[test]
+    fn backing_off_actually_slows_the_observed_drain() {
+        // scale() moving is not the claim; throughput moving is.
+        let full = drain_bytes_over(&mut pacer(64 * 1024, 1_000), 4 * 1024, 5_000);
+
+        let mut throttled = pacer(64 * 1024, 1_000);
+        throttled.on_backpressure();
+        throttled.on_backpressure();
+        let slowed = drain_bytes_over(&mut throttled, 4 * 1024, 5_000);
+
+        assert!(
+            slowed < full / 2,
+            "a backed-off pacer must move measurably less data: {slowed} vs {full}. \
+             If this regresses, suspect recovery_increase — recovering per batch \
+             too quickly makes the backpressure signal decorative."
+        );
+    }
+
+    #[test]
+    fn the_rate_floor_keeps_a_hammered_drain_moving() {
+        let mut p = pacer(64 * 1024, 1_000);
+        for _ in 0..64 {
+            p.on_backpressure();
+        }
+        assert!(p.scale() >= 0.05, "scale collapsed to {}", p.scale());
+        assert!(
+            drain_bytes_over(&mut p, 1_024, 30_000) > 0,
+            "even a fully backed-off drain must make progress, or the backlog \
+             never leaves and ages into gap evidence instead"
+        );
+    }
+
+    #[test]
+    fn an_oversized_batch_is_not_a_deadlock() {
+        // A batch bigger than one second of budget can never accumulate enough
+        // tokens. It must still go out — the bucket goes negative and the next
+        // batch waits proportionally longer, so the average rate holds.
+        let mut p = pacer(1_024, 1_000);
+        let mut sent = false;
+        let mut now = 0u64;
+        for _ in 0..100 {
+            match p.poll(now, 64 * 1024) {
+                Pace::Send => {
+                    sent = true;
+                    break;
+                }
+                Pace::Wait { ms } => now += ms,
+            }
+        }
+        assert!(sent, "an oversized batch stalled the drain forever");
+    }
+
+    #[test]
+    fn a_healthy_sink_sees_no_added_latency_for_the_first_batch() {
+        // The pacer bounds *recovery*, and must not tax ordinary delivery.
+        let mut p = pacer(2 * 1024 * 1024, 20);
+        assert_eq!(p.poll(0, 4 * 1024), Pace::Send);
     }
 }
