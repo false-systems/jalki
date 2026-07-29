@@ -77,7 +77,12 @@ struct Cli {
     /// Kubernetes namespaces reaches the sink — the source-side volume control
     /// that keeps jälki from shipping the whole-node firehose. Empty = deliver
     /// all bound evidence. The local CLI query surface is unaffected.
-    #[arg(long = "namespace", env = "JALKI_NAMESPACES", value_delimiter = ',', global = true)]
+    #[arg(
+        long = "namespace",
+        env = "JALKI_NAMESPACES",
+        value_delimiter = ',',
+        global = true
+    )]
     namespaces: Vec<String>,
 
     /// Kubernetes node name for pod watches. Defaults to the host name.
@@ -290,8 +295,7 @@ async fn build_vartio_sink(cli: &Cli) -> Result<jalki_vartio_sink::VartioSink> {
         .vartio_endpoint
         .clone()
         .context("--sink vartio requires --vartio-endpoint (or JALKI_VARTIO_ENDPOINT)")?;
-    let mut cfg =
-        jalki_vartio_sink::VartioSinkConfig::new(endpoint, cli.vartio_adapter_id.clone());
+    let mut cfg = jalki_vartio_sink::VartioSinkConfig::new(endpoint, cli.vartio_adapter_id.clone());
     if let Ok(token) = std::env::var("VARTIO_INGRESS_TOKEN") {
         cfg = cfg.with_ingress_token(token);
     }

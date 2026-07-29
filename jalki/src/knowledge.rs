@@ -56,21 +56,16 @@ impl KnowledgeBase {
     /// Panics at startup if the JSON is malformed — this is intentional.
     /// A corrupted knowledge base must never silently serve wrong answers.
     pub fn load() -> Self {
-        let tcp: Layer =
-            serde_json::from_str(include_str!("../../knowledge/tcp.json"))
-                .expect("knowledge/tcp.json is malformed — fix it before shipping");
-        let memory: Layer =
-            serde_json::from_str(include_str!("../../knowledge/memory.json"))
-                .expect("knowledge/memory.json is malformed — fix it before shipping");
-        let fs: Layer =
-            serde_json::from_str(include_str!("../../knowledge/fs.json"))
-                .expect("knowledge/fs.json is malformed — fix it before shipping");
-        let sched: Layer =
-            serde_json::from_str(include_str!("../../knowledge/sched.json"))
-                .expect("knowledge/sched.json is malformed — fix it before shipping");
-        let process: Layer =
-            serde_json::from_str(include_str!("../../knowledge/process.json"))
-                .expect("knowledge/process.json is malformed — fix it before shipping");
+        let tcp: Layer = serde_json::from_str(include_str!("../../knowledge/tcp.json"))
+            .expect("knowledge/tcp.json is malformed — fix it before shipping");
+        let memory: Layer = serde_json::from_str(include_str!("../../knowledge/memory.json"))
+            .expect("knowledge/memory.json is malformed — fix it before shipping");
+        let fs: Layer = serde_json::from_str(include_str!("../../knowledge/fs.json"))
+            .expect("knowledge/fs.json is malformed — fix it before shipping");
+        let sched: Layer = serde_json::from_str(include_str!("../../knowledge/sched.json"))
+            .expect("knowledge/sched.json is malformed — fix it before shipping");
+        let process: Layer = serde_json::from_str(include_str!("../../knowledge/process.json"))
+            .expect("knowledge/process.json is malformed — fix it before shipping");
 
         Self {
             layers: vec![tcp, memory, fs, sched, process],
@@ -112,7 +107,7 @@ impl KnowledgeBase {
         }
 
         // Sort by relevance (highest score first).
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         matches.into_iter().map(|(p, _)| p).collect()
     }
 
@@ -341,6 +336,8 @@ mod tests {
     fn combine_with_populated() {
         let kb = KnowledgeBase::load();
         let probe = kb.get_probe("tcp_connect").unwrap();
-        assert!(probe.combine_with.contains(&"tcp_retransmit_skb".to_string()));
+        assert!(probe
+            .combine_with
+            .contains(&"tcp_retransmit_skb".to_string()));
     }
 }

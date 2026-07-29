@@ -89,7 +89,8 @@ pub fn populate_task_offsets(ebpf: &mut Ebpf) -> Result<()> {
 
     match resolve_task_offsets() {
         Ok((real_parent, tgid)) => {
-            map.set(0, real_parent, 0).context("set real_parent offset")?;
+            map.set(0, real_parent, 0)
+                .context("set real_parent offset")?;
             map.set(1, tgid, 0).context("set tgid offset")?;
             info!(
                 real_parent,

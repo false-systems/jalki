@@ -13,6 +13,12 @@ pub struct FileOpenAttempt {
     attachments: Vec<Attachment>,
 }
 
+impl Default for FileOpenAttempt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileOpenAttempt {
     pub fn new() -> Self {
         Self {
@@ -62,7 +68,9 @@ impl Probe for FileOpenAttempt {
     }
 
     fn decode_event(&self, raw: &[u8]) -> Result<KernelEvent, ProbeError> {
-        Ok(KernelEvent::FileOpenAttempt(FileOpenEvent::from_bytes(raw)?))
+        Ok(KernelEvent::FileOpenAttempt(FileOpenEvent::from_bytes(
+            raw,
+        )?))
     }
 }
 
@@ -104,7 +112,7 @@ mod tests {
         );
         assert_eq!(occ.labels.get("result").map(String::as_str), Some("failed"));
         // never claims a resolved file identity
-        assert!(occ.labels.get("resource_ref_id").is_none());
+        assert!(!occ.labels.contains_key("resource_ref_id"));
     }
 
     #[test]

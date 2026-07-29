@@ -59,18 +59,28 @@ pub async fn run(
     let events_resp = ipc::call_native(
         METHOD_GET_EVENTS,
         Value::Map(vec![
-            (msgpack_str("last_seconds"), Value::Integer((seconds + 1).into())),
+            (
+                msgpack_str("last_seconds"),
+                Value::Integer((seconds + 1).into()),
+            ),
             (msgpack_str("filter"), Value::Map(filter_pairs)),
         ]),
     )
     .await?;
 
     if !events_resp.ok {
-        anyhow::bail!("get_events failed: {}", events_resp.error.unwrap_or_default());
+        anyhow::bail!(
+            "get_events failed: {}",
+            events_resp.error.unwrap_or_default()
+        );
     }
 
     let json = events_resp.to_json();
-    let events = json.get("events").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let events = json
+        .get("events")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
 
     eprintln!("{} events collected.", events.len());
     println!();

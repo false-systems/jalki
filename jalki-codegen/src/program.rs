@@ -106,7 +106,9 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                     size: 16,
                     field_type: FieldType::U8, // byte array, not a scalar
                 });
-                field_reads.push(FieldRead::Comm { event_offset: offset });
+                field_reads.push(FieldRead::Comm {
+                    event_offset: offset,
+                });
                 offset += 16;
             }
             "ret" => {
@@ -248,7 +250,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
 
     // r2 = &pid_key (on stack)
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, pid_key_off as i32));
+    insns.push(add64_imm(R2, pid_key_off));
 
     // r0 = bpf_map_lookup_elem(r1, r2)
     insns.push(call(BPF_FUNC_MAP_LOOKUP_ELEM));
@@ -256,7 +258,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
     // if r0 != NULL, this is our own PID — exit
     insns.push(jne_imm(R0, 0, 2)); // skip 2 insns to exit
     insns.push(ja(1)); // jump over the exit
-    // exit path:
+                       // exit path:
     insns.push(mov64_imm(R0, 0));
     // We need a jump target. Let me restructure:
     // Actually, simpler:
@@ -278,7 +280,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
     relocs.push((map_fd_offset, MAP_IDX_PID_FILTER));
 
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, pid_key_off as i32));
+    insns.push(add64_imm(R2, pid_key_off));
     insns.push(call(BPF_FUNC_MAP_LOOKUP_ELEM));
 
     // if r0 != 0 (found in filter): exit
@@ -346,7 +348,11 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                 // For fexit: ret is ctx->args[n_params]
                 let ctx_off = (*arg_index as i16) * 8;
                 insns.push(ldx_dw(R1, R7, ctx_off));
-                insns.push(stx_w(R10, R1, (event_base_off + *event_offset as i32) as i16));
+                insns.push(stx_w(
+                    R10,
+                    R1,
+                    (event_base_off + *event_offset as i32) as i16,
+                ));
             }
             FieldRead::DirectArg {
                 event_offset,
@@ -356,10 +362,26 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
                 let ctx_off = (*arg_index as i16) * 8;
                 insns.push(ldx_dw(R1, R7, ctx_off));
                 match size {
-                    8 => insns.push(stx_dw(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    4 => insns.push(stx_w(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    2 => insns.push(stx_h(R10, R1, (event_base_off + *event_offset as i32) as i16)),
-                    1 => insns.push(stx_b(R10, R1, (event_base_off + *event_offset as i32) as i16)),
+                    8 => insns.push(stx_dw(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    4 => insns.push(stx_w(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    2 => insns.push(stx_h(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
+                    1 => insns.push(stx_b(
+                        R10,
+                        R1,
+                        (event_base_off + *event_offset as i32) as i16,
+                    )),
                     _ => return Err(CodegenError::UnsupportedType(format!("{size}-byte direct"))),
                 }
             }
@@ -372,7 +394,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
             } => {
                 // r1 = &event[event_offset] (dst)
                 insns.push(mov64_reg(R1, R10));
-                insns.push(add64_imm(R1, event_base_off as i32 + *event_offset as i32));
+                insns.push(add64_imm(R1, event_base_off + *event_offset as i32));
                 // r2 = size
                 insns.push(mov64_imm(R2, *size as i32));
                 // r3 = ctx->args[arg_index] + struct_offset (src)
@@ -395,7 +417,7 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
 
     // r2 = &event (on stack)
     insns.push(mov64_reg(R2, R10));
-    insns.push(add64_imm(R2, event_base_off as i32));
+    insns.push(add64_imm(R2, event_base_off));
     // r3 = event_size
     insns.push(mov64_imm(R3, event_size as i32));
     // r4 = flags (0)
@@ -415,7 +437,10 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
         });
     }
 
-    let map_name = format!("{}_EVENTS", spec.function.to_uppercase().replace("_SKB", ""));
+    let map_name = format!(
+        "{}_EVENTS",
+        spec.function.to_uppercase().replace("_SKB", "")
+    );
 
     Ok(GeneratedProgram {
         instructions: insns,
@@ -444,6 +469,10 @@ enum FieldRead {
         arg_index: u32,
         struct_offset: u32,
         size: usize,
+        /// Parsed from the probe spec but not consumed by the emitter yet.
+        /// Kept because the variant mirrors the spec's shape; dropping it
+        /// would make the two stop corresponding. See btf.rs `vlen`.
+        #[allow(dead_code)]
         field_type: FieldType,
     },
 }
@@ -485,7 +514,7 @@ mod tests {
         assert_eq!(program.relocations.len(), 2);
         // Field layout should include header + requested fields.
         assert!(program.field_layout.len() >= 6); // timestamp, pid, tid, + requested
-        // Event size should be > 0 and aligned to 8.
+                                                  // Event size should be > 0 and aligned to 8.
         assert!(program.event_size > 0);
         assert_eq!(program.event_size % 8, 0);
     }

@@ -42,9 +42,10 @@ pub async fn run(function: Option<&str>) -> Result<()> {
     loop {
         let resp = ipc::call_native(
             METHOD_GET_EVENTS,
-            Value::Map(vec![
-                (msgpack_str("last_seconds"), Value::Integer(2.into())),
-            ]),
+            Value::Map(vec![(
+                msgpack_str("last_seconds"),
+                Value::Integer(2.into()),
+            )]),
         )
         .await?;
 

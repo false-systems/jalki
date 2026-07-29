@@ -6,6 +6,12 @@ pub struct TcpConnect {
     attachments: Vec<Attachment>,
 }
 
+impl Default for TcpConnect {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TcpConnect {
     pub fn new() -> Self {
         Self {

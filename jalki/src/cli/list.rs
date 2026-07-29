@@ -9,7 +9,11 @@ pub fn run(layer: Option<&str>) {
     if let Some(layer_name) = layer {
         let probes = kb.probes_in_layer(layer_name);
         if probes.is_empty() {
-            eprintln!("Unknown layer '{}'. Available: {:?}", layer_name, kb.layers());
+            eprintln!(
+                "Unknown layer '{}'. Available: {:?}",
+                layer_name,
+                kb.layers()
+            );
             return;
         }
         println!("Layer: {}", layer_name);
@@ -29,10 +33,7 @@ pub fn run(layer: Option<&str>) {
 }
 
 fn print_probe(p: &jalki::knowledge::ProbeKnowledge) {
-    println!(
-        "  {} ({})  {}",
-        p.function, p.attachment, p.event_type
-    );
+    println!("  {} ({})  {}", p.function, p.attachment, p.event_type);
     println!("    {}", p.use_when);
     if !p.combine_with.is_empty() {
         println!("    combine with: {}", p.combine_with.join(", "));

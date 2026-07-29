@@ -71,7 +71,11 @@ pub fn generate_for_function(
     let attach_type = match attachment {
         "fentry" => AttachType::Fentry,
         "fexit" => AttachType::Fexit,
-        other => return Err(CodegenError::BtfType(format!("unknown attachment: {other}"))),
+        other => {
+            return Err(CodegenError::BtfType(format!(
+                "unknown attachment: {other}"
+            )))
+        }
     };
 
     let spec = ProbeSpec {

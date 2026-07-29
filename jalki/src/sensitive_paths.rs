@@ -47,7 +47,10 @@ impl SensitivePathMatcher {
 }
 
 fn pattern_matches(pattern: &str, path: &str) -> bool {
-    let has_glob = pattern.as_bytes().iter().any(|b| matches!(b, b'*' | b'?' | b'['));
+    let has_glob = pattern
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'*' | b'?' | b'['));
     if !has_glob && pattern.ends_with('/') {
         return path.starts_with(pattern);
     }

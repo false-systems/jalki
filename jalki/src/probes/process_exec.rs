@@ -6,6 +6,12 @@ pub struct ProcessExec {
     attachments: Vec<Attachment>,
 }
 
+impl Default for ProcessExec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessExec {
     pub fn new() -> Self {
         Self {

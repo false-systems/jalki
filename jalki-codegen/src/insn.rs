@@ -1,9 +1,9 @@
-/// BPF instruction encoding.
-///
-/// Each BPF instruction is 8 bytes. The `ld_map_fd` pseudo-instruction
-/// is 16 bytes (two consecutive instructions).
-///
-/// Reference: linux/bpf.h, linux/bpf_common.h
+//! BPF instruction encoding.
+//!
+//! Each BPF instruction is 8 bytes. The `ld_map_fd` pseudo-instruction
+//! is 16 bytes (two consecutive instructions).
+//!
+//! Reference: linux/bpf.h, linux/bpf_common.h
 
 /// A single 8-byte BPF instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +263,10 @@ mod tests {
         let bytes = insn.to_bytes();
         // code = BPF_JMP | BPF_CALL = 0x05 | 0x80 = 0x85
         assert_eq!(bytes[0], 0x85);
-        assert_eq!(i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 14);
+        assert_eq!(
+            i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            14
+        );
     }
 
     #[test]

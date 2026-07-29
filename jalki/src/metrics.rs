@@ -90,6 +90,12 @@ pub struct Metrics {
     pub retry_oldest_age_seconds: Gauge<f64, AtomicU64>,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         let mut registry = Registry::default();
