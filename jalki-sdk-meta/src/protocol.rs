@@ -58,6 +58,8 @@ pub const POS_INTERP: usize = 11; // [str, str]|nil — [conclusion, action]
 
 // REQUEST payload: [request_id: u32, method: u8, params: msgpack_value]
 // RESPONSE payload: [request_id: u32, ok: bool, result_or_error: msgpack_value]
+// Methods: find=0x01 deploy=0x02 subscribe=0x03 unsubscribe=0x04 status=0x05
+//          ask=0x06 get_events=0x07 detach=0x08
 // STREAM_START payload: [probe_names: [str]] — probe name table
 // STREAM_END payload: [probe_id: str] — which stream ended. Was `[]`; a
 // client with more than one live subscription could not tell which stream the

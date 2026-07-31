@@ -386,6 +386,38 @@ impl DaemonHandle {
         self.deploy_codegen(function).await
     }
 
+    /// Detach a runtime-deployed probe and unload its BPF programs.
+    ///
+    /// Two steps, and both are required. `registry.detach` stops the reader,
+    /// which owns the `RingBuf` — the map cannot be released while it lives.
+    /// Dropping the generated `Ebpf` then unloads the programs and maps.
+    ///
+    /// Before #59 the second step was impossible: `deploy_codegen` ended in
+    /// `std::mem::forget`, so nothing owned the object and nothing could ever
+    /// release it. That is why this issue's acceptance criteria were
+    /// unsatisfiable rather than merely unimplemented.
+    ///
+    /// Unknown probe id is a no-op: the caller asked for a state that already
+    /// holds, so retries are safe.
+    pub async fn detach_probe(&self, probe_id: &str) -> Result<bool> {
+        let Some(name) = self.registry.detach(probe_id)? else {
+            return Ok(false);
+        };
+
+        // The registry keys probes by id, the generated objects by kernel
+        // function, and the probe's name is the function for codegen probes.
+        // A startup probe never reaches here — `registry.detach` refuses it.
+        if let Some(ebpf) = self.generated_probes.lock().await.remove(&name) {
+            drop(ebpf);
+            info!(
+                probe_id = %probe_id,
+                function = %name,
+                "unloaded generated BPF programs"
+            );
+        }
+        Ok(true)
+    }
+
     /// Generate and deploy a probe for any kernel function using codegen.
     async fn deploy_codegen(&self, function: &str) -> Result<String> {
         // Determine attachment type from knowledge base, default to fentry.
