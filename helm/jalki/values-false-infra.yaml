@@ -48,11 +48,6 @@ spool:
 # The published image is arm64-only; the control-plane node is amd64.
 nodeSelector:
   kubernetes.io/arch: arm64
-  # PAUSED — matches no node, so zero pods schedule. Declared in
-  # false-infra/apps/jalki/daemonset.yaml; the gate for removing it is
-  # false-systems/vartio#246. This drift check is expected to fail the day the
-  # pause is lifted in one place and not the other, which is the point.
-  jalki.false.systems/paused: "true"
 
 tolerations:
   - operator: Exists
