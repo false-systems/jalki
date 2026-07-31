@@ -57,6 +57,27 @@ env = {}
 for e in c.get("env", []):
     env[e["name"]] = e["value"] if "value" in e else source(e)
 
+def image_identity(ref):
+    """Repository, with a digest pin reported separately from the reference.
+
+    The deploy pipeline resolves `repo:tag` to `repo@sha256:…` at deploy time
+    (false-infra#109) so a deploy is attributable to an exact image. The chart
+    cannot render that — the digest does not exist until the deploy runs — so a
+    literal comparison reports drift on every run, which is how a check stops
+    being read.
+
+    Repository identity is the part the chart is responsible for and is
+    compared. The digest is surfaced as its own field so a pin is *visible*
+    rather than silently normalised away: seeing which digest is live is the
+    point of pinning.
+    """
+    if "@" in ref:
+        repo, digest = ref.split("@", 1)
+        return repo, digest
+    repo = ref.rsplit(":", 1)[0] if ":" in ref.rsplit("/", 1)[-1] else ref
+    return repo, None
+
+
 def probe(p):
     """httpGet without the server-populated scheme."""
     g = (p or {}).get("httpGet")
@@ -65,7 +86,7 @@ def probe(p):
     return {k: v for k, v in g.items() if k != "scheme"}
 
 print(json.dumps({
-    "image": c["image"],
+    "image_repository": image_identity(c["image"])[0],
     "imagePullPolicy": c.get("imagePullPolicy"),
     "args": c.get("args"),
     "securityContext": c.get("securityContext"),
@@ -82,6 +103,12 @@ print(json.dumps({
     "tolerations": spec.get("tolerations"),
     "volumes": sorted(v["name"] for v in spec.get("volumes", [])),
 }, indent=2, sort_keys=True))
+
+# Informational, never compared: prints beside the diff so a live digest pin is
+# visible without being drift.
+pinned = image_identity(c["image"])[1]
+if pinned:
+    print(f"# live image pinned to {pinned}", file=sys.stderr)
 PY
 }
 
