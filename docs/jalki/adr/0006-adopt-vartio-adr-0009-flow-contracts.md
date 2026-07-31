@@ -1,9 +1,13 @@
 # ADR 0006 — Adopt vartio ADR-0009 cross-service flow contracts
 
-**Status:** proposed — acceptance pends `false-systems/vartio#245` merging.
-The conformance record below is independent of that: it describes what jälki
-already does, and was written from the implementations rather than from the
-intent.
+**Status:** accepted, 2026-07-31. `false-systems/vartio#245` merged at
+14:51Z, and the merged text is byte-identical to the draft this was written
+against (`eafcb68`) — checked rather than assumed, because this document said
+to re-check if it was reworded before landing.
+
+The conformance record below was written before acceptance and is independent
+of it: it describes what jälki already does, from the implementations rather
+than from the intent.
 
 **Context:** vartio ADR-0009 defines six flow contracts for the
 jälki → Vartio → Ahti pipeline, drawn from the 2026-07-28/29 tri-service
