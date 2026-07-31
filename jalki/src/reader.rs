@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -57,7 +57,7 @@ pub fn spawn_reader(
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_path_matcher: Arc<SensitivePathMatcher>,
-) -> Result<()> {
+) -> Result<ReaderStop> {
     let map_name = probe.ring_buffer_map().to_string();
 
     let map = ebpf
@@ -68,6 +68,8 @@ pub fn spawn_reader(
         .with_context(|| format!("{map_name} is not a RingBuf"))?;
 
     let probe_name = probe.name().to_string();
+    let stop = ReaderStop::new();
+    let stop_flag = stop.clone();
 
     tokio::task::spawn_blocking(move || {
         drain_loop(
@@ -80,10 +82,39 @@ pub fn spawn_reader(
             store,
             enricher,
             sensitive_path_matcher,
+            stop_flag,
         );
     });
 
-    Ok(())
+    Ok(stop)
+}
+
+/// Stop signal for a reader.
+///
+/// A flag rather than an `AbortHandle`, because the reader is a
+/// `spawn_blocking` task: aborting one does nothing until it next yields, and
+/// this one is inside a blocking `ring_buf.next()` / `thread::sleep` cycle. It
+/// has to be asked to leave, and it checks at the top of each poll — at most
+/// one 10ms sleep away.
+///
+/// Dropping this does *not* stop the reader; the registry owns it for as long
+/// as the probe is attached.
+#[derive(Clone, Debug)]
+pub struct ReaderStop(Arc<AtomicBool>);
+
+impl ReaderStop {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Ask the reader to finish its current poll and exit.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 // Reader setup is genuinely one cohesive bundle (probe, cluster, channel,
@@ -102,6 +133,7 @@ fn drain_loop(
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_path_matcher: Arc<SensitivePathMatcher>,
+    stop: ReaderStop,
 ) {
     let sample_rate = probe.sample_rate();
     let do_sampling = sample_rate < 1.0;
@@ -115,6 +147,14 @@ fn drain_loop(
     let mut counter: u64 = 0;
 
     loop {
+        // Checked before draining, so a detach cannot be delayed by a busy ring
+        // buffer. Returning here drops `ring_buf`, which releases the map — the
+        // reason detach can unload the program at all.
+        if stop.stopped() {
+            debug!(probe = probe_name, "reader stopping on request");
+            return;
+        }
+
         let mut records = Vec::new();
 
         while let Some(item) = ring_buf.next() {

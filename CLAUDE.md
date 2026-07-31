@@ -148,6 +148,7 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
   - `list [--layer tcp]` — browse the knowledge base
   - `status` — show attached probes, event counts, drops
 - Key types: `Probe` trait, `EvidenceSink` trait (in `jalki-evidence`), `Runtime` (builder API), `DaemonHandle` (shared state), `Loader`, `Reader`, `KnowledgeBase`, `ProbeRegistry`, `EventStore`
+- Runtime-deployed probes can be removed again: `DaemonHandle::detach_probe` stops the reader (releasing the ring-buffer map) and drops the generated `Ebpf` (unloading programs). Startup probes cannot — they share one eBPF object.
 - IPC: Unix socket at `/run/jalki/jalki.sock`. **Binary frame protocol**: `[frame_len: u32 BE][msg_type: u8][flags: u8][msgpack payload]`, `frame_len = payload.len() + 2`. Encoded via `rmpv`. Wire constants live in `jalki-sdk-meta/src/protocol.rs` — single source of truth, do not hardcode message-type bytes elsewhere. `ipc::call()` is the client used by CLI and MCP.
 
 ### jalki-codegen

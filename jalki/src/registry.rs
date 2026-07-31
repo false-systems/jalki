@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::enrich::RuntimeEnricher;
 use crate::probe::{Attachment, Probe};
-use crate::reader::{self, ProbeStats};
+use crate::reader::{self, ProbeStats, ReaderStop};
 use crate::sensitive_paths::SensitivePathMatcher;
 use crate::store::EventStore;
 
@@ -48,9 +48,18 @@ struct AttachedProbe {
     probe: Arc<dyn Probe>,
     attached_since: DateTime<Utc>,
     stats: Arc<ProbeStats>,
+    /// `None` for startup probes: they are attached by the loader from the
+    /// shared eBPF object, so stopping one reader would not release anything —
+    /// the object stays alive for the others. Only runtime-generated probes own
+    /// their object and can therefore be genuinely unloaded (#19).
+    stop: Option<ReaderStop>,
 }
 
-/// Registry of attached probes. Supports runtime attachment and detachment.
+/// Registry of attached probes, with runtime attach and detach.
+///
+/// Detach applies only to runtime-generated probes. Startup probes share the
+/// daemon's single eBPF object, so there is nothing to release by stopping one
+/// reader and detaching one would only blind a producer lane (#19).
 ///
 /// The eBPF object contains all compiled probes. At startup, only configured
 /// probes attach. At runtime, any probe in the object can be activated by name.
@@ -156,7 +165,7 @@ impl ProbeRegistry {
 
         // Start the reader.
         let stats = Arc::new(ProbeStats::new());
-        reader::spawn_reader(
+        let stop = reader::spawn_reader(
             ebpf,
             probe.clone(),
             cluster.to_string(),
@@ -181,6 +190,7 @@ impl ProbeRegistry {
             probe,
             attached_since: Utc::now(),
             stats,
+            stop: Some(stop),
         };
 
         self.attached
@@ -199,6 +209,7 @@ impl ProbeRegistry {
             probe,
             attached_since: Utc::now(),
             stats,
+            stop: None,
         };
 
         self.attached
@@ -209,6 +220,41 @@ impl ProbeRegistry {
     }
 
     /// Check if a probe for a given function is already attached.
+    /// Detach a runtime-attached probe: stop its reader and forget it.
+    ///
+    /// Returns the probe name so the caller can log what went, and
+    /// `Ok(None)` for an unknown id — detaching something already gone is the
+    /// state the caller asked for, so it is a no-op rather than an error.
+    ///
+    /// Refuses a startup probe. Those share the daemon's single eBPF object,
+    /// so stopping one reader would release nothing and would silently blind a
+    /// producer lane that the deployment expects to be running. Undoing the
+    /// startup set is a restart, not a runtime operation.
+    ///
+    /// Stopping the reader is what makes unloading possible: the reader owns
+    /// the `RingBuf`, and the map it borrows cannot be released while it lives.
+    /// The caller drops the generated `Ebpf` afterwards, which unloads the
+    /// programs.
+    pub fn detach(&self, probe_id: &str) -> Result<Option<String>> {
+        let mut attached = self.attached.write().unwrap();
+        let Some(entry) = attached.get(probe_id) else {
+            return Ok(None);
+        };
+        let Some(stop) = entry.stop.clone() else {
+            anyhow::bail!(
+                "probe '{probe_id}' was attached at startup and shares the daemon's \
+                 eBPF object; it cannot be detached at runtime"
+            );
+        };
+        stop.stop();
+        let name = attached
+            .remove(probe_id)
+            .map(|e| e.probe.name().to_string())
+            .unwrap_or_default();
+        info!(probe_id = %probe_id, name = %name, "probe detached at runtime");
+        Ok(Some(name))
+    }
+
     pub fn is_attached(&self, function: &str) -> bool {
         let attached = self.attached.read().unwrap();
         attached.values().any(|a| {
@@ -255,5 +301,45 @@ impl ProbeRegistry {
     /// Get status by probe ID.
     pub fn get_status(&self, probe_id: &str) -> Option<ProbeStatus> {
         self.status().into_iter().find(|s| s.probe_id == probe_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A startup probe shares the daemon's single eBPF object, so stopping its
+    /// reader releases nothing — it would just blind a producer lane the
+    /// deployment expects to be running, with no way to get it back short of a
+    /// restart. Refusing is the honest answer.
+    #[test]
+    fn a_startup_probe_cannot_be_detached() {
+        let registry = ProbeRegistry::new();
+        let stats = Arc::new(ProbeStats::new());
+        let id = registry.register_startup_probe(
+            Arc::new(crate::probes::tcp_connect::TcpConnect::new()),
+            stats,
+        );
+
+        let err = registry
+            .detach(id.as_str())
+            .expect_err("must refuse, not silently succeed");
+        assert!(
+            err.to_string().contains("attached at startup"),
+            "the refusal must say why: {err}"
+        );
+        assert!(
+            registry.get_status(id.as_str()).is_some(),
+            "and the probe must still be attached after the refusal"
+        );
+    }
+
+    /// Detaching something already gone leaves the caller in the state they
+    /// asked for, so it is a no-op. That makes a retry after a partial failure
+    /// safe, which matters because the caller cannot easily tell the two apart.
+    #[test]
+    fn detaching_an_unknown_probe_is_a_no_op() {
+        let registry = ProbeRegistry::new();
+        assert_eq!(registry.detach("probe_999").unwrap(), None);
     }
 }

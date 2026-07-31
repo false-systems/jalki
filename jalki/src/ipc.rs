@@ -38,6 +38,10 @@ pub const METHOD_UNSUBSCRIBE: u8 = 0x04;
 pub const METHOD_STATUS: u8 = 0x05;
 pub const METHOD_ASK: u8 = 0x06;
 pub const METHOD_GET_EVENTS: u8 = 0x07;
+/// Counterpart to METHOD_DEPLOY. Appended rather than inserted: the byte values
+/// are the wire contract, so renumbering the existing ones would break every
+/// client that already speaks it.
+pub const METHOD_DETACH: u8 = 0x08;
 
 // --- Frame encoding/decoding ---
 
@@ -255,6 +259,7 @@ impl ConnectionHandler {
         let result = match method {
             METHOD_FIND => self.handle_find(&params).await,
             METHOD_DEPLOY => self.handle_deploy(&params).await,
+            METHOD_DETACH => self.handle_detach(&params).await,
             METHOD_SUBSCRIBE => {
                 return self.handle_subscribe(request_id, &params, flags).await;
             }
@@ -303,6 +308,26 @@ impl ConnectionHandler {
             .collect();
 
         Ok(Value::Array(results))
+    }
+
+    /// Detach a runtime-deployed probe and unload its BPF programs.
+    ///
+    /// `detached: false` for an unknown id rather than an error — the caller
+    /// asked for a state that already holds, so a retry after a partial
+    /// failure is safe. A startup probe *is* an error: it shares the daemon's
+    /// eBPF object, and silently succeeding would leave a producer lane the
+    /// deployment expects to be running quietly blinded.
+    async fn handle_detach(&self, params: &Value) -> Result<Value, String> {
+        let probe_id = get_str(params, "probe_id").ok_or("missing 'probe_id'")?;
+        let detached = self
+            .handle
+            .detach_probe(&probe_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Map(vec![
+            (msgpack_str("ok"), Value::Boolean(true)),
+            (msgpack_str("detached"), Value::Boolean(detached)),
+        ]))
     }
 
     async fn handle_deploy(&self, params: &Value) -> Result<Value, String> {
@@ -989,6 +1014,7 @@ pub async fn call(method: &str, params: serde_json::Value) -> Result<Response> {
     let method_u8 = match method {
         "find_probe" | "find" => METHOD_FIND,
         "deploy_probe" | "deploy" => METHOD_DEPLOY,
+        "detach_probe" | "detach" => METHOD_DETACH,
         "subscribe" => METHOD_SUBSCRIBE,
         "unsubscribe" => METHOD_UNSUBSCRIBE,
         "probe_status" | "status" => METHOD_STATUS,
