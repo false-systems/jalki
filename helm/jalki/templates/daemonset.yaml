@@ -155,6 +155,13 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 6
+            # 1s (the default) was too tight and killed a healthy agent during
+            # a sink outage — jalki#67. The server now runs on its own thread
+            # so it cannot be starved, and this is the belt to that braces: on
+            # an agent whose whole purpose is to outlive downstream outages, a
+            # liveness probe should need real evidence of death, not a slow
+            # second.
+            timeoutSeconds: 3
           # Readiness reports whether evidence is *flowing*: it goes red once
           # the agent has held undeliverable evidence longer than
           # JALKI_READY_MAX_BACKLOG_AGE_SECS (default 60). Nothing selects this
@@ -166,6 +173,7 @@ spec:
               port: metrics
             periodSeconds: 30
             failureThreshold: 3
+            timeoutSeconds: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
