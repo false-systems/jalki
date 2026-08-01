@@ -295,24 +295,39 @@ impl Runtime {
             spool,
         }));
 
-        // Spawn metrics server.
-        let _metrics_handle = {
+        // The observability server runs on its OWN thread and its own
+        // single-threaded runtime, not as a task on the main one.
+        //
+        // `/healthz` answers "is this process alive", and a liveness probe acts
+        // on the answer by killing the process. That makes it the one endpoint
+        // that must never be affected by how busy the process is — and as a
+        // task among others it was: during a Vartio outage the probe timed out
+        // (`context deadline exceeded ... while awaiting headers`, 1s budget)
+        // and the kubelet killed an agent that was healthy and correctly
+        // buffering. Consulting no dependency is not enough if the answer
+        // cannot be delivered (jalki #67).
+        //
+        // A dedicated thread means the health surface is answerable whenever
+        // the process exists, which is exactly the claim it makes.
+        let _metrics_thread = {
             let metrics = metrics.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_metrics(metrics).await {
-                    error!(error = %e, "metrics server failed");
-                }
-            })
-        };
-
-        // Spawn metrics server.
-        let _metrics_handle = {
-            let metrics = metrics.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_metrics(metrics).await {
-                    error!(error = %e, "metrics server failed");
-                }
-            })
+            std::thread::Builder::new()
+                .name("jalki-observability".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            error!(error = %e, "observability runtime failed to start");
+                            return;
+                        }
+                    };
+                    if let Err(e) = rt.block_on(serve_metrics(metrics)) {
+                        error!(error = %e, "observability server failed");
+                    }
+                })
         };
 
         sink_handle.await?;
