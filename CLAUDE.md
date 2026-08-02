@@ -32,7 +32,7 @@ jalki/
 ├── xtask/            # build orchestration (eBPF compilation)
 ├── knowledge/        # JSON knowledge base — compiled into binary via include_str!
 ├── specs/            # Luotain-compatible requirement specs (tested by oracle)
-├── helm/jalki/       # Helm chart for k8s deployment
+├── helm/             # README pointing at false-infra apps/jalki (chart retired)
 └── eval/oracle/      # standalone contract test suite — NOT in workspace
 ```
 

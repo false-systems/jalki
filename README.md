@@ -251,11 +251,7 @@ These three, joined on the 4-tuple, answer: which backends are being connected t
 
 ## Kubernetes
 
-Helm chart in `helm/jalki/`. Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF.
-
-```bash
-helm install jalki helm/jalki/ --set cluster=prod-east-1 --set emit=stdout
-```
+Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF. The deployment authority is false-infra `apps/jalki/` — the manifest set that runs in the live cluster (see `helm/README.md` for why the in-repo chart was retired).
 
 ---
 
