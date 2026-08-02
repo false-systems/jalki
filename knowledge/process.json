@@ -4,7 +4,7 @@
   "description": "Process lifecycle kernel functions",
   "probes": [
     {
-      "function": "do_execve",
+      "function": "sched_process_exec",
       "attachment": "fentry",
       "event_type": "kernel.process.exec",
       "layer": "process",
@@ -49,7 +49,7 @@
       ],
       "use_when": "you want to observe process termination. exit codes above 128 indicate the process was killed by a signal (exit_code - 128 = signal number).",
       "not_when": "you need to know why the process exited — correlate with other probes or application logs.",
-      "combine_with": ["do_execve", "oom_kill_process"],
+      "combine_with": ["sched_process_exec", "oom_kill_process"],
       "interpretations": [
         {
           "pattern": "exit_code == 137 (128 + SIGKILL)",
@@ -82,8 +82,8 @@
         { "name": "ret",     "type": "i64",   "meaning": "child PID or negative errno",   "important": true }
       ],
       "use_when": "you need to track process or thread creation. ret < 0 means fork failed — system may be out of PIDs or memory.",
-      "not_when": "you need to know what the child process does — use do_execve for that.",
-      "combine_with": ["do_execve", "do_exit"],
+      "not_when": "you need to know what the child process does — use sched_process_exec for that.",
+      "combine_with": ["sched_process_exec", "do_exit"],
       "interpretations": [
         {
           "pattern": "ret < 0",

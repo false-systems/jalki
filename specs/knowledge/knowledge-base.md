@@ -11,7 +11,7 @@
 - tcp: connection observability (tcp_connect, tcp_close, tcp_retransmit_skb, tcp_sendmsg, inet_csk_accept, tcp_recvmsg, tcp_v4_syn_recv_sock, tcp_reset)
 - memory: resource observability (oom_kill_process, mm_page_alloc, try_charge_memcg)
 - fs: filesystem I/O (vfs_open, vfs_write, vfs_read, filp_close)
-- process: lifecycle (do_execve, do_exit, sys_clone)
+- process: lifecycle (sched_process_exec, do_exit, sys_clone)
 - sched: CPU scheduling (finish_task_switch, try_to_wake_up)
 
 ## Semantic correctness
