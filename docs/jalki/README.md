@@ -1,18 +1,18 @@
 # Jälki — Design
 
-> Jälki observes the kernel and answers questions about it. Polku transports its evidence to Vartio. Vartio interprets it and writes to Ahti. Lähde and Vartio reason across producers. Syvä enforces later.
+> Jälki observes the kernel and answers questions about it. Its native Vartio sink delivers the evidence to Vartio's source ingress. Vartio interprets it and writes to Ahti. Lähde and Vartio reason across producers. Syvä enforces later.
 
-> **⚠ Superseded in part by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md) (2026-06-22) — read this first.** This directory's May-2026 pass framed Jälki as a *direct Ahti producer*. That is reversed: evidence flows `jälki → Polku → Vartio → Ahti`; **Jälki never writes to Ahti** (Vartio does); and Jälki **keeps** its product surface (`ask`/MCP/SDK/KB). Every doc here carries a banner noting what survives.
+> **⚠ Current architecture is [ADR-0003](./adr/0003-native-vartio-sink-retire-polku.md) (accepted 2026-07-27) — read this first.** Evidence flows `jälki → Vartio source-ingress → Ahti`; there is **no Polku hop** (Polku left the deployed topology). ADR-0003 supersedes ADR-0002's routing clauses while keeping its core prohibitions: **Jälki never writes to Ahti** (Vartio does), Plane-B evidence stays neutral, node-local binding enrichment is mandatory, and Jälki **keeps** its product surface (`ask`/MCP/SDK/KB). This directory's May-2026 pass framed Jälki as a *direct Ahti producer* — that premise is dead; every doc here carries a banner noting what survives.
 >
-> **Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md) (2026-05-20).** ADR-0001 reversed the "all interpretation in Lähde" boundary so Jälki may interpret; ADR-0002 keeps that but scopes interpretation to Jälki's *direct* surface (it is not written to Ahti). Read both ADRs before relying on any "MUST"/"MUST NOT" clause below.
+> **Amended by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md) (2026-05-20).** ADR-0001 reversed the "all interpretation in Lähde" boundary so Jälki may interpret; ADR-0002/0003 keep that but scope interpretation to Jälki's *direct* surface (it is not written to Ahti). Read both ADRs before relying on any "MUST"/"MUST NOT" clause below.
 
 This directory contains the design documents for Jälki in the new False Systems architecture. When the design is approved, implementation will follow in separate PRs against the existing crate layout (see top-level `CLAUDE.md`).
 
 ## What Jälki is
 
-Jälki is a runtime/kernel evidence layer. It runs on every node and produces structured evidence of what the kernel and the container runtime are doing — process exec, file open, network connect, TCP retransmit, scheduler latency, block IO — and hands that evidence to Polku for delivery to Vartio.
+Jälki is a runtime/kernel evidence layer. It runs on every node and produces structured evidence of what the kernel and the container runtime are doing — process exec, file open, network connect, TCP retransmit, scheduler latency, block IO — and delivers that evidence to Vartio's source ingress through its native `jalki-vartio-sink`.
 
-Jälki is to **kernel functions** what an OTel collector is to userspace spans, with one critical difference: Jälki does not own a datastore, a dashboard, an alert engine, or a root-cause interpreter. It produces evidence and hands it to Polku → Vartio (which interprets and writes to Ahti).
+Jälki is to **kernel functions** what an OTel collector is to userspace spans, with one critical difference: Jälki does not own a datastore, a dashboard, an alert engine, or a root-cause interpreter. It produces evidence and delivers it to Vartio (which interprets and writes to Ahti).
 
 ## What Jälki is not
 
@@ -44,9 +44,7 @@ Data flow:
         ▼
    Jälki agent (per node)
         │  captures, enriches (cgroup→container→pod), normalizes — neutral evidence
-        ▼
-   Polku   (event transport)
-        ▼
+        ▼  (native Vartio sink — gRPC SourceIngress.ReceiveBatch; Polku retired, ADR-0003)
    Vartio  (interprets: ObservedEvent → operational chains → decisions)
         ▼
    Ahti    (append-first record store; Vartio is the writer)
@@ -56,7 +54,7 @@ Data flow:
 
 The boundaries are deliberate:
 
-- Jälki **MUST** hand its evidence to Polku → Vartio. It **MUST NOT** write to Ahti directly, and **MUST NOT** keep a parallel durable store.
+- Jälki **MUST** deliver its evidence to Vartio's source ingress (native sink, no intermediary). It **MUST NOT** write to Ahti directly, and **MUST NOT** keep a parallel durable store.
 - Vartio interprets Jälki's evidence and is the writer of the resulting records to Ahti.
 - Vartio decides Actor attribution. Jälki **MUST NOT** assert that a process belongs to an Actor envelope.
 - Lähde decides observability meaning ("MySQL latency is network-related"). Jälki **MUST NOT** assert root cause on the evidence it ships (it MAY interpret on its own `ask`/MCP surface).
@@ -66,7 +64,8 @@ The boundaries are deliberate:
 
 | Document | Purpose |
 |---|---|
-| [`adr/0002-evidence-through-polku-to-vartio.md`](./adr/0002-evidence-through-polku-to-vartio.md) | **Current architecture — read first.** Evidence routes `jälki → Polku → Vartio → Ahti`; Jälki never writes Ahti; product surface kept. Supersedes the Ahti-producer framing across every doc below. |
+| [`adr/0003-native-vartio-sink-retire-polku.md`](./adr/0003-native-vartio-sink-retire-polku.md) | **Current architecture — read first.** Evidence routes `jälki → Vartio source-ingress → Ahti` through the native `VartioSink`; no Polku hop; Jälki never writes Ahti; product surface kept. |
+| [`adr/0002-evidence-through-polku-to-vartio.md`](./adr/0002-evidence-through-polku-to-vartio.md) | Superseded in its routing clauses by ADR-0003. Still binding: Jälki never writes Ahti (§D1 core), two planes (§D3), Plane-B neutrality (§D4), mandatory binding enrichment (§D5), importer contract (§D6), no silent loss (§D7). |
 | [`adr/0001-evidence-sinks-and-probe-intelligence.md`](./adr/0001-evidence-sinks-and-probe-intelligence.md) | The architectural gate for the `EvidenceSink` seam and the probe-intelligence reversal. Its Polku/Ahti *routing* (§D2) and Ahti-records interpretation (§D4) are superseded by ADR-0002. |
 | [`product-boundaries.md`](./product-boundaries.md) | The does/does-not contract. Read first when in doubt — but note §2.2/§2.3/§2.5 are amended by ADR-0001. |
 | [`ahti-record-mapping.md`](./ahti-record-mapping.md) | How every Jälki concept maps to one of Ahti's eight record kinds, using Ahti's actual field names. |
@@ -84,7 +83,7 @@ Details in [`local-agent-state.md`](./local-agent-state.md).
 
 ## The design sentence to preserve
 
-> *"Jälki asks the kernel questions, emits structured evidence, and says what it likely means. Polku routes it. Ahti preserves it. Lähde and Vartio reason across producers."*
+> *"Jälki asks the kernel questions, emits structured evidence, and says what it likely means. Vartio receives and interprets it. Ahti preserves it. Lähde and Vartio reason across producers."*
 
 When any future design choice conflicts with this sentence, the design choice is wrong, not the sentence. (The earlier sentence — which placed *all* interpretation in Lähde — was deliberately replaced by [ADR-0001](./adr/0001-evidence-sinks-and-probe-intelligence.md). Changing this sentence requires an ADR, not an edit.)
 
@@ -93,10 +92,10 @@ When any future design choice conflicts with this sentence, the design choice is
 Today's `jalki` repo already implements:
 
 - A programmable fentry/fexit framework (`Probe` trait, `jalki-ebpf`, `jalki-codegen`).
-- Three built-in TCP probes emitting **FALSE Protocol Occurrences** to stdout / file / a stub gRPC sink.
+- Six built-in probes (TCP connect/close/retransmit, process exec, file open/open-attempt) emitting **FALSE Protocol Occurrences** to the native Vartio sink / stdout / file.
 - A local knowledge base and `ask`/`watch`/`stream`/`list`/`status` CLI surface.
 - An MCP server exposing kernel observability to AI agents.
 
-This design refactors the **output model**: the agent gains a neutral evidence plane that hands evidence to Polku → Vartio (which interprets and writes to Ahti). The fentry/fexit framework, the probe trait, and the eBPF crates are preserved — and per [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md), Jälki **keeps** its direct product surface (`ask` / MCP / SDK / knowledge base); it is not demoted. Jälki does not write to Ahti directly.
+This design refactors the **output model**: the agent gains a neutral evidence plane that delivers evidence to Vartio (which interprets and writes to Ahti). The fentry/fexit framework, the probe trait, and the eBPF crates are preserved — and per [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md), Jälki **keeps** its direct product surface (`ask` / MCP / SDK / knowledge base); it is not demoted. Jälki does not write to Ahti directly.
 
-The v0 implementation slice is defined by [ADR-0002](./adr/0002-evidence-through-polku-to-vartio.md): a Polku→Vartio sink behind the existing `EvidenceSink`, mandatory node-local `cgroup→pod` enrichment, and a Vartio-side `Importer.Jalki`. (The old `v0-scope.md` was removed — it described the dead Ahti-producer slice.)
+The implemented slice follows [ADR-0003](./adr/0003-native-vartio-sink-retire-polku.md): the native `jalki-vartio-sink` behind the existing `EvidenceSink`, mandatory node-local `cgroup→pod` enrichment (`jalki-enrich`), and a Vartio-side `Importer.Jalki`. (The old `v0-scope.md` was removed — it described the dead Ahti-producer slice.)
