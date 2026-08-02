@@ -10,7 +10,10 @@ use jalki_common::{
     MAX_SENSITIVE_PREFIXES,
 };
 
-use crate::{is_self_filtered, FILE_OPEN_EVENTS, FILE_OPEN_SCRATCH, SENSITIVE_PREFIXES};
+use crate::{
+    count_ring_buffer_drop, is_self_filtered, FILE_OPEN_EVENTS, FILE_OPEN_EVENTS_DROPS,
+    FILE_OPEN_SCRATCH, SENSITIVE_PREFIXES,
+};
 
 // `struct file` field offsets (f_path for bpf_d_path, f_flags) are compile-time
 // constants shared from `jalki_common` and verified against kernel BTF at load
@@ -76,9 +79,9 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    // Best-effort ring buffer output — drop silently if full. Reader-side stats
-    // surface ring buffer drops as agent gap evidence.
-    let _ = FILE_OPEN_EVENTS.output(event, 0);
+    if FILE_OPEN_EVENTS.output(event, 0).is_err() {
+        count_ring_buffer_drop(&FILE_OPEN_EVENTS_DROPS);
+    }
 
     Ok(())
 }

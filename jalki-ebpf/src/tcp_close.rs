@@ -5,7 +5,7 @@ use aya_ebpf::programs::FExitContext;
 
 use jalki_common::TcpCloseEvent;
 
-use crate::{is_self_filtered, TCP_CLOSE_EVENTS};
+use crate::{count_ring_buffer_drop, is_self_filtered, TCP_CLOSE_EVENTS, TCP_CLOSE_EVENTS_DROPS};
 
 /// Handle fexit/tcp_close.
 ///
@@ -84,7 +84,9 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         _pad2: 0,
     };
 
-    let _ = TCP_CLOSE_EVENTS.output(&event, 0);
+    if TCP_CLOSE_EVENTS.output(&event, 0).is_err() {
+        count_ring_buffer_drop(&TCP_CLOSE_EVENTS_DROPS);
+    }
 
     Ok(())
 }

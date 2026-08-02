@@ -8,7 +8,10 @@ use aya_ebpf::EbpfContext;
 
 use jalki_common::ProcessExecEvent;
 
-use crate::{is_self_filtered, PROCESS_EXEC_EVENTS, TASK_OFFSETS};
+use crate::{
+    count_ring_buffer_drop, is_self_filtered, PROCESS_EXEC_EVENTS, PROCESS_EXEC_EVENTS_DROPS,
+    TASK_OFFSETS,
+};
 
 /// sched_process_exec tracepoint payload offsets after the common trace header.
 ///
@@ -73,8 +76,9 @@ fn try_handle(ctx: &TracePointContext) -> Result<(), i64> {
         };
     }
 
-    // Best-effort ring buffer output — drop silently if full.
-    let _ = PROCESS_EXEC_EVENTS.output(&event, 0);
+    if PROCESS_EXEC_EVENTS.output(&event, 0).is_err() {
+        count_ring_buffer_drop(&PROCESS_EXEC_EVENTS_DROPS);
+    }
 
     Ok(())
 }

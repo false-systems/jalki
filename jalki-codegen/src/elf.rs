@@ -12,7 +12,9 @@ use object::{
 
 use crate::error::CodegenError;
 use crate::insn::{encode, BpfInsn};
-use crate::program::{AttachType, MAP_IDX_PID_FILTER, MAP_IDX_RINGBUF};
+use crate::program::{
+    AttachType, MAP_IDX_PID_FILTER, MAP_IDX_RINGBUF, MAP_IDX_RINGBUF_DROPS,
+};
 
 /// BPF map definition struct (legacy format — 20 bytes).
 /// Matches the kernel's `struct bpf_map_def`.
@@ -26,6 +28,7 @@ struct BpfMapDef {
 }
 
 const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 /// Relocation type for BPF 64-bit immediate (map fd).
@@ -59,6 +62,14 @@ pub fn generate_elf(
         key_size: 0,
         value_size: 0,
         max_entries: ringbuf_size,
+        map_flags: 0,
+    };
+
+    let ringbuf_drops_def = BpfMapDef {
+        map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
         map_flags: 0,
     };
 
@@ -114,6 +125,31 @@ pub fn generate_elf(
         flags: SymbolFlags::None,
     });
 
+    let ringbuf_drops_data = unsafe {
+        std::slice::from_raw_parts(
+            &ringbuf_drops_def as *const BpfMapDef as *const u8,
+            std::mem::size_of::<BpfMapDef>(),
+        )
+    };
+    let ringbuf_drops_name = format!("{ringbuf_map_name}_DROPS");
+    let ringbuf_drops_section = obj.add_section(
+        Vec::new(),
+        format!("maps/{ringbuf_drops_name}").into_bytes(),
+        SectionKind::Data,
+    );
+    obj.set_section_data(ringbuf_drops_section, ringbuf_drops_data, 4);
+
+    let ringbuf_drops_sym = obj.add_symbol(Symbol {
+        name: ringbuf_drops_name.into_bytes(),
+        value: 0,
+        size: std::mem::size_of::<BpfMapDef>() as u64,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(ringbuf_drops_section),
+        flags: SymbolFlags::None,
+    });
+
     // === License section ===
     let license_section = obj.add_section(Vec::new(), b"license".to_vec(), SectionKind::Data);
     obj.set_section_data(license_section, b"GPL\0", 1);
@@ -150,6 +186,7 @@ pub fn generate_elf(
         let target_sym = match map_index {
             MAP_IDX_PID_FILTER => pid_filter_sym,
             MAP_IDX_RINGBUF => ringbuf_sym,
+            MAP_IDX_RINGBUF_DROPS => ringbuf_drops_sym,
             _ => return Err(CodegenError::Elf(format!("unknown map index {map_index}"))),
         };
 
@@ -197,5 +234,8 @@ mod tests {
         // Should be a valid ELF.
         assert!(elf.len() > 64); // at least an ELF header
         assert_eq!(&elf[0..4], b"\x7fELF"); // ELF magic
+        assert!(elf
+            .windows(b"TEST_EVENTS_DROPS".len())
+            .any(|window| window == b"TEST_EVENTS_DROPS"));
     }
 }

@@ -2,13 +2,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use aya::maps::{MapData, RingBuf};
+use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
 use jalki_evidence::EvidenceRecord;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::enrich::{bind_record, RuntimeEnricher};
+use crate::metrics::{Metrics, ProbeLabel};
 use crate::probe::Probe;
 use crate::sensitive_paths::SensitivePathMatcher;
 use crate::store::EventStore;
@@ -19,6 +20,7 @@ pub struct ProbeStats {
     pub events_dropped: AtomicU64,
     pub events_sampled_out: AtomicU64,
     pub parse_errors: AtomicU64,
+    pub last_observed_at_ns: AtomicU64,
 }
 
 impl Default for ProbeStats {
@@ -34,6 +36,7 @@ impl ProbeStats {
             events_dropped: AtomicU64::new(0),
             events_sampled_out: AtomicU64::new(0),
             parse_errors: AtomicU64::new(0),
+            last_observed_at_ns: AtomicU64::new(0),
         }
     }
 }
@@ -54,6 +57,7 @@ pub fn spawn_reader(
     cluster: String,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
     stats: Arc<ProbeStats>,
+    metrics: Arc<Metrics>,
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_path_matcher: Arc<SensitivePathMatcher>,
@@ -66,6 +70,20 @@ pub fn spawn_reader(
     let ring_buf: RingBuf<MapData> = map
         .try_into()
         .with_context(|| format!("{map_name} is not a RingBuf"))?;
+    let drop_map_name = format!("{map_name}_DROPS");
+    let drop_counts = match ebpf.take_map(&drop_map_name) {
+        Some(map) => Some(
+            map.try_into()
+                .with_context(|| format!("{drop_map_name} is not a PerCpuArray"))?,
+        ),
+        None => {
+            warn!(
+                probe = probe.name(),
+                "ring buffer drop counter map not found"
+            );
+            None
+        }
+    };
 
     let probe_name = probe.name().to_string();
     let stop = ReaderStop::new();
@@ -74,10 +92,12 @@ pub fn spawn_reader(
     tokio::task::spawn_blocking(move || {
         drain_loop(
             ring_buf,
+            drop_counts,
             probe,
             &cluster,
             tx,
             stats,
+            metrics,
             &probe_name,
             store,
             enricher,
@@ -125,10 +145,12 @@ impl ReaderStop {
 #[allow(clippy::too_many_arguments)]
 fn drain_loop(
     mut ring_buf: RingBuf<aya::maps::MapData>,
+    drop_counts: Option<PerCpuArray<MapData, u64>>,
     probe: Arc<dyn Probe>,
     cluster: &str,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
     stats: Arc<ProbeStats>,
+    metrics: Arc<Metrics>,
     probe_name: &str,
     store: Arc<EventStore>,
     enricher: Arc<dyn RuntimeEnricher>,
@@ -145,6 +167,10 @@ fn drain_loop(
         1
     };
     let mut counter: u64 = 0;
+    let mut last_drop_poll = std::time::Instant::now();
+    let drop_metric_label = ProbeLabel {
+        probe: probe_name.to_string(),
+    };
 
     loop {
         // Checked before draining, so a detach cannot be delayed by a busy ring
@@ -178,6 +204,9 @@ fn drain_loop(
                             continue;
                         }
                         let record = bind_record(record, enricher.as_ref());
+                        stats
+                            .last_observed_at_ns
+                            .store(record.observed_at_ns, Ordering::Relaxed);
                         // The local debug store keeps the lean occurrence shape used by
                         // IPC stream/watch. Durable sinks project D6 metadata later via
                         // EvidenceBatch::into_occurrences().
@@ -196,6 +225,28 @@ fn drain_loop(
         if !records.is_empty() && tx.blocking_send(records).is_err() {
             debug!(probe = probe_name, "sink channel closed, stopping reader");
             return;
+        }
+
+        if last_drop_poll.elapsed() >= std::time::Duration::from_secs(1) {
+            if let Some(drop_counts) = &drop_counts {
+                match drop_counts.get(&0, 0) {
+                    Ok(values) => {
+                        let total = values.iter().copied().fold(0, u64::wrapping_add);
+                        let previous = stats.events_dropped.swap(total, Ordering::Relaxed);
+                        let new_drops = total.wrapping_sub(previous);
+                        if new_drops > 0 {
+                            metrics
+                                .ring_buffer_drops
+                                .get_or_create(&drop_metric_label)
+                                .inc_by(new_drops);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(probe = probe_name, %error, "failed to read ring buffer drop counter")
+                    }
+                }
+            }
+            last_drop_poll = std::time::Instant::now();
         }
 
         // No events available — sleep briefly before polling again.

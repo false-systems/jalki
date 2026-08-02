@@ -140,7 +140,6 @@ impl Runtime {
         let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
 
         // Spawn a reader for each probe, register in the registry.
-        let mut stats_map: Vec<(String, Arc<ProbeStats>)> = Vec::new();
         for probe in &self.probes {
             let stats = Arc::new(ProbeStats::new());
             reader::spawn_reader(
@@ -149,12 +148,12 @@ impl Runtime {
                 self.cluster.clone(),
                 tx.clone(),
                 stats.clone(),
+                metrics.clone(),
                 store.clone(),
                 self.enricher.clone(),
                 sensitive_path_matcher.clone(),
             )?;
             registry.register_startup_probe(probe.clone(), stats.clone());
-            stats_map.push((probe.name().to_string(), stats));
         }
 
         // Build the daemon handle for IPC and CLI.
@@ -163,6 +162,7 @@ impl Runtime {
             btf,
             btf_data,
             registry: registry.clone(),
+            metrics: metrics.clone(),
             store: store.clone(),
             kb: kb.clone(),
             tx: tx.clone(),
@@ -174,10 +174,10 @@ impl Runtime {
 
         // Spawn self-observability: periodically emit drops/errors as evidence.
         let stats_tx = tx.clone();
-        let stats_cluster = self.cluster.clone();
-        let stats_for_task = stats_map.clone();
+        let stats_registry = registry.clone();
+        let stats_producer = producer.clone();
         tokio::spawn(async move {
-            emit_self_observability(stats_for_task, stats_tx, &stats_cluster).await;
+            emit_self_observability(stats_registry, stats_tx, &stats_producer).await;
         });
 
         // Spawn IPC server.
@@ -344,6 +344,7 @@ pub struct DaemonHandle {
     btf: Btf,
     btf_data: jalki_codegen::btf::BtfData,
     pub registry: Arc<ProbeRegistry>,
+    metrics: Arc<Metrics>,
     pub store: Arc<EventStore>,
     pub kb: Arc<KnowledgeBase>,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
@@ -389,6 +390,7 @@ impl DaemonHandle {
                 &self.btf,
                 &self.cluster,
                 self.tx.clone(),
+                self.metrics.clone(),
                 &self.store,
                 self.enricher.clone(),
                 self.sensitive_path_matcher.clone(),
@@ -505,6 +507,7 @@ impl DaemonHandle {
             &self.btf,
             &self.cluster,
             self.tx.clone(),
+            self.metrics.clone(),
             &self.store,
             self.enricher.clone(),
             self.sensitive_path_matcher.clone(),
@@ -1245,46 +1248,95 @@ fn map_kb_fields_to_btf(
 /// If AHTI sees a gap in events and doesn't know jälki dropped them,
 /// it will misdiagnose. These events close that gap.
 async fn emit_self_observability(
-    stats_map: Vec<(String, Arc<ProbeStats>)>,
+    registry: Arc<ProbeRegistry>,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
-    cluster: &str,
+    producer: &ProducerMetadata,
 ) {
-    let mut prev_dropped: Vec<u64> = vec![0; stats_map.len()];
-    let mut prev_errors: Vec<u64> = vec![0; stats_map.len()];
+    let mut previous: HashMap<String, (u64, u64, u64)> = HashMap::new();
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
     loop {
         interval.tick().await;
 
-        for (i, (probe_name, stats)) in stats_map.iter().enumerate() {
+        for (probe_name, stats) in registry.observability_stats() {
             let dropped = stats.events_dropped.load(Ordering::Relaxed);
             let errors = stats.parse_errors.load(Ordering::Relaxed);
+            let observed_at_ns = stats.last_observed_at_ns.load(Ordering::Relaxed);
+            let (prev_dropped, prev_errors, prev_observed_at_ns) =
+                previous.get(&probe_name).copied().unwrap_or_default();
 
-            let new_drops = dropped - prev_dropped[i];
-            let new_errors = errors - prev_errors[i];
+            let new_drops = dropped.wrapping_sub(prev_dropped);
+            let new_errors = errors.wrapping_sub(prev_errors);
+            previous.insert(probe_name.clone(), (dropped, errors, observed_at_ns));
 
             if new_drops > 0 {
                 warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
-                let occ = Occurrence::new("jalki/self", "jalki.probe.events_dropped")
-                    .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                // Best-effort — if the channel is full, we can't do anything about it.
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
+                let gap_start_ns = if prev_observed_at_ns == 0 {
+                    observed_at_ns
+                } else {
+                    prev_observed_at_ns
+                };
+                let gap_end_ns = if observed_at_ns == 0 {
+                    gap_start_ns
+                } else {
+                    observed_at_ns
+                };
+                if tx
+                    .send(ring_buffer_gap_records(
+                        producer,
+                        &probe_name,
+                        new_drops,
+                        gap_start_ns,
+                        gap_end_ns,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
 
             if new_errors > 0 {
                 warn!(probe = %probe_name, errors = new_errors, "parse errors detected");
                 let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
                     .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
+                    .in_cluster(producer.cluster.clone());
+                if tx
+                    .send(vec![self_observability_record(occ)])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
-
-            prev_dropped[i] = dropped;
-            prev_errors[i] = errors;
         }
     }
+}
+
+fn ring_buffer_gap_records(
+    producer: &ProducerMetadata,
+    probe_name: &str,
+    dropped_records: u64,
+    gap_start_ns: u64,
+    gap_end_ns: u64,
+) -> Vec<EvidenceRecord> {
+    let mut batch = GapReport {
+        cause: "ringbuffer_overflow".into(),
+        dropped_records: usize::try_from(dropped_records).unwrap_or(usize::MAX),
+        gap_start_ns,
+        gap_end_ns,
+        dropped_reliability: 0,
+        dropped_attribution: 0,
+    }
+    .into_batch(producer.clone());
+    if let Some(record) = batch.records.first_mut() {
+        record
+            .occurrence
+            .labels
+            .insert("affected_probes".into(), probe_name.into());
+    }
+    batch.records
 }
 
 fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
@@ -1526,6 +1578,35 @@ mod tests {
         assert_eq!(
             retry.records[0].occurrence.id,
             first.records[0].occurrence.id
+        );
+    }
+
+    #[test]
+    fn ring_buffer_loss_becomes_gap_evidence() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let records = ring_buffer_gap_records(&producer, "tcp_connect", 7, 10, 20);
+        let gap = &records[0].occurrence;
+
+        assert_eq!(gap.occurrence_type.as_str(), "jalki.agent.gap");
+        assert_eq!(
+            gap.labels.get("cause").map(String::as_str),
+            Some("ringbuffer_overflow")
+        );
+        assert_eq!(
+            gap.labels.get("dropped_records").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            gap.labels.get("affected_probes").map(String::as_str),
+            Some("tcp_connect")
+        );
+        assert_eq!(
+            gap.labels.get("gap_start_ns").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            gap.labels.get("gap_end_ns").map(String::as_str),
+            Some("20")
         );
     }
 
