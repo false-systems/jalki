@@ -76,10 +76,21 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<(u8, u8, 
     Ok((msg_type, flags, payload))
 }
 
-fn encode_msgpack(value: &Value) -> Vec<u8> {
+fn encode_msgpack(value: &Value) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, value).unwrap_or_default();
-    buf
+    rmpv::encode::write_value(&mut buf, value).context("msgpack encode")?;
+    Ok(buf)
+}
+
+/// Encode an ERROR frame: `[code, message]` (see jalki-sdk-meta protocol.rs).
+///
+/// Encoding two plain strings cannot realistically fail; if it somehow does,
+/// an ERROR frame with an empty payload still reaches the client — a visible
+/// protocol error, never a silently empty RESPONSE.
+fn encode_error_frame(code: &str, message: &str) -> Vec<u8> {
+    let payload = Value::Array(vec![msgpack_str(code), msgpack_str(message)]);
+    let bytes = encode_msgpack(&payload).unwrap_or_default();
+    encode_frame(MSG_ERROR, 0, &bytes)
 }
 
 fn decode_msgpack(data: &[u8]) -> Result<Value> {
@@ -103,7 +114,19 @@ fn encode_response(request_id: u32, result: Result<Value, String>) -> Vec<u8> {
             Value::String(msg.into()),
         ]),
     };
-    encode_frame(MSG_RESPONSE, 0, &encode_msgpack(&payload))
+    match encode_msgpack(&payload) {
+        Ok(bytes) => encode_frame(MSG_RESPONSE, 0, &bytes),
+        Err(e) => {
+            // Previously this silently sent an empty payload, which a client
+            // decodes as an empty array — indistinguishable from a real
+            // (malformed) response. Fail loudly instead.
+            tracing::error!(request_id, error = %e, "failed to encode IPC response payload");
+            encode_error_frame(
+                "encode_failed",
+                &format!("daemon failed to encode response for request {request_id}: {e}"),
+            )
+        }
+    }
 }
 
 // --- Server ---
@@ -189,7 +212,15 @@ async fn handle_connection(stream: UnixStream, handle: Arc<DaemonHandle>) -> Res
                 }
             }
             MSG_PING => {
-                let pong = encode_frame(MSG_PONG, 0, &encode_msgpack(&Value::Array(vec![])));
+                // An empty array's encoding is infallible in practice; the
+                // fallback keeps the failure visible rather than silent.
+                let pong = match encode_msgpack(&Value::Array(vec![])) {
+                    Ok(bytes) => encode_frame(MSG_PONG, 0, &bytes),
+                    Err(e) => {
+                        warn!(error = %e, "failed to encode PONG payload");
+                        encode_error_frame("encode_failed", "failed to encode PONG payload")
+                    }
+                };
                 let _ = tx.send(pong).await;
             }
             _ => {
@@ -383,7 +414,19 @@ impl ConnectionHandler {
         let task = tokio::spawn(async move {
             // Send STREAM_START.
             let start_arr = Value::Array(vec![msgpack_str(&probe_id_clone)]);
-            let start_frame = encode_frame(MSG_STREAM_START, 0, &encode_msgpack(&start_arr));
+            let start_frame = match encode_msgpack(&start_arr) {
+                Ok(bytes) => encode_frame(MSG_STREAM_START, 0, &bytes),
+                Err(e) => {
+                    tracing::error!(probe_id = %probe_id_clone, error = %e, "failed to encode STREAM_START payload");
+                    let _ = tx
+                        .send(encode_error_frame(
+                            "encode_failed",
+                            "failed to encode STREAM_START payload",
+                        ))
+                        .await;
+                    return;
+                }
+            };
             if tx.send(start_frame).await.is_err() {
                 return;
             }
@@ -442,7 +485,13 @@ impl ConnectionHandler {
             // Payload mirrors STREAM_START's `[probe_id]`, so a client can tell
             // which stream ended rather than inferring it.
             let end_arr = Value::Array(vec![msgpack_str(&probe_id)]);
-            let end_frame = encode_frame(MSG_STREAM_END, 0, &encode_msgpack(&end_arr));
+            let end_frame = match encode_msgpack(&end_arr) {
+                Ok(bytes) => encode_frame(MSG_STREAM_END, 0, &bytes),
+                Err(e) => {
+                    tracing::error!(probe_id = %probe_id, error = %e, "failed to encode STREAM_END payload");
+                    encode_error_frame("encode_failed", "failed to encode STREAM_END payload")
+                }
+            };
             let _ = self.tx.send(end_frame).await;
         }
 
@@ -772,7 +821,13 @@ fn encode_stream_event(
     ]);
 
     let flags = if interpreted { FLAG_INTERPRETED } else { 0 };
-    encode_frame(MSG_STREAM_EVENT, flags, &encode_msgpack(&arr))
+    match encode_msgpack(&arr) {
+        Ok(bytes) => encode_frame(MSG_STREAM_EVENT, flags, &bytes),
+        Err(e) => {
+            tracing::error!(event_id = %occ.id, error = %e, "failed to encode stream event payload");
+            encode_error_frame("encode_failed", "failed to encode stream event payload")
+        }
+    }
 }
 
 fn encode_compact_event(
@@ -985,7 +1040,7 @@ pub async fn call_native(method: u8, params: Value) -> Result<Response> {
         Value::Integer(method.into()),
         params,
     ]);
-    let payload = encode_msgpack(&request);
+    let payload = encode_msgpack(&request)?;
     let frame = encode_frame(MSG_REQUEST, 0, &payload);
 
     write_half.write_all(&frame).await?;
