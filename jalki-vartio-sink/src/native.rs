@@ -137,7 +137,11 @@ pub fn native_runtime_item(occ: &Occurrence) -> Map<String, Value> {
             item.insert("ppid".into(), json!(ppid));
         }
         item.insert("comm".into(), json!(process.command));
-        item.insert("uid".into(), json!(process.uid));
+        // Absent for the TCP family: those kernel events carry no uid, and an
+        // omitted key is honest where uid=0 would claim root.
+        if let Some(uid) = process.uid {
+            item.insert("uid".into(), json!(uid));
+        }
     }
 
     if let Some(network) = &occ.network_data {
@@ -216,7 +220,7 @@ mod tests {
             ppid: None,
             command: "kubectl".into(),
             args: None,
-            uid: 0,
+            uid: None,
             exit_code: None,
         });
 
@@ -238,6 +242,8 @@ mod tests {
         assert!(!m.contains_key("labels") && !m.contains_key("reasoning"));
         // no RTT observed → no rtt_ms key, never a fabricated value
         assert!(!m.contains_key("rtt_ms"));
+        // the TCP kernel events carry no uid — omitted, never claimed as 0
+        assert!(!m.contains_key("uid"));
     }
 
     #[test]
@@ -285,7 +291,7 @@ mod tests {
             ppid: Some(1707001),
             command: "kubectl".into(),
             args: None,
-            uid: 1001,
+            uid: Some(1001),
             exit_code: None,
         });
 
@@ -316,7 +322,7 @@ mod tests {
             ppid: None,
             command: "cat".into(),
             args: None,
-            uid: 1001,
+            uid: Some(1001),
             exit_code: None,
         });
 
@@ -350,7 +356,7 @@ mod tests {
             ppid: None,
             command: "cat".into(),
             args: None,
-            uid: 0,
+            uid: Some(0),
             exit_code: None,
         });
 

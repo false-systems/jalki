@@ -85,7 +85,10 @@ pub struct ProcessEventData {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<String>,
-    pub uid: u32,
+    /// `None` when the source event does not carry a uid (e.g. the TCP
+    /// kernel events) — an absent uid must never be reported as root's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }

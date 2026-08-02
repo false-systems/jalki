@@ -69,7 +69,7 @@ impl FileOpenEvent {
             ppid: None,
             command: self.comm.clone(),
             args: None,
-            uid: self.uid,
+            uid: Some(self.uid),
             exit_code: None,
         });
 
@@ -121,7 +121,7 @@ impl FileOpenEvent {
             ppid: None,
             command: self.comm.clone(),
             args: None,
-            uid: self.uid,
+            uid: Some(self.uid),
             exit_code: None,
         });
 
@@ -166,7 +166,7 @@ impl ProcessExecEvent {
             ppid: (self.ppid != 0).then_some(self.ppid),
             command: self.filename.clone(),
             args: None,
-            uid: self.uid,
+            uid: Some(self.uid),
             exit_code: if success { None } else { Some(self.ret) },
         });
 
@@ -238,7 +238,9 @@ impl TcpConnectEvent {
             ppid: None,
             command: self.comm.clone(),
             args: None,
-            uid: 0,
+            // The TCP kernel events carry no uid; absent means absent —
+            // claiming uid 0 here would report every connection as root's.
+            uid: None,
             exit_code: None,
         });
         occ.labels
@@ -312,7 +314,9 @@ impl TcpCloseEvent {
             ppid: None,
             command: self.comm.clone(),
             args: None,
-            uid: 0,
+            // The TCP kernel events carry no uid; absent means absent —
+            // claiming uid 0 here would report every connection as root's.
+            uid: None,
             exit_code: None,
         });
         occ.labels
@@ -367,7 +371,9 @@ impl TcpRetransmitEvent {
             ppid: None,
             command: self.comm.clone(),
             args: None,
-            uid: 0,
+            // The TCP kernel events carry no uid; absent means absent —
+            // claiming uid 0 here would report every connection as root's.
+            uid: None,
             exit_code: None,
         });
         occ.labels
@@ -610,6 +616,20 @@ mod tests {
         assert_eq!(net.dst_port, 8080);
         assert_eq!(occ.correlation_keys, vec!["10.0.0.1:54321->10.0.0.2:8080"]);
         assert!(occ.entity_ids.iter().any(|e| e == "process:1234"));
+    }
+
+    #[test]
+    fn tcp_occurrences_omit_unknown_uid() {
+        // The TCP kernel events carry no uid, so the occurrence must not
+        // claim one — uid=0 would report every connection as root's.
+        let occ = connect(0).to_occurrence("prod");
+        assert_eq!(occ.process_data.unwrap().uid, None);
+
+        // Events that DO carry a kernel-provided uid keep asserting it.
+        let occ = exec_event(0).to_occurrence("prod");
+        assert_eq!(occ.process_data.unwrap().uid, Some(1000));
+        let occ = file_open(0).to_occurrence("prod");
+        assert_eq!(occ.process_data.unwrap().uid, Some(1000));
     }
 
     #[test]
