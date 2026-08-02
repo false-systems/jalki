@@ -149,6 +149,13 @@ pub fn native_runtime_item(occ: &Occurrence) -> Map<String, Value> {
         if let Some(count) = network.retransmit_count {
             item.insert("count".into(), json!(count));
         }
+        // Importer.Jalki reads `rtt_ms` into its tcp_context; the current
+        // (not baseline) RTT is the observation. Capture does not measure RTT
+        // yet, so this is None today — the projection is the sink-side half,
+        // wired so the value flows the moment normalize carries it.
+        if let Some(rtt_ms) = network.rtt_current_ms {
+            item.insert("rtt_ms".into(), json!(rtt_ms));
+        }
     }
 
     if let Some(outcome) = &occ.outcome {
@@ -229,6 +236,38 @@ mod tests {
         assert!(m.contains_key("event_id") && m.contains_key("agent_recv_time"));
         // native shape: binding is top-level, no occurrence wrapper remains
         assert!(!m.contains_key("labels") && !m.contains_key("reasoning"));
+        // no RTT observed → no rtt_ms key, never a fabricated value
+        assert!(!m.contains_key("rtt_ms"));
+    }
+
+    #[test]
+    fn rtt_current_projects_as_rtt_ms() {
+        let mut occ = base_occ("kernel.tcp.retransmit");
+        occ.network_data = Some(NetworkEventData {
+            protocol: "tcp".into(),
+            src_ip: "10.244.3.21".into(),
+            dst_ip: "10.42.7.19".into(),
+            src_port: 41822,
+            dst_port: 443,
+            direction: "egress".into(),
+            dns_query: None,
+            http_method: None,
+            http_path: None,
+            http_status_code: None,
+            latency_ms: None,
+            bytes_sent: None,
+            bytes_received: None,
+            rtt_baseline_ms: Some(1.2),
+            rtt_current_ms: Some(48.5),
+            retransmit_count: None,
+        });
+
+        let m = native_runtime_item(&occ);
+        assert_eq!(m["rtt_ms"], 48.5, "importer reads the current RTT");
+        assert!(
+            !m.contains_key("rtt_baseline_ms"),
+            "baseline is jalki-internal; the importer key is rtt_ms only"
+        );
     }
 
     #[test]
