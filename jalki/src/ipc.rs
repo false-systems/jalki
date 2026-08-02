@@ -701,16 +701,20 @@ fn encode_stream_event(
     let ts_ns = occ.timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
 
     let severity: u8 = match occ.severity {
-        false_protocol::Severity::Info | false_protocol::Severity::Debug => 0,
+        false_protocol::Severity::Info => 0,
         false_protocol::Severity::Warning => 1,
         false_protocol::Severity::Error => 2,
         false_protocol::Severity::Critical => 3,
+        // Appended after 0-3 shipped — wire values never renumber.
+        false_protocol::Severity::Debug => 4,
     };
 
     let outcome: u8 = match occ.outcome {
         Some(false_protocol::Outcome::Success) => 0,
         Some(false_protocol::Outcome::Failure) => 1,
-        _ => 2,
+        Some(false_protocol::Outcome::Timeout) => 3,
+        Some(false_protocol::Outcome::InProgress) => 4,
+        Some(false_protocol::Outcome::Unknown) | None => 2,
     };
 
     let net_src = occ
@@ -779,15 +783,19 @@ fn encode_compact_event(
     let probe = occ.source.strip_prefix("jalki/").unwrap_or(&occ.source);
 
     let severity: u8 = match occ.severity {
-        false_protocol::Severity::Info | false_protocol::Severity::Debug => 0,
+        false_protocol::Severity::Info => 0,
         false_protocol::Severity::Warning => 1,
         false_protocol::Severity::Error => 2,
         false_protocol::Severity::Critical => 3,
+        // Appended after 0-3 shipped — wire values never renumber.
+        false_protocol::Severity::Debug => 4,
     };
     let outcome: u8 = match occ.outcome {
         Some(false_protocol::Outcome::Success) => 0,
         Some(false_protocol::Outcome::Failure) => 1,
-        _ => 2,
+        Some(false_protocol::Outcome::Timeout) => 3,
+        Some(false_protocol::Outcome::InProgress) => 4,
+        Some(false_protocol::Outcome::Unknown) | None => 2,
     };
 
     let fields = extract_event_fields(occ);
