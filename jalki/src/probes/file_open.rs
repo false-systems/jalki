@@ -31,6 +31,10 @@ impl Probe for FileOpen {
         "file_open"
     }
 
+    fn occurrence_type(&self) -> &str {
+        "kernel.file.open"
+    }
+
     fn program_name(&self) -> &str {
         "jalki_file_open"
     }

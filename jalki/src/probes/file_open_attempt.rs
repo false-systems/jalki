@@ -49,6 +49,10 @@ impl FileOpenAttempt {
 }
 
 impl Probe for FileOpenAttempt {
+    fn occurrence_type(&self) -> &str {
+        "kernel.file.open_attempt"
+    }
+
     fn attachments(&self) -> &[Attachment] {
         &self.attachments
     }

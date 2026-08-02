@@ -31,6 +31,10 @@ impl Probe for TcpClose {
         "tcp_close"
     }
 
+    fn occurrence_type(&self) -> &str {
+        "kernel.tcp.close"
+    }
+
     fn program_name(&self) -> &str {
         "jalki_tcp_close"
     }

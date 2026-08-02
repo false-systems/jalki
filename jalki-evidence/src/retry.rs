@@ -379,6 +379,8 @@ impl DrainPacer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapReport {
     pub cause: String,
+    /// Occurrence types whose absence the gap covers.
+    pub affected_probes: Vec<String>,
     pub dropped_records: usize,
     pub gap_start_ns: u64,
     pub gap_end_ns: u64,
@@ -403,6 +405,11 @@ impl GapReport {
             .saturating_add(other.dropped_attribution);
         self.gap_start_ns = self.gap_start_ns.min(other.gap_start_ns);
         self.gap_end_ns = self.gap_end_ns.max(other.gap_end_ns);
+        for occurrence_type in other.affected_probes {
+            if !self.affected_probes.contains(&occurrence_type) {
+                self.affected_probes.push(occurrence_type);
+            }
+        }
     }
 
     pub fn into_batch(self, producer: ProducerMetadata) -> EvidenceBatch {
@@ -410,6 +417,10 @@ impl GapReport {
             .severity(Severity::Warning)
             .in_cluster(producer.cluster.clone());
         occ.labels.insert("cause".into(), self.cause);
+        occ.labels.insert(
+            "affected_probes".into(),
+            serde_json::json!(self.affected_probes).to_string(),
+        );
         occ.labels
             .insert("dropped_records".into(), self.dropped_records.to_string());
         occ.labels.insert(
@@ -658,6 +669,7 @@ pub fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
     }
     GapReport {
         cause: cause.into(),
+        affected_probes: affected_probes(batch),
         dropped_records: batch.len(),
         gap_start_ns: batch.observed_at_min,
         gap_end_ns: batch.observed_at_max,
@@ -672,6 +684,7 @@ fn gap_for_shed(cause: &str, class: EvidenceClass, batch: &EvidenceBatch) -> Gap
     let n = batch.len();
     GapReport {
         cause: cause.into(),
+        affected_probes: affected_probes(batch),
         dropped_records: n,
         gap_start_ns: batch.observed_at_min,
         gap_end_ns: batch.observed_at_max,
@@ -684,6 +697,17 @@ fn gap_for_shed(cause: &str, class: EvidenceClass, batch: &EvidenceBatch) -> Gap
             EvidenceClass::Reliability => 0,
         },
     }
+}
+
+fn affected_probes(batch: &EvidenceBatch) -> Vec<String> {
+    let mut occurrence_types = Vec::new();
+    for record in &batch.records {
+        let occurrence_type = record.occurrence.occurrence_type.as_str().to_string();
+        if !occurrence_types.contains(&occurrence_type) {
+            occurrence_types.push(occurrence_type);
+        }
+    }
+    occurrence_types
 }
 
 struct ClassPart {
@@ -818,11 +842,12 @@ mod tests {
     fn gap_batch_projects_to_plane_b_without_runtime_binding() {
         let gap = GapReport {
             cause: "retry_buffer_overflow".into(),
+            affected_probes: vec!["kernel.process.exec".into()],
             dropped_records: 3,
             gap_start_ns: 10,
             gap_end_ns: 20,
             dropped_reliability: 0,
-            dropped_attribution: 0,
+            dropped_attribution: 3,
         };
 
         let mut occurrences = gap.into_batch(producer()).into_plane_b_occurrences();
@@ -833,6 +858,10 @@ mod tests {
         assert_eq!(
             occ.labels.get("dropped_records").map(String::as_str),
             Some("3")
+        );
+        assert_eq!(
+            occ.labels.get("affected_probes").map(String::as_str),
+            Some("[\"kernel.process.exec\"]")
         );
     }
 
@@ -883,25 +912,33 @@ mod tests {
     fn gap_reports_merge_without_growing_the_retry_buffer() {
         let mut pending = GapReport {
             cause: "retry_buffer_overflow".into(),
+            affected_probes: vec!["kernel.tcp.close".into()],
             dropped_records: 2,
             gap_start_ns: 20,
             gap_end_ns: 30,
-            dropped_reliability: 0,
+            dropped_reliability: 2,
             dropped_attribution: 0,
         };
         pending.merge(GapReport {
             cause: "retry_buffer_expired".into(),
+            affected_probes: vec!["kernel.process.exec".into()],
             dropped_records: 3,
             gap_start_ns: 10,
             gap_end_ns: 40,
             dropped_reliability: 0,
-            dropped_attribution: 0,
+            dropped_attribution: 3,
         });
 
         assert_eq!(pending.cause, "multiple");
         assert_eq!(pending.dropped_records, 5);
+        assert_eq!(pending.dropped_reliability, 2);
+        assert_eq!(pending.dropped_attribution, 3);
         assert_eq!(pending.gap_start_ns, 10);
         assert_eq!(pending.gap_end_ns, 40);
+        assert_eq!(
+            pending.affected_probes,
+            ["kernel.tcp.close", "kernel.process.exec"]
+        );
     }
 
     #[test]
@@ -1363,6 +1400,7 @@ mod tests {
     fn the_gap_occurrence_carries_the_class_split() {
         let gap = GapReport {
             cause: "retry_buffer_overflow".into(),
+            affected_probes: vec!["kernel.tcp.close".into(), "kernel.process.exec".into()],
             dropped_records: 7,
             gap_start_ns: 1,
             gap_end_ns: 9,

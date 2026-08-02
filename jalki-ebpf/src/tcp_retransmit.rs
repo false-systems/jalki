@@ -5,7 +5,9 @@ use aya_ebpf::programs::FEntryContext;
 
 use jalki_common::TcpRetransmitEvent;
 
-use crate::{is_self_filtered, TCP_RETRANSMIT_EVENTS};
+use crate::{
+    count_ring_buffer_drop, is_self_filtered, TCP_RETRANSMIT_EVENTS, TCP_RETRANSMIT_EVENTS_DROPS,
+};
 
 /// Handle fentry/tcp_retransmit_skb.
 ///
@@ -69,7 +71,9 @@ fn try_handle(ctx: &FEntryContext) -> Result<(), i64> {
         _pad3: 0,
     };
 
-    let _ = TCP_RETRANSMIT_EVENTS.output(&event, 0);
+    if TCP_RETRANSMIT_EVENTS.output(&event, 0).is_err() {
+        count_ring_buffer_drop(&TCP_RETRANSMIT_EVENTS_DROPS);
+    }
 
     Ok(())
 }

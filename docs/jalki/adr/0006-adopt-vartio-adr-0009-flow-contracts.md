@@ -107,6 +107,11 @@ counts, and the covered time range. Causes are distinguished rather than
 collapsed: `retry_buffer_overflow`, `retry_buffer_expired`, and
 `memory_pressure` are different operational stories.
 
+Gap occurrences cross the native Vartio sink without a pod/container binding:
+they describe producer coverage for a node, not one workload. The sink
+allowlist and Vartio's `Importer.Jalki` both accept `jalki.agent.gap`; all
+kernel runtime evidence still requires a strong workload binding.
+
 Three losses that used to be silent now are not:
 
 - **Shutdown with an undeliverable backlog** logs the batch, record and byte

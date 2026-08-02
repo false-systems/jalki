@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::enrich::RuntimeEnricher;
+use crate::metrics::Metrics;
 use crate::probe::{Attachment, Probe};
 use crate::reader::{self, ProbeStats, ReaderStop};
 use crate::sensitive_paths::SensitivePathMatcher;
@@ -97,6 +98,7 @@ impl ProbeRegistry {
         btf: &Btf,
         cluster: &str,
         tx: mpsc::Sender<Vec<EvidenceRecord>>,
+        metrics: Arc<Metrics>,
         store: &Arc<EventStore>,
         enricher: Arc<dyn RuntimeEnricher>,
         sensitive_path_matcher: Arc<SensitivePathMatcher>,
@@ -171,6 +173,7 @@ impl ProbeRegistry {
             cluster.to_string(),
             tx,
             stats.clone(),
+            metrics,
             store.clone(),
             enricher,
             sensitive_path_matcher,
@@ -301,6 +304,22 @@ impl ProbeRegistry {
     /// Get status by probe ID.
     pub fn get_status(&self, probe_id: &str) -> Option<ProbeStatus> {
         self.status().into_iter().find(|s| s.probe_id == probe_id)
+    }
+
+    pub(crate) fn observability_stats(&self) -> Vec<(String, String, String, Arc<ProbeStats>)> {
+        self.attached
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(probe_id, entry)| {
+                (
+                    probe_id.clone(),
+                    entry.probe.name().to_string(),
+                    entry.probe.occurrence_type().to_string(),
+                    entry.stats.clone(),
+                )
+            })
+            .collect()
     }
 }
 

@@ -33,6 +33,10 @@ impl Probe for ProcessExec {
         "process_exec"
     }
 
+    fn occurrence_type(&self) -> &str {
+        "kernel.process.exec"
+    }
+
     fn program_name(&self) -> &str {
         "jalki_process_exec"
     }

@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
 use false_protocol::{Occurrence, Severity};
 use jalki_evidence::{
-    gap_for_batch, DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceRecord, EvidenceSink,
-    GapReport, HookKind, MemoryPressure, Pace, ProbeMetadata, ProducerMetadata, RetryBackoff,
-    RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError, Spool, SpoolConfig,
+    gap_for_batch, DrainPaceConfig, DrainPacer, EvidenceBatch, EvidenceClass, EvidenceRecord,
+    EvidenceSink, GapReport, HookKind, MemoryPressure, Pace, ProbeMetadata, ProducerMetadata,
+    RetryBackoff, RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError, Spool,
+    SpoolConfig,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant as Deadline;
@@ -140,7 +141,6 @@ impl Runtime {
         let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
 
         // Spawn a reader for each probe, register in the registry.
-        let mut stats_map: Vec<(String, Arc<ProbeStats>)> = Vec::new();
         for probe in &self.probes {
             let stats = Arc::new(ProbeStats::new());
             reader::spawn_reader(
@@ -149,12 +149,12 @@ impl Runtime {
                 self.cluster.clone(),
                 tx.clone(),
                 stats.clone(),
+                metrics.clone(),
                 store.clone(),
                 self.enricher.clone(),
                 sensitive_path_matcher.clone(),
             )?;
             registry.register_startup_probe(probe.clone(), stats.clone());
-            stats_map.push((probe.name().to_string(), stats));
         }
 
         // Build the daemon handle for IPC and CLI.
@@ -163,6 +163,7 @@ impl Runtime {
             btf,
             btf_data,
             registry: registry.clone(),
+            metrics: metrics.clone(),
             store: store.clone(),
             kb: kb.clone(),
             tx: tx.clone(),
@@ -174,10 +175,10 @@ impl Runtime {
 
         // Spawn self-observability: periodically emit drops/errors as evidence.
         let stats_tx = tx.clone();
-        let stats_cluster = self.cluster.clone();
-        let stats_for_task = stats_map.clone();
+        let stats_registry = registry.clone();
+        let stats_producer = producer.clone();
         tokio::spawn(async move {
-            emit_self_observability(stats_for_task, stats_tx, &stats_cluster).await;
+            emit_self_observability(stats_registry, stats_tx, &stats_producer).await;
         });
 
         // Spawn IPC server.
@@ -344,6 +345,7 @@ pub struct DaemonHandle {
     btf: Btf,
     btf_data: jalki_codegen::btf::BtfData,
     pub registry: Arc<ProbeRegistry>,
+    metrics: Arc<Metrics>,
     pub store: Arc<EventStore>,
     pub kb: Arc<KnowledgeBase>,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
@@ -389,6 +391,7 @@ impl DaemonHandle {
                 &self.btf,
                 &self.cluster,
                 self.tx.clone(),
+                self.metrics.clone(),
                 &self.store,
                 self.enricher.clone(),
                 self.sensitive_path_matcher.clone(),
@@ -505,6 +508,7 @@ impl DaemonHandle {
             &self.btf,
             &self.cluster,
             self.tx.clone(),
+            self.metrics.clone(),
             &self.store,
             self.enricher.clone(),
             self.sensitive_path_matcher.clone(),
@@ -662,7 +666,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                 // not observed here (a scope, not a loss — no gap evidence).
                 if let Some(allow) = &namespace_allowlist {
                     let before = records.len();
-                    records.retain(|r| r.bound_namespace().is_some_and(|ns| allow.contains(ns)));
+                    records.retain(|record| record_in_namespace_scope(record, allow));
                     let dropped = before - records.len();
                     if dropped > 0 {
                         tracing::debug!(dropped, "records filtered by namespace allow-list");
@@ -1148,6 +1152,13 @@ fn record_sink_error(metrics: &Metrics, sink: &str) {
         .inc();
 }
 
+fn record_in_namespace_scope(record: &EvidenceRecord, allow: &HashSet<String>) -> bool {
+    record.occurrence.occurrence_type.as_str() == "jalki.agent.gap"
+        || record
+            .bound_namespace()
+            .is_some_and(|namespace| allow.contains(namespace))
+}
+
 fn record_unbound_drops(metrics: &Metrics, records: &[EvidenceRecord]) {
     for record in records {
         if let Some(reason) = record.plane_b_drop_reason() {
@@ -1245,46 +1256,115 @@ fn map_kb_fields_to_btf(
 /// If AHTI sees a gap in events and doesn't know jälki dropped them,
 /// it will misdiagnose. These events close that gap.
 async fn emit_self_observability(
-    stats_map: Vec<(String, Arc<ProbeStats>)>,
+    registry: Arc<ProbeRegistry>,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
-    cluster: &str,
+    producer: &ProducerMetadata,
 ) {
-    let mut prev_dropped: Vec<u64> = vec![0; stats_map.len()];
-    let mut prev_errors: Vec<u64> = vec![0; stats_map.len()];
+    let mut previous: HashMap<String, (u64, u64, u64)> = HashMap::new();
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
     loop {
         interval.tick().await;
 
-        for (i, (probe_name, stats)) in stats_map.iter().enumerate() {
-            let dropped = stats.events_dropped.load(Ordering::Relaxed);
-            let errors = stats.parse_errors.load(Ordering::Relaxed);
+        let snapshots = registry.observability_stats();
+        let attached_ids: HashSet<_> = snapshots.iter().map(|(id, ..)| id.clone()).collect();
+        previous.retain(|id, _| attached_ids.contains(id));
 
-            let new_drops = dropped - prev_dropped[i];
-            let new_errors = errors - prev_errors[i];
+        for (probe_id, probe_name, occurrence_type, stats) in snapshots {
+            let errors = stats.parse_errors.load(Ordering::Relaxed);
+            let (dropped, tracking_started_at_ns, counter_polled_at_ns) = stats.drop_observation();
+            let (new_drops, new_errors, previous_poll_at_ns) = update_probe_counters(
+                &mut previous,
+                &probe_id,
+                dropped,
+                errors,
+                tracking_started_at_ns,
+                counter_polled_at_ns,
+            );
 
             if new_drops > 0 {
                 warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
-                let occ = Occurrence::new("jalki/self", "jalki.probe.events_dropped")
-                    .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                // Best-effort — if the channel is full, we can't do anything about it.
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
+                if tx
+                    .send(ring_buffer_gap_records(
+                        producer,
+                        &occurrence_type,
+                        new_drops,
+                        previous_poll_at_ns,
+                        counter_polled_at_ns,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
 
             if new_errors > 0 {
                 warn!(probe = %probe_name, errors = new_errors, "parse errors detected");
                 let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
                     .severity(Severity::Warning)
-                    .in_cluster(cluster);
-                let _ = tx.try_send(vec![self_observability_record(occ)]);
+                    .in_cluster(producer.cluster.clone());
+                if tx.send(vec![self_observability_record(occ)]).await.is_err() {
+                    return;
+                }
             }
-
-            prev_dropped[i] = dropped;
-            prev_errors[i] = errors;
         }
     }
+}
+
+fn counter_delta(current: u64, previous: u64) -> u64 {
+    current.checked_sub(previous).unwrap_or(current)
+}
+
+fn update_probe_counters(
+    previous: &mut HashMap<String, (u64, u64, u64)>,
+    probe_id: &str,
+    dropped: u64,
+    errors: u64,
+    tracking_started_at_ns: u64,
+    counter_polled_at_ns: u64,
+) -> (u64, u64, u64) {
+    let (prev_dropped, prev_errors, previous_poll_at_ns) = previous
+        .get(probe_id)
+        .copied()
+        .unwrap_or((0, 0, tracking_started_at_ns));
+    previous.insert(probe_id.to_owned(), (dropped, errors, counter_polled_at_ns));
+    (
+        counter_delta(dropped, prev_dropped),
+        counter_delta(errors, prev_errors),
+        previous_poll_at_ns,
+    )
+}
+
+fn ring_buffer_gap_records(
+    producer: &ProducerMetadata,
+    occurrence_type: &str,
+    dropped_records: u64,
+    gap_start_ns: u64,
+    gap_end_ns: u64,
+) -> Vec<EvidenceRecord> {
+    let dropped_records = usize::try_from(dropped_records).unwrap_or(usize::MAX);
+    let class = EvidenceClass::of(occurrence_type);
+    let batch = GapReport {
+        cause: "ringbuffer_overflow".into(),
+        affected_probes: vec![occurrence_type.into()],
+        dropped_records,
+        gap_start_ns,
+        gap_end_ns,
+        dropped_reliability: if class == EvidenceClass::Reliability {
+            dropped_records
+        } else {
+            0
+        },
+        dropped_attribution: if class == EvidenceClass::Attribution {
+            dropped_records
+        } else {
+            0
+        },
+    }
+    .into_batch(producer.clone());
+    batch.records
 }
 
 fn self_observability_record(occurrence: Occurrence) -> EvidenceRecord {
@@ -1512,11 +1592,12 @@ mod tests {
         let mut pending = PendingGaps::default();
         pending.merge(GapReport {
             cause: "retry_buffer_overflow".into(),
+            affected_probes: vec!["kernel.process.exec".into()],
             dropped_records: 1,
             gap_start_ns: 10,
             gap_end_ns: 20,
             dropped_reliability: 0,
-            dropped_attribution: 0,
+            dropped_attribution: 1,
         });
 
         let first = pending.front(&producer).expect("pending gap");
@@ -1527,6 +1608,75 @@ mod tests {
             retry.records[0].occurrence.id,
             first.records[0].occurrence.id
         );
+    }
+
+    #[test]
+    fn ring_buffer_loss_becomes_gap_evidence() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let records = ring_buffer_gap_records(&producer, "kernel.tcp.connect", 7, 10, 20);
+        let gap = &records[0].occurrence;
+
+        assert_eq!(gap.occurrence_type.as_str(), "jalki.agent.gap");
+        assert_eq!(
+            gap.labels.get("cause").map(String::as_str),
+            Some("ringbuffer_overflow")
+        );
+        assert_eq!(
+            gap.labels.get("dropped_records").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            gap.labels.get("affected_probes").map(String::as_str),
+            Some("[\"kernel.tcp.connect\"]")
+        );
+        assert_eq!(
+            gap.labels.get("dropped_attribution").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            gap.labels.get("gap_start_ns").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(gap.labels.get("gap_end_ns").map(String::as_str), Some("20"));
+
+        let reliability = ring_buffer_gap_records(&producer, "kernel.tcp.close", 3, 30, 40);
+        assert_eq!(
+            reliability[0]
+                .occurrence
+                .labels
+                .get("dropped_reliability")
+                .map(String::as_str),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn reset_probe_counters_start_a_new_history() {
+        assert_eq!(counter_delta(3, 10), 3);
+        assert_eq!(counter_delta(12, 10), 2);
+    }
+
+    #[test]
+    fn redeployed_probe_uses_its_new_instance_history() {
+        let mut previous = HashMap::from([("probe_001".into(), (3, 0, 10))]);
+
+        let first = update_probe_counters(&mut previous, "probe_002", 7, 0, 20, 30);
+        let second = update_probe_counters(&mut previous, "probe_002", 9, 0, 20, 40);
+
+        assert_eq!(first, (7, 0, 20));
+        assert_eq!(second, (2, 0, 30));
+    }
+
+    #[test]
+    fn namespace_allowlist_never_discards_agent_gaps() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let record = ring_buffer_gap_records(&producer, "kernel.tcp.connect", 1, 10, 20)
+            .into_iter()
+            .next()
+            .expect("gap record");
+        let allow = HashSet::from(["workloads".to_string()]);
+
+        assert!(record_in_namespace_scope(&record, &allow));
     }
 
     // ── sink loop retry cadence (jalki #39) ─────────────────────────────────

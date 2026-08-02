@@ -25,9 +25,15 @@ static PID_FILTER: HashMap<u32, u8> = HashMap::with_max_entries(64, 0);
 #[map]
 static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+#[map]
+static TCP_CONNECT_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 /// Ring buffer for ProcessExecEvent (tracepoint/sched_process_exec).
 #[map]
 static PROCESS_EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[map]
+static PROCESS_EXEC_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// task_struct field offsets resolved from kernel BTF at load time.
 /// Index 0 = real_parent, index 1 = tgid. Zero means BTF resolution was
@@ -41,13 +47,22 @@ static TASK_OFFSETS: Array<u32> = Array::with_max_entries(2, 0);
 #[map]
 static TCP_CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+#[map]
+static TCP_CLOSE_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 /// Ring buffer for TcpRetransmitEvent (fentry/tcp_retransmit_skb).
 #[map]
 static TCP_RETRANSMIT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
+#[map]
+static TCP_RETRANSMIT_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 /// Ring buffer for FileOpenEvent (fexit/security_file_open).
 #[map]
 static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[map]
+static FILE_OPEN_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Configured sensitive path prefixes for the in-kernel file.open gate.
 #[map]
@@ -62,6 +77,9 @@ static FILE_OPEN_SCRATCH: PerCpuArray<jalki_common::FileOpenEvent> =
 /// Ring buffer for failed-open attempts (sys_exit_open{at,at2}).
 #[map]
 static OPEN_ATTEMPT_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[map]
+static OPEN_ATTEMPT_EVENTS_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// In-flight requested paths stashed at sys_enter, keyed by pid_tgid, read at
 /// sys_exit. LRU so missed exits / overflow evict automatically (bounded, no
@@ -134,6 +152,15 @@ pub fn jalki_sys_exit_openat2(ctx: TracePointContext) -> i32 {
 pub fn is_self_filtered() -> bool {
     let pid = (aya_ebpf::helpers::bpf_get_current_pid_tgid() >> 32) as u32;
     unsafe { PID_FILTER.get(&pid).is_some() }
+}
+
+#[inline(always)]
+pub fn count_ring_buffer_drop(counter: &PerCpuArray<u64>) {
+    if let Some(value) = counter.get_ptr_mut(0) {
+        // SAFETY: `value` points to this CPU's u64 map slot and remains valid
+        // for this probe invocation.
+        unsafe { *value = (*value).wrapping_add(1) };
+    }
 }
 
 /// Read address family and src/dst addresses from a sock pointer.

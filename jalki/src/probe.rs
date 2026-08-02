@@ -70,6 +70,14 @@ pub trait Probe: Send + Sync + 'static {
     /// Name used in metrics, logging, and the event `source` field.
     fn name(&self) -> &str;
 
+    /// Occurrence type produced by this probe. The default preserves source
+    /// compatibility for custom probes, but probes whose metric name differs
+    /// from their wire type should override it so gap evidence names the
+    /// affected occurrence type precisely.
+    fn occurrence_type(&self) -> &str {
+        self.name()
+    }
+
     /// eBPF program name in the ELF object.
     ///
     /// This must match the function name annotated with `#[fentry]`/`#[fexit]`

@@ -31,6 +31,10 @@ impl Probe for TcpConnect {
         "tcp_connect"
     }
 
+    fn occurrence_type(&self) -> &str {
+        "kernel.tcp.connect"
+    }
+
     fn program_name(&self) -> &str {
         "jalki_tcp_connect"
     }

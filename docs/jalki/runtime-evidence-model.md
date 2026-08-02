@@ -288,17 +288,13 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 | Field | Type | Notes |
 |---|---|---|
 | `node_id` | string | |
-| `gap_start` | RFC3339 | Wall-clock estimate; nullable when only monotonic time is known |
-| `gap_end` | RFC3339 | |
-| `cause` | string | `"agent_offline" | "ringbuffer_overflow" | "sampling_drop" | "pipeline_unreachable" | "probe_unloaded"`, plus sink-specific terminal causes such as `"sink_rejected"` |
+| `gap_start_ns` | u64 | Start of the affected monotonic kernel-time window |
+| `gap_end_ns` | u64 | End of the affected monotonic kernel-time window |
+| `cause` | string | Stable machine-readable cause, including `"ringbuffer_overflow"`, retry-buffer causes, and terminal sink causes such as `"sink_rejected"` |
 | `affected_probes` | string[] | `occurrence_type` values affected |
-
-**Optional payload fields:**
-
-| Field | Type | Notes |
-|---|---|---|
-| `estimated_events_lost` | u64 | Only when the count is known |
-| `note` | string | |
+| `dropped_records` | u64 | Total records known to be lost |
+| `dropped_attribution` | u64 | Lost attribution-class records |
+| `dropped_reliability` | u64 | Lost reliability-class records; the two class counts MUST sum to `dropped_records` |
 
 **Plane B occurrence type:** `jalki.agent.gap`, `evidence_level = observed`, `retention_class = long`.
 

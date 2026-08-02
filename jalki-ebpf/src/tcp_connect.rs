@@ -5,7 +5,9 @@ use aya_ebpf::programs::FExitContext;
 
 use jalki_common::TcpConnectEvent;
 
-use crate::{is_self_filtered, TCP_CONNECT_EVENTS};
+use crate::{
+    count_ring_buffer_drop, is_self_filtered, TCP_CONNECT_EVENTS, TCP_CONNECT_EVENTS_DROPS,
+};
 
 /// Handle fexit/tcp_connect.
 ///
@@ -66,8 +68,9 @@ fn try_handle(ctx: &FExitContext) -> Result<(), i64> {
         _pad2: 0,
     };
 
-    // Best-effort ring buffer output — drop silently if full.
-    let _ = TCP_CONNECT_EVENTS.output(&event, 0);
+    if TCP_CONNECT_EVENTS.output(&event, 0).is_err() {
+        count_ring_buffer_drop(&TCP_CONNECT_EVENTS_DROPS);
+    }
 
     Ok(())
 }

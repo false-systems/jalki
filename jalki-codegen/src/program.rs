@@ -14,6 +14,8 @@ const MAX_STACK: usize = 512;
 pub const MAP_IDX_PID_FILTER: usize = 0;
 /// Map index for the ring buffer in the generated ELF.
 pub const MAP_IDX_RINGBUF: usize = 1;
+/// Map index for the per-CPU ring-buffer drop counter in the generated ELF.
+pub const MAP_IDX_RINGBUF_DROPS: usize = 2;
 
 /// Layout of a single field in the generated event struct.
 #[derive(Debug, Clone)]
@@ -425,6 +427,23 @@ pub fn generate(spec: &ProbeSpec, btf: &BtfData) -> Result<GeneratedProgram, Cod
     // bpf_ringbuf_output(map, data, size, flags)
     insns.push(call(BPF_FUNC_RINGBUF_OUTPUT));
 
+    // Count failed output on this CPU. Reuse the PID_FILTER stack key as the
+    // single array index now that event construction is complete.
+    insns.push(jeq_imm(R0, 0, 10));
+    insns.push(st_w(R10, pid_key_off as i16, 0));
+    let drops_reloc_off = insns.len();
+    let drops_insns = ld_map_fd(R1);
+    insns.push(drops_insns[0]);
+    insns.push(drops_insns[1]);
+    relocs.push((drops_reloc_off, MAP_IDX_RINGBUF_DROPS));
+    insns.push(mov64_reg(R2, R10));
+    insns.push(add64_imm(R2, pid_key_off));
+    insns.push(call(BPF_FUNC_MAP_LOOKUP_ELEM));
+    insns.push(jeq_imm(R0, 0, 3));
+    insns.push(ldx_dw(R1, R0, 0));
+    insns.push(add64_imm(R1, 1));
+    insns.push(stx_dw(R0, R1, 0));
+
     // === Exit ===
     insns.push(mov64_imm(R0, 0));
     insns.push(exit());
@@ -510,8 +529,8 @@ mod tests {
 
         // Should have instructions.
         assert!(!program.instructions.is_empty());
-        // Should have 2 map relocations (PID_FILTER + RINGBUF).
-        assert_eq!(program.relocations.len(), 2);
+        // PID_FILTER + RINGBUF + its drop counter.
+        assert_eq!(program.relocations.len(), 3);
         // Field layout should include header + requested fields.
         assert!(program.field_layout.len() >= 6); // timestamp, pid, tid, + requested
                                                   // Event size should be > 0 and aligned to 8.

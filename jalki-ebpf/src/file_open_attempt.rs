@@ -8,7 +8,8 @@ use jalki_common::{FileOpenEvent, FILE_OPEN_PATH_LEN};
 
 use crate::file_open::matches_sensitive_prefix;
 use crate::{
-    is_self_filtered, ENTER_PATH_SCRATCH, IN_FLIGHT_OPENS, OPEN_ATTEMPT_EVENTS, OPEN_ATTEMPT_SCRATCH,
+    count_ring_buffer_drop, is_self_filtered, ENTER_PATH_SCRATCH, IN_FLIGHT_OPENS,
+    OPEN_ATTEMPT_EVENTS, OPEN_ATTEMPT_EVENTS_DROPS, OPEN_ATTEMPT_SCRATCH,
 };
 
 /// sys_enter_open{at,at2} layout: __syscall_nr@8, dfd@16, filename@24.
@@ -95,7 +96,9 @@ fn try_exit(ctx: &TracePointContext) -> Result<(), i64> {
             comm: aya_ebpf::helpers::bpf_get_current_comm().unwrap_or([0u8; 16]),
             path,
         };
-        let _ = OPEN_ATTEMPT_EVENTS.output(event, 0);
+        if OPEN_ATTEMPT_EVENTS.output(event, 0).is_err() {
+            count_ring_buffer_drop(&OPEN_ATTEMPT_EVENTS_DROPS);
+        }
     }
 
     let _ = IN_FLIGHT_OPENS.remove(&key);
