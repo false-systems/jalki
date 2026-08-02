@@ -22,6 +22,11 @@ pub enum Method {
     Unsubscribe = 0x04,
     Status = 0x05,
     Ask = 0x06,
+    /// Query stored events (optionally per probe, with a server-side filter).
+    GetEvents = 0x07,
+    /// Counterpart to `Deploy`. Byte values are the wire contract — new
+    /// methods are appended, never renumbered.
+    Detach = 0x08,
 }
 
 /// Frame flags.

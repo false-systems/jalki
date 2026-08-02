@@ -215,6 +215,8 @@ class Method(IntEnum):
     UNSUBSCRIBE = 0x04
     STATUS = 0x05
     ASK = 0x06
+    GET_EVENTS = 0x07
+    DETACH = 0x08
 
 
 class Flags:
