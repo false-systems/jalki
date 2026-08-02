@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
@@ -14,13 +14,22 @@ use crate::probe::Probe;
 use crate::sensitive_paths::SensitivePathMatcher;
 use crate::store::EventStore;
 
+const MAX_DRAIN_ITEMS: usize = 1024;
+
 /// Per-probe drop counter, exposed for metrics.
 pub struct ProbeStats {
     pub events_emitted: AtomicU64,
     pub events_dropped: AtomicU64,
     pub events_sampled_out: AtomicU64,
     pub parse_errors: AtomicU64,
-    pub last_observed_at_ns: AtomicU64,
+    drop_observation: Mutex<DropObservation>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DropObservation {
+    total: u64,
+    tracking_started_at_ns: u64,
+    counter_polled_at_ns: u64,
 }
 
 impl Default for ProbeStats {
@@ -36,8 +45,41 @@ impl ProbeStats {
             events_dropped: AtomicU64::new(0),
             events_sampled_out: AtomicU64::new(0),
             parse_errors: AtomicU64::new(0),
-            last_observed_at_ns: AtomicU64::new(0),
+            drop_observation: Mutex::new(DropObservation::default()),
         }
+    }
+
+    fn start_drop_tracking(&self, at_ns: u64) {
+        let mut observation = self
+            .drop_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observation.tracking_started_at_ns = at_ns;
+        observation.counter_polled_at_ns = at_ns;
+    }
+
+    fn record_drop_poll(&self, total: u64, at_ns: u64) -> u64 {
+        let mut observation = self
+            .drop_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let new_drops = total.wrapping_sub(observation.total);
+        observation.total = total;
+        observation.counter_polled_at_ns = at_ns;
+        self.events_dropped.store(total, Ordering::Relaxed);
+        new_drops
+    }
+
+    pub(crate) fn drop_observation(&self) -> (u64, u64, u64) {
+        let observation = *self
+            .drop_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            observation.total,
+            observation.tracking_started_at_ns,
+            observation.counter_polled_at_ns,
+        )
     }
 }
 
@@ -71,19 +113,13 @@ pub fn spawn_reader(
         .try_into()
         .with_context(|| format!("{map_name} is not a RingBuf"))?;
     let drop_map_name = format!("{map_name}_DROPS");
-    let drop_counts = match ebpf.take_map(&drop_map_name) {
-        Some(map) => Some(
-            map.try_into()
-                .with_context(|| format!("{drop_map_name} is not a PerCpuArray"))?,
-        ),
-        None => {
-            warn!(
-                probe = probe.name(),
-                "ring buffer drop counter map not found"
-            );
-            None
-        }
-    };
+    let drop_counts = ebpf
+        .take_map(&drop_map_name)
+        .ok_or_else(|| anyhow::anyhow!("ring buffer drop counter map {drop_map_name} not found"))?
+        .try_into()
+        .with_context(|| format!("{drop_map_name} is not a PerCpuArray"))?;
+    let tracking_started_at_ns = monotonic_now_ns()?;
+    stats.start_drop_tracking(tracking_started_at_ns);
 
     let probe_name = probe.name().to_string();
     let stop = ReaderStop::new();
@@ -114,8 +150,7 @@ pub fn spawn_reader(
 /// A flag rather than an `AbortHandle`, because the reader is a
 /// `spawn_blocking` task: aborting one does nothing until it next yields, and
 /// this one is inside a blocking `ring_buf.next()` / `thread::sleep` cycle. It
-/// has to be asked to leave, and it checks at the top of each poll — at most
-/// one 10ms sleep away.
+/// has to be asked to leave, and it checks between bounded drain batches.
 ///
 /// Dropping this does *not* stop the reader; the registry owns it for as long
 /// as the probe is attached.
@@ -145,7 +180,7 @@ impl ReaderStop {
 #[allow(clippy::too_many_arguments)]
 fn drain_loop(
     mut ring_buf: RingBuf<aya::maps::MapData>,
-    drop_counts: Option<PerCpuArray<MapData, u64>>,
+    drop_counts: PerCpuArray<MapData, u64>,
     probe: Arc<dyn Probe>,
     cluster: &str,
     tx: mpsc::Sender<Vec<EvidenceRecord>>,
@@ -183,7 +218,13 @@ fn drain_loop(
 
         let mut records = Vec::new();
 
-        while let Some(item) = ring_buf.next() {
+        let mut drained = 0;
+        while drained < MAX_DRAIN_ITEMS {
+            let Some(item) = ring_buf.next() else {
+                break;
+            };
+            drained += 1;
+
             // Apply sampling before parsing — skip the conversion cost too.
             if do_sampling {
                 counter = counter.wrapping_add(1);
@@ -204,9 +245,6 @@ fn drain_loop(
                             continue;
                         }
                         let record = bind_record(record, enricher.as_ref());
-                        stats
-                            .last_observed_at_ns
-                            .store(record.observed_at_ns, Ordering::Relaxed);
                         // The local debug store keeps the lean occurrence shape used by
                         // IPC stream/watch. Durable sinks project D6 metadata later via
                         // EvidenceBatch::into_occurrences().
@@ -222,37 +260,74 @@ fn drain_loop(
             }
         }
 
-        if !records.is_empty() && tx.blocking_send(records).is_err() {
-            debug!(probe = probe_name, "sink channel closed, stopping reader");
-            return;
-        }
-
         if last_drop_poll.elapsed() >= std::time::Duration::from_secs(1) {
-            if let Some(drop_counts) = &drop_counts {
-                match drop_counts.get(&0, 0) {
-                    Ok(values) => {
-                        let total = values.iter().copied().fold(0, u64::wrapping_add);
-                        let previous = stats.events_dropped.swap(total, Ordering::Relaxed);
-                        let new_drops = total.wrapping_sub(previous);
-                        if new_drops > 0 {
-                            metrics
-                                .ring_buffer_drops
-                                .get_or_create(&drop_metric_label)
-                                .inc_by(new_drops);
+            match drop_counts.get(&0, 0) {
+                Ok(values) => {
+                    let total = values.iter().copied().fold(0, u64::wrapping_add);
+                    let polled_at_ns = match monotonic_now_ns() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!(probe = probe_name, %error, "failed to read monotonic clock");
+                            return;
                         }
+                    };
+                    let new_drops = stats.record_drop_poll(total, polled_at_ns);
+                    if new_drops > 0 {
+                        metrics
+                            .ring_buffer_drops
+                            .get_or_create(&drop_metric_label)
+                            .inc_by(new_drops);
                     }
-                    Err(error) => {
-                        warn!(probe = probe_name, %error, "failed to read ring buffer drop counter")
-                    }
+                }
+                Err(error) => {
+                    warn!(probe = probe_name, %error, "failed to read ring buffer drop counter")
                 }
             }
             last_drop_poll = std::time::Instant::now();
         }
 
-        // No events available — sleep briefly before polling again.
-        // TODO: wire up epoll via ring_buf fd for zero-latency wakeup.
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !records.is_empty() && tx.blocking_send(records).is_err() {
+            debug!(probe = probe_name, "sink channel closed, stopping reader");
+            return;
+        }
+
+        if drained < MAX_DRAIN_ITEMS {
+            // No events available — sleep briefly before polling again.
+            // TODO: wire up epoll via ring_buf fd for zero-latency wakeup.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: std::ffi::c_long,
+    tv_nsec: std::ffi::c_long,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clock_id: std::ffi::c_int, time: *mut Timespec) -> std::ffi::c_int;
+}
+
+/// Read the same Linux monotonic clock used by `bpf_ktime_get_ns`.
+fn monotonic_now_ns() -> Result<u64> {
+    const CLOCK_MONOTONIC: std::ffi::c_int = 1;
+    let mut time = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid writable timespec and CLOCK_MONOTONIC is a
+    // fixed Linux clock id.
+    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let seconds =
+        u64::try_from(time.tv_sec).context("monotonic clock returned negative seconds")?;
+    let nanos = u64::try_from(time.tv_nsec).context("monotonic clock returned negative nanos")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or_else(|| anyhow::anyhow!("monotonic clock overflow"))
 }
 
 fn record_matches_sensitive_paths(
@@ -268,4 +343,29 @@ fn record_matches_sensitive_paths(
         .labels
         .get("resource_ref_id")
         .is_some_and(|path| sensitive_path_matcher.is_match(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_observation_keeps_count_and_window_together() {
+        let stats = ProbeStats::new();
+        stats.start_drop_tracking(10);
+
+        assert_eq!(stats.record_drop_poll(3, 20), 3);
+        assert_eq!(stats.drop_observation(), (3, 10, 20));
+        assert_eq!(stats.record_drop_poll(5, 30), 2);
+        assert_eq!(stats.drop_observation(), (5, 10, 30));
+    }
+
+    #[test]
+    fn monotonic_clock_advances_in_kernel_time_domain() {
+        let first = monotonic_now_ns().expect("monotonic clock");
+        let second = monotonic_now_ns().expect("monotonic clock");
+
+        assert!(first > 0);
+        assert!(second >= first);
+    }
 }

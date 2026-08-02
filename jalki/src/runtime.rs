@@ -1272,31 +1272,26 @@ async fn emit_self_observability(
         previous.retain(|id, _| attached_ids.contains(id));
 
         for (probe_id, probe_name, occurrence_type, stats) in snapshots {
-            let dropped = stats.events_dropped.load(Ordering::Relaxed);
             let errors = stats.parse_errors.load(Ordering::Relaxed);
-            let observed_at_ns = stats.last_observed_at_ns.load(Ordering::Relaxed);
-            let (new_drops, new_errors, prev_observed_at_ns) =
-                update_probe_counters(&mut previous, &probe_id, dropped, errors, observed_at_ns);
+            let (dropped, tracking_started_at_ns, counter_polled_at_ns) = stats.drop_observation();
+            let (new_drops, new_errors, previous_poll_at_ns) = update_probe_counters(
+                &mut previous,
+                &probe_id,
+                dropped,
+                errors,
+                tracking_started_at_ns,
+                counter_polled_at_ns,
+            );
 
             if new_drops > 0 {
                 warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
-                let gap_start_ns = if prev_observed_at_ns == 0 {
-                    observed_at_ns
-                } else {
-                    prev_observed_at_ns
-                };
-                let gap_end_ns = if observed_at_ns == 0 {
-                    gap_start_ns
-                } else {
-                    observed_at_ns
-                };
                 if tx
                     .send(ring_buffer_gap_records(
                         producer,
                         &occurrence_type,
                         new_drops,
-                        gap_start_ns,
-                        gap_end_ns,
+                        previous_poll_at_ns,
+                        counter_polled_at_ns,
                     ))
                     .await
                     .is_err()
@@ -1327,15 +1322,18 @@ fn update_probe_counters(
     probe_id: &str,
     dropped: u64,
     errors: u64,
-    observed_at_ns: u64,
+    tracking_started_at_ns: u64,
+    counter_polled_at_ns: u64,
 ) -> (u64, u64, u64) {
-    let (prev_dropped, prev_errors, prev_observed_at_ns) =
-        previous.get(probe_id).copied().unwrap_or_default();
-    previous.insert(probe_id.to_owned(), (dropped, errors, observed_at_ns));
+    let (prev_dropped, prev_errors, previous_poll_at_ns) = previous
+        .get(probe_id)
+        .copied()
+        .unwrap_or((0, 0, tracking_started_at_ns));
+    previous.insert(probe_id.to_owned(), (dropped, errors, counter_polled_at_ns));
     (
         counter_delta(dropped, prev_dropped),
         counter_delta(errors, prev_errors),
-        prev_observed_at_ns,
+        previous_poll_at_ns,
     )
 }
 
@@ -1662,9 +1660,11 @@ mod tests {
     fn redeployed_probe_uses_its_new_instance_history() {
         let mut previous = HashMap::from([("probe_001".into(), (3, 0, 10))]);
 
-        let delta = update_probe_counters(&mut previous, "probe_002", 7, 0, 20);
+        let first = update_probe_counters(&mut previous, "probe_002", 7, 0, 20, 30);
+        let second = update_probe_counters(&mut previous, "probe_002", 9, 0, 20, 40);
 
-        assert_eq!(delta, (7, 0, 0));
+        assert_eq!(first, (7, 0, 20));
+        assert_eq!(second, (2, 0, 30));
     }
 
     #[test]
