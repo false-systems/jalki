@@ -45,8 +45,14 @@ jobs:
 
       - name: Toolchain
         run: |
-          rustup show active-toolchain || rustup toolchain install stable
-          rustup component add rustfmt clippy
+          # GitHub-hosted PR runners include rustup; the ARC runner does not.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
 
       - uses: Swatinem/rust-cache@v2
 
