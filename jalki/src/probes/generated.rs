@@ -124,6 +124,10 @@ impl Probe for GeneratedProbeReader {
         &self.spec.function
     }
 
+    fn occurrence_type(&self) -> &str {
+        &self.spec.event_type
+    }
+
     fn program_name(&self) -> &str {
         &self.program_name
     }

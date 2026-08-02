@@ -57,12 +57,13 @@ use proto::{ProviderEvidenceBatch, ProviderEvidenceItem};
 pub const SINK_NAME: &str = "vartio";
 
 /// Occurrence types Vartio's `Importer.Jalki` accepts (the `vartio-jalki`
-/// namespace contract): exec, the three TCP signals, and the file family
-/// (ADR-0005). Anything else is dropped here with a visible warning rather
-/// than sent as a guaranteed `UNSUPPORTED_EVENT` reject. Widening this set is
-/// a Vartio-side decision — the importer must accept a type BEFORE it is
-/// added here (ADR-0005 §4).
+/// namespace contract): exec, the three TCP signals, the file family
+/// (ADR-0005), and agent gap evidence (ADR-0006). Anything else is dropped
+/// here with a visible warning rather than sent as a guaranteed
+/// `UNSUPPORTED_EVENT` reject. Widening this set is a Vartio-side decision —
+/// the importer must accept a type BEFORE it is added here (ADR-0005 §4).
 pub const VARTIO_SUPPORTED_TYPES: &[&str] = &[
+    "jalki.agent.gap",
     "kernel.process.exec",
     "kernel.tcp.connect",
     "kernel.tcp.close",

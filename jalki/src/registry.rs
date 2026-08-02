@@ -306,12 +306,19 @@ impl ProbeRegistry {
         self.status().into_iter().find(|s| s.probe_id == probe_id)
     }
 
-    pub(crate) fn observability_stats(&self) -> Vec<(String, Arc<ProbeStats>)> {
+    pub(crate) fn observability_stats(&self) -> Vec<(String, String, String, Arc<ProbeStats>)> {
         self.attached
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .map(|entry| (entry.probe.name().to_string(), entry.stats.clone()))
+            .iter()
+            .map(|(probe_id, entry)| {
+                (
+                    probe_id.clone(),
+                    entry.probe.name().to_string(),
+                    entry.probe.occurrence_type().to_string(),
+                    entry.stats.clone(),
+                )
+            })
             .collect()
     }
 }

@@ -31,6 +31,10 @@ impl Probe for TcpRetransmit {
         "tcp_retransmit"
     }
 
+    fn occurrence_type(&self) -> &str {
+        "kernel.tcp.retransmit"
+    }
+
     fn program_name(&self) -> &str {
         "jalki_tcp_retransmit"
     }

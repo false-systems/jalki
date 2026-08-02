@@ -12,9 +12,7 @@ use object::{
 
 use crate::error::CodegenError;
 use crate::insn::{encode, BpfInsn};
-use crate::program::{
-    AttachType, MAP_IDX_PID_FILTER, MAP_IDX_RINGBUF, MAP_IDX_RINGBUF_DROPS,
-};
+use crate::program::{AttachType, MAP_IDX_PID_FILTER, MAP_IDX_RINGBUF, MAP_IDX_RINGBUF_DROPS};
 
 /// BPF map definition struct (legacy format — 20 bytes).
 /// Matches the kernel's `struct bpf_map_def`.

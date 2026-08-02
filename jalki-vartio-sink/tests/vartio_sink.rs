@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jalki_evidence::{
-    AppendResult, BindingProvenance, EvidenceBatch, EvidenceRecord, EvidenceSink, HookKind,
-    KernelEvent, ProbeMetadata, ProducerMetadata, RetryBuffer, RuntimeBinding, SinkError,
+    AppendResult, BindingProvenance, EvidenceBatch, EvidenceRecord, EvidenceSink, GapReport,
+    HookKind, KernelEvent, ProbeMetadata, ProducerMetadata, RetryBuffer, RuntimeBinding, SinkError,
     TcpConnectEvent, UnboundReason,
 };
 use jalki_vartio_sink::proto::source_ingress_server::{SourceIngress, SourceIngressServer};
@@ -343,6 +343,41 @@ async fn importer_unsupported_types_are_dropped_with_a_warning() {
     let batches = rx.received.lock().unwrap();
     assert_eq!(batches[0].items.len(), 1, "only 1 item on the wire");
     assert_eq!(batches[0].items[0].occurrence_type, "kernel.tcp.connect");
+}
+
+#[tokio::test]
+async fn agent_gap_crosses_the_wire_without_runtime_binding() {
+    let rx = spawn_receiver(false, 0, 0).await;
+    let sink = connect(rx.endpoint.clone()).await;
+    let batch = GapReport {
+        cause: "ringbuffer_overflow".into(),
+        affected_probes: vec!["kernel.tcp.connect".into()],
+        dropped_records: 7,
+        dropped_reliability: 0,
+        dropped_attribution: 7,
+        gap_start_ns: 10,
+        gap_end_ns: 20,
+    }
+    .into_batch(producer());
+    let result = sink.append_batch(batch).await.expect("accepted");
+    assert_eq!(result.accepted_count, 1);
+
+    let batches = rx.received.lock().unwrap();
+    let item = &batches[0].items[0];
+    assert_eq!(item.occurrence_type, "jalki.agent.gap");
+    let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
+    assert_eq!(payload["cause"], "ringbuffer_overflow");
+    assert_eq!(payload["dropped_records"], 7);
+    assert_eq!(payload["dropped_reliability"], 0);
+    assert_eq!(payload["dropped_attribution"], 7);
+    assert_eq!(payload["gap_start_ns"], 10);
+    assert_eq!(payload["gap_end_ns"], 20);
+    assert_eq!(
+        payload["affected_probes"],
+        serde_json::json!(["kernel.tcp.connect"])
+    );
+    assert!(payload.get("pod_uid").is_none());
+    assert!(payload.get("container_id").is_none());
 }
 
 /// A bound `kernel.file.open_attempt` record — importer-supported, but gated

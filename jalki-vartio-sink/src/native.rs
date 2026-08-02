@@ -46,6 +46,17 @@ const LABEL_KEYS: &[(&str, &str)] = &[
     ("cluster_id", "cluster_id"),
     ("kernel_release", "kernel_release"),
     ("evidence_level", "evidence_level"),
+    ("cause", "cause"),
+];
+
+/// Gap counts and window bounds are numeric in Vartio's native payload even
+/// though FALSE Protocol labels carry strings.
+const GAP_U64_KEYS: &[&str] = &[
+    "dropped_records",
+    "dropped_reliability",
+    "dropped_attribution",
+    "gap_start_ns",
+    "gap_end_ns",
 ];
 
 /// Build the native runtime map for one Plane-B occurrence.
@@ -73,6 +84,17 @@ pub fn native_runtime_item(occ: &Occurrence) -> Map<String, Value> {
         if let Some(value) = labels.get(*label) {
             item.insert((*key).into(), json!(value));
         }
+    }
+    for key in GAP_U64_KEYS {
+        if let Some(value) = labels.get(*key).and_then(|v| v.parse::<u64>().ok()) {
+            item.insert((*key).into(), json!(value));
+        }
+    }
+    if let Some(affected_probes) = labels
+        .get("affected_probes")
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+    {
+        item.insert("affected_probes".into(), json!(affected_probes));
     }
     if let Some(gid) = labels.get("gid").and_then(|v| v.parse::<u64>().ok()) {
         item.insert("gid".into(), json!(gid));
@@ -311,5 +333,30 @@ mod tests {
             .insert("resource_ref_id".into(), "10.42.7.19:443".into());
         let m = native_runtime_item(&occ);
         assert!(!m.contains_key("exe"));
+    }
+
+    #[test]
+    fn agent_gap_projects_loss_counts_and_window() {
+        let mut occ = base_occ("jalki.agent.gap");
+        for (key, value) in [
+            ("cause", "ringbuffer_overflow"),
+            ("dropped_records", "7"),
+            ("dropped_reliability", "0"),
+            ("dropped_attribution", "7"),
+            ("gap_start_ns", "10"),
+            ("gap_end_ns", "20"),
+            ("affected_probes", "[\"kernel.tcp.connect\"]"),
+        ] {
+            occ.labels.insert(key.into(), value.into());
+        }
+
+        let m = native_runtime_item(&occ);
+        assert_eq!(m["cause"], "ringbuffer_overflow");
+        assert_eq!(m["dropped_records"], 7);
+        assert_eq!(m["dropped_reliability"], 0);
+        assert_eq!(m["dropped_attribution"], 7);
+        assert_eq!(m["gap_start_ns"], 10);
+        assert_eq!(m["gap_end_ns"], 20);
+        assert_eq!(m["affected_probes"], json!(["kernel.tcp.connect"]));
     }
 }
