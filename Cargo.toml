@@ -51,9 +51,6 @@ prometheus-client = "0.22"
 # Async utilities
 async-trait = "0.1"
 
-# gRPC
-tonic = "0.12"
-
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }

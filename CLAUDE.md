@@ -12,7 +12,7 @@ Two value planes run off one capture engine:
 - **Neutral evidence** — capture → normalize → `EvidenceSink`. Sinks are
   `stdout`/`file`/`composite` plus the native Vartio source-ingress sink.
 
-The three built-in TCP probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`) are batteries-included defaults; the framework makes writing *any* fentry/fexit probe a matter of implementing the `Probe` trait.
+The six built-in probes (`TcpConnect`, `TcpClose`, `TcpRetransmit`, `ProcessExec`, `FileOpen`, `FileOpenAttempt`) are batteries-included defaults; the framework makes writing *any* fentry/fexit probe a matter of implementing the `Probe` trait.
 
 > ⚠ **Do not trust the "jälki is an Ahti producer" framing in `docs/jalki/`.** That May-2026 pass had jälki writing directly to Ahti; that premise has been reversed (see Design docs). jälki does not write to Ahti directly.
 
@@ -23,6 +23,8 @@ jalki/
 ├── false-protocol/   # vendored FALSE Protocol types (Occurrence, Severity, …) — was ../ahti/false-protocol
 ├── jalki-common/     # no_std shared types — kernel + userspace
 ├── jalki-evidence/   # aya-free: typed KernelEvent, normalization, EvidenceBatch, EvidenceSink
+├── jalki-vartio-sink/# native Vartio source-ingress sink (gRPC, ADR-0003/0004)
+├── jalki-enrich/     # node-local cgroup→pod binding enrichment
 ├── jalki-ebpf/       # eBPF programs — NOT a workspace member (separate build target)
 ├── jalki/            # userspace daemon + library
 ├── jalki-codegen/    # runtime BPF program generation from BTF (no C, no clang)
@@ -32,11 +34,11 @@ jalki/
 ├── xtask/            # build orchestration (eBPF compilation)
 ├── knowledge/        # JSON knowledge base — compiled into binary via include_str!
 ├── specs/            # Luotain-compatible requirement specs (tested by oracle)
-├── helm/jalki/       # Helm chart for k8s deployment
+├── helm/             # README pointing at false-infra apps/jalki (chart retired)
 └── eval/oracle/      # standalone contract test suite — NOT in workspace
 ```
 
-Workspace members: `false-protocol`, `jalki-common`, `jalki-evidence`, `jalki`, `jalki-codegen`, `jalki-mcp`, `jalki-sdk-meta`, `xtask`.
+Workspace members: `false-protocol`, `jalki-common`, `jalki-evidence`, `jalki-vartio-sink`, `jalki-enrich`, `jalki`, `jalki-codegen`, `jalki-mcp`, `jalki-sdk-meta`, `xtask`.
 
 Non-workspace (built separately): `jalki-ebpf`, `jalki-sdk-python`, `eval/oracle`.
 
@@ -114,13 +116,13 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
 ### jalki-common
 
 - `no_std` — must stay no_std, shared with kernel space
-- `#[repr(C)]` event structs: `TcpConnectEvent`, `TcpCloseEvent`, `TcpRetransmitEvent`
+- `#[repr(C)]` event structs: `TcpConnectEvent`, `TcpCloseEvent`, `TcpRetransmitEvent`, `ProcessExecEvent`, `FileOpenEvent`
 - Feature `userspace` enables `aya::Pod` impls
 - Size tests lock down the BPF ABI — do not change struct sizes without updating tests
 
 ### jalki-evidence
 
-- **aya-free by design** — uses a *direct* path dep on `jalki-common` (no `userspace`/aya feature) so it compiles and unit-tests on macOS, unlike `jalki`/`jalki-codegen`/`jalki-mcp`. (Currently blocked from building only by the unresolved `false-protocol` dep — see Known Constraints.)
+- **aya-free by design** — uses a *direct* path dep on `jalki-common` (no `userspace`/aya feature) so it compiles and unit-tests on macOS, unlike `jalki`/`jalki-codegen`/`jalki-mcp`.
 - The capture→output layer between raw bytes and durable output:
   - `event.rs` — typed `KernelEvent` + `from_bytes` decode of the `#[repr(C)]` structs.
   - `normalize.rs` — `KernelEvent` → FALSE Protocol `Occurrence` (one event may yield several `EvidenceRecord`s).
@@ -134,8 +136,8 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
 - Separate build target: `bpfel-unknown-none`, requires nightly Rust
 - NOT in the workspace Cargo.toml — has its own
 - Build with: `cargo run -p xtask -- build-ebpf [--release]`
-- Three programs: `fexit/tcp_connect`, `fexit/tcp_close`, `fentry/tcp_retransmit_skb`
-- Four BPF maps: three ring buffers (one per probe, 4MB each) + `PID_FILTER` HashMap
+- Nine programs: `fexit/tcp_connect`, `fexit/tcp_close`, `fentry/tcp_retransmit_skb`, `fexit/security_file_open`, `tracepoint/sched_process_exec`, and the four `sys_{enter,exit}_openat{,2}` tracepoints feeding the open-attempt pair
+- Nineteen BPF maps: six ring buffers (one per probe family, 4MB each) + six per-CPU ring drop counters (`*_DROPS`) + `PID_FILTER` + `TASK_OFFSETS` + `SENSITIVE_PREFIXES` + `IN_FLIGHT_OPENS` + three per-CPU scratch arrays
 
 ### jalki (userspace)
 
@@ -184,7 +186,7 @@ Standalone Rust binary. Validates jälki's public contract by reading data files
 - When an oracle case fails, fix the system or the data — not the test
 - The oracle must not be modified as a side effect of modifying the system
 
-**50 cases by domain:** 001-010 KB schema, 011-020 KB semantics, 021-030 MCP contract, 031-040 event schema, 041-050 interpretation accuracy, 051-055 cross-layer consistency, 060-065 probe counts, 070-072 find relevance, 080-082 ask interpretations, 090-091 SDK types, 095-096 specs structure.
+**50 cases by domain:** 001-010 KB schema, 011-020 KB semantics, 021-022 MCP contract, 031-032 event schema, 041-045 interpretation accuracy, 051-055 cross-layer consistency, 060-065 probe counts, 070-072 find relevance, 080-082 ask interpretations, 090-091 SDK types, 095-096 specs structure.
 
 ## Adding a New Probe
 
@@ -251,7 +253,7 @@ The old direct-Ahti and deployed-Polku premises are both retired:
 - ADR-0001's interpretation reversal ("jälki MAY interpret") still holds; its
   old routing clause does not.
 
-Until a superseding ADR lands, treat the storage/routing claims in these docs as wrong. The fentry/fexit framework, the `Probe` trait, and the eBPF crates are accurate and preserved.
+ADR-0003 (native Vartio sink, Polku retired) is the superseding routing decision — treat pre-ADR-0003 storage/routing claims in these docs as wrong. The fentry/fexit framework, the `Probe` trait, and the eBPF crates are accurate and preserved.
 
 - `docs/jalki/README.md` — start here, document map and the "design sentence to preserve"
 - `docs/jalki/product-boundaries.md` — what jälki MUST and MUST NOT do

@@ -58,6 +58,17 @@ mod tests {
         assert_eq!(types::Severity::Warning as u8, 1);
         assert_eq!(types::Severity::Error as u8, 2);
         assert_eq!(types::Severity::Critical as u8, 3);
+        // Appended after the fact — 0-3 are the wire contract.
+        assert_eq!(types::Severity::Debug as u8, 4);
+    }
+
+    #[test]
+    fn outcome_repr_values() {
+        assert_eq!(types::Outcome::Success as u8, 0);
+        assert_eq!(types::Outcome::Failure as u8, 1);
+        assert_eq!(types::Outcome::Unknown as u8, 2);
+        assert_eq!(types::Outcome::Timeout as u8, 3);
+        assert_eq!(types::Outcome::InProgress as u8, 4);
     }
 
     #[test]

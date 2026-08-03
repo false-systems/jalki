@@ -30,16 +30,22 @@ from typing import Optional
 
 
 class Severity(IntEnum):
+    # DEBUG is appended, not inserted before INFO: values 0-3 are the wire
+    # contract (POS_SEVERITY), so renumbering would break existing clients.
     INFO = 0
     WARNING = 1
     ERROR = 2
     CRITICAL = 3
+    DEBUG = 4
 
 
 class Outcome(IntEnum):
+    # TIMEOUT/IN_PROGRESS appended after UNKNOWN for wire stability.
     SUCCESS = 0
     FAILURE = 1
     UNKNOWN = 2
+    TIMEOUT = 3
+    IN_PROGRESS = 4
 
 
 class Proto(IntEnum):
@@ -215,6 +221,8 @@ class Method(IntEnum):
     UNSUBSCRIBE = 0x04
     STATUS = 0x05
     ASK = 0x06
+    GET_EVENTS = 0x07
+    DETACH = 0x08
 
 
 class Flags:

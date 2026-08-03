@@ -91,6 +91,9 @@ pub struct AskResult {
     pub kb_only: bool,
 }
 
+/// Mirrors the FALSE Protocol `Severity` (5 values). `Debug` is appended
+/// rather than inserted before `Info`: the u8 values 0-3 are the wire
+/// contract (POS_SEVERITY), so renumbering would break every client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Severity {
@@ -98,14 +101,19 @@ pub enum Severity {
     Warning = 1,
     Error = 2,
     Critical = 3,
+    Debug = 4,
 }
 
+/// Mirrors the FALSE Protocol `Outcome` (5 values). `Timeout`/`InProgress`
+/// are appended after `Unknown` for the same wire-stability reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Outcome {
     Success = 0,
     Failure = 1,
     Unknown = 2,
+    Timeout = 3,
+    InProgress = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

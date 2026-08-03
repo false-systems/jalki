@@ -243,7 +243,7 @@ mod tests {
             ppid: None,
             command: cmd.into(),
             args: None,
-            uid: 0,
+            uid: None,
             exit_code: None,
         });
         occ

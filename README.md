@@ -70,7 +70,7 @@ The kernel knew the answer all along. 35 retransmits in ESTABLISHED state on the
    │  loader     → attach probes via BTF metadata    │
    │  reader     → drain ring buffers → EventStore   │
    │  probes     → raw bytes → FALSE Protocol JSON   │
-   │  sinks      → stdout / file / composite         │
+   │  sinks      → vartio (gRPC) / stdout / file     │
    │  IPC server → /run/jalki/jalki.sock             │
    │  metrics    → :9090 /metrics /healthz /readyz    │
    └────────────────────┬───────────────────────────┘
@@ -245,17 +245,25 @@ async for event in jalki.stream(handle, interpreted=True):  # live events
 | `TcpClose` | `fexit/tcp_close` | Connection teardown — 4-tuple, process info |
 | `TcpRetransmit` | `fentry/tcp_retransmit_skb` | Retransmissions — 4-tuple, TCP state |
 
-These three, joined on the 4-tuple, answer: which backends are being connected to, which connections are failing, which are retransmitting, and what the TCP state was when it happened.
+These three, joined on the 4-tuple, answer: which backends are being connected to, which connections are failing, which are retransmitting, and what the TCP state was when it happened. Alongside them ship `ProcessExec` (tracepoint `sched_process_exec` — what binaries run), and the `FileOpen`/`FileOpenAttempt` pair (`fexit/security_file_open` + the openat tracepoints — who touched, or tried to touch, watched files).
+
+---
+
+## Evidence delivery
+
+Beyond the local `stdout` / `file` / `composite` sinks, the native Vartio sink ships evidence off the node (ADR-0003/0004):
+
+```bash
+jalki --sink vartio --vartio-endpoint http://vartio.vartio.svc:50061
+```
+
+Captured events are normalized, bound to their pod (`cgroup → container → pod`), and delivered to Vartio's source ingress over gRPC. Vartio interprets the evidence and writes product records to Ahti; jälki itself never writes to Ahti.
 
 ---
 
 ## Kubernetes
 
-Helm chart in `helm/jalki/`. Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF.
-
-```bash
-helm install jalki helm/jalki/ --set cluster=prod-east-1 --set emit=stdout
-```
+Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF. The deployment authority is false-infra `apps/jalki/` — the manifest set that runs in the live cluster (see `helm/README.md` for why the in-repo chart was retired).
 
 ---
 
@@ -306,8 +314,6 @@ cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
 - **dst_ip 0.0.0.0 on Cilium-managed connections** — `skc_daddr` reads 0 when Cilium drops the packet before destination resolution (policy denial), when the conntrack table has no entry for the connection, or during loopback SNAT where the address is temporarily 0.0.0.0. Not fixable from jälki — requires Cilium debug monitor logs (`cilium monitor --type drop`) to diagnose the specific cause.
 - **src_port 0 on tcp_close events** — the kernel clears `skc_num` before `tcp_close` returns, so fexit sees 0. This is correct kernel behavior. Use the `tcp_connect` event's `src_port` and correlate by 4-tuple to get the full picture.
 - **IPv4 only** — IPv6 in v0.2.
-- **bytes_sent/bytes_received emit 0** — requires `tcp_sock` offset walking not yet implemented.
-- **Durable pipeline sink not built yet** — only `stdout` / `file` / `composite` evidence sinks exist; the `Polku → Vartio` delivery sink (see `docs/jalki/adr/0002-evidence-through-polku-to-vartio.md`) is upcoming work.
 - **Privileged required** — `CAP_BPF` + `CAP_PERFMON` at minimum.
 
 ---
@@ -318,7 +324,6 @@ cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
 jälki     kernel observation (this)
 TAPIO     k8s observation
 RAUTA     L7 gateway
-POLKU     event transport
 AHTI      causality correlation
 syva      enforcement
 rauha     container runtime

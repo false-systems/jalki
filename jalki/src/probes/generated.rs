@@ -251,7 +251,9 @@ impl Probe for GeneratedProbeReader {
                 ppid: None,
                 command: cmd.clone(),
                 args: None,
-                uid: 0,
+                // Generated probe specs do not extract a uid field; absent
+                // means absent — never claim root.
+                uid: None,
                 exit_code: None,
             });
         }

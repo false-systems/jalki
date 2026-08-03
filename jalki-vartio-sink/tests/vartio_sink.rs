@@ -376,6 +376,9 @@ async fn agent_gap_crosses_the_wire_without_runtime_binding() {
         payload["affected_probes"],
         serde_json::json!(["kernel.tcp.connect"])
     );
+    assert!(payload.get("event_id").is_some());
+    assert!(payload.get("node_id").is_some());
+    assert!(payload.get("cluster_id").is_some());
     assert!(payload.get("pod_uid").is_none());
     assert!(payload.get("container_id").is_none());
 }
