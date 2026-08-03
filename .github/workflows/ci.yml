@@ -45,7 +45,11 @@ jobs:
 
       - name: Toolchain
         run: |
-          # GitHub-hosted PR runners include rustup; the ARC runner does not.
+          # GitHub-hosted PR runners include these; the stock ARC image does not.
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes build-essential
+          fi
           if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             export PATH="$HOME/.cargo/bin:$PATH"
