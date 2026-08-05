@@ -1,0 +1,240 @@
+# jälki — reference DaemonSet.
+#
+# This is the deployment we actually run, with our site-specific values
+# replaced by CHANGE-ME markers. It is checked against the live spec in CI, so
+# it does not drift into fiction the way the retired Helm chart did (see
+# ../../helm/README.md).
+#
+# Everything marked CHANGE-ME is yours to set. Everything else is load-bearing:
+# jälki will start without it and then fail in ways that look like something
+# else — see deploy/kubernetes/README.md before removing any of it.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jalki
+  labels:
+    app.kubernetes.io/name: jalki
+    # jälki loads eBPF programs, needs hostPID/hostNetwork, and reads host
+    # bpffs/btf/cgroupfs. Under Pod Security Standards this namespace must be
+    # `privileged`; at `baseline` or `restricted` the pod is rejected outright.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jalki
+  namespace: jalki
+  labels:
+    app.kubernetes.io/name: jalki
+---
+# The k8s enrichment watcher (`--k8s-enrichment`) watches pods to bind kernel
+# events to pod_uid/container_id. Evidence that cannot be bound to a pod is
+# dropped at the source, so for any pipeline that consumes attributed evidence
+# this is not optional.
+#
+# This is the whole of jälki's Kubernetes API surface: read-only, pods only, no
+# writes, no secrets, no other kinds.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jalki
+  labels:
+    app.kubernetes.io/name: jalki
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jalki
+  labels:
+    app.kubernetes.io/name: jalki
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jalki
+subjects:
+  - kind: ServiceAccount
+    name: jalki
+    namespace: jalki
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: jalki
+  namespace: jalki
+  labels:
+    app.kubernetes.io/name: jalki
+    app.kubernetes.io/component: kernel-evidence
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jalki
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jalki
+        app.kubernetes.io/component: kernel-evidence
+    spec:
+      serviceAccountName: jalki
+      # CHANGE-ME: only if you pull from a private registry.
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      #
+      # CHANGE-ME: the published images are arm64 and amd64. Pin to whichever
+      # architecture your nodes are, or drop the selector to run everywhere.
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      # Run on every node, including tainted ones. A node excluded from the
+      # DaemonSet is a node with no kernel evidence, and nothing downstream can
+      # tell that apart from a node where nothing happened.
+      tolerations:
+        - operator: Exists
+      # hostPID: process and cgroup visibility across the node.
+      # hostNetwork: the pod hostname becomes the node name (producer identity)
+      #   and the kernel netns matches the host, so captured connections are the
+      #   node's real ones.
+      # dnsPolicy: REQUIRED with hostNetwork — the default keeps the host's
+      #   resolv.conf and in-cluster Service DNS names will not resolve, which
+      #   presents as the sink being permanently unreachable.
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: jalki
+          # CHANGE-ME: pin a tag or digest you control.
+          image: ghcr.io/false-systems/jalki:main
+          # With a mutable tag, nodes keep whatever digest they first pulled and
+          # a rollout silently reuses it. Irrelevant if you pin a digest.
+          imagePullPolicy: Always
+          securityContext:
+            # eBPF load and attach. On SELinux-enforcing hosts a privileged
+            # container also runs as spc_t, which host-resource access needs.
+            privileged: true
+            # The image base is distroless :nonroot. Without runAsUser 0 the
+            # process keeps uid 65532 and its effective capabilities are cleared
+            # at exec, so BPF map creation fails EPERM even in a privileged pod.
+            runAsUser: 0
+            runAsGroup: 0
+          args:
+            - --sink
+            - vartio
+            - --k8s-enrichment
+          env:
+            # CHANGE-ME: your cluster's name. Rides along on every record as
+            # producer identity.
+            - { name: JALKI_CLUSTER, value: "CHANGE-ME" }
+            # CHANGE-ME: your Vartio source-ingress endpoint.
+            - { name: JALKI_VARTIO_ENDPOINT, value: "http://vartio.vartio.svc.cluster.local:50061" }
+            - { name: JALKI_VARTIO_ADAPTER_ID, value: "jalki-daemonset" }
+            # CHANGE-ME: which namespaces' workloads to capture. Scope this
+            # deliberately — unscoped, this is the whole-node kernel firehose,
+            # and evidence volume is the most common way to overwhelm whatever
+            # consumes it.
+            - { name: JALKI_NAMESPACES, value: "CHANGE-ME" }
+            # File-family evidence (kernel.file.open / open_attempt). File opens
+            # are far more frequent than exec/connect; leave off until the
+            # consuming side is known to keep up.
+            - { name: JALKI_VARTIO_FILE_TYPES, value: "1" }
+            - name: JALKI_NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+            # CHANGE-ME: bearer token for Vartio's source ingress. Create the
+            # Secret out of band; never commit it.
+            - name: VARTIO_INGRESS_TOKEN
+              valueFrom:
+                secretKeyRef: { name: jalki-vartio-token, key: ingress-token }
+            # Retry buffer, held in RAM while the sink is unavailable. The BYTE
+            # budget is the binding constraint — a record cap alone never
+            # engages before the kernel does. This is an *estimate* of encoded
+            # size; real RSS runs a small multiple of it, so keep it well under
+            # the memory limit minus the steady-state baseline.
+            - { name: JALKI_RETRY_MAX_BYTES, value: "67108864" }
+            - { name: JALKI_RETRY_MAX_RECORDS, value: "120000" }
+            # How long undeliverable evidence may sit before /readyz reports
+            # NotReady. Keep it comfortably above the retry-backoff cap so an
+            # ordinary blip cannot flap the probe.
+            - { name: JALKI_READY_MAX_BACKLOG_AGE_SECS, value: "60" }
+            # Self-shedding: give buffered evidence up before the kernel
+            # OOM-kills the agent. An OOM costs the entire backlog AND emits no
+            # gap evidence — the one loss the pipeline cannot describe
+            # afterwards. Shedding costs some of the same records and says so.
+            #
+            # Optional: the agent resolves its own container cgroup and arms
+            # shedding without this. Setting it is exact and survives a
+            # cgroup-layout change that would otherwise silently disarm it.
+            - name: JALKI_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: jalki
+                  resource: limits.memory
+            # On-disk mirror of the retry buffer. Without it, a restart during a
+            # sink outage destroys exactly the evidence that outage produced.
+            # Off unless JALKI_SPOOL_PATH is set — the agent will not silently
+            # write into the container's ephemeral root.
+            - { name: JALKI_SPOOL_PATH, value: "/var/lib/jalki/backlog.spool" }
+            - { name: JALKI_SPOOL_MAX_BYTES, value: "268435456" }
+            - { name: RUST_LOG, value: "jalki=info" }
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          # /readyz reports whether evidence is *flowing*: 503 once undeliverable
+          # evidence has been held past JALKI_READY_MAX_BACKLOG_AGE_SECS. Nothing
+          # selects this DaemonSet, so NotReady cuts no traffic — it is a
+          # visible, alertable state rather than a restart.
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 3
+          # /healthz consults NOTHING — not the sink, not the retry buffer. A
+          # sink outage must not restart the agent; restarting is how you lose
+          # the buffer you were holding.
+          #
+          # Do not point either probe at /metrics: that runs a full Prometheus
+          # registry encode per probe, and makes the two probes incapable of
+          # reporting different things.
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 6
+            timeoutSeconds: 3
+          # CHANGE-ME: size against your own measurements.
+          #
+          # requests == limits gives Guaranteed QoS: last on the kernel OOM list
+          # and never node-pressure-evicted. An evidence collector should outlive
+          # the incidents it records.
+          #
+          # Our steady state is ~255-506Mi depending on node busyness; 1Gi is
+          # roughly 2x that, leaving room for a burst plus a full retry buffer.
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: 500m, memory: 1Gi }
+          volumeMounts:
+            - { name: bpffs, mountPath: /sys/fs/bpf }
+            - { name: debugfs, mountPath: /sys/kernel/debug, readOnly: true }
+            - { name: btf, mountPath: /sys/kernel/btf, readOnly: true }
+            # cgroup_id -> container resolution for k8s enrichment.
+            - { name: cgroupfs, mountPath: /sys/fs/cgroup, readOnly: true }
+            - { name: spool, mountPath: /var/lib/jalki }
+      volumes:
+        - name: bpffs
+          hostPath: { path: /sys/fs/bpf }
+        - name: debugfs
+          hostPath: { path: /sys/kernel/debug }
+        - name: btf
+          hostPath: { path: /sys/kernel/btf }
+        - name: cgroupfs
+          hostPath: { path: /sys/fs/cgroup }
+        # emptyDir, not hostPath: it survives a container restart within the
+        # same pod, which is the case the spool exists for. Surviving a node
+        # reboot would need hostPath plus an eviction story for stale spools.
+        #
+        # sizeLimit is deliberately ABOVE JALKI_SPOOL_MAX_BYTES so the agent's
+        # own budget engages first — hitting the kubelet's cap evicts the pod,
+        # which destroys the backlog the spool was protecting.
+        - name: spool
+          emptyDir: { sizeLimit: 512Mi }
