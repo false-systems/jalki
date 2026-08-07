@@ -7,6 +7,14 @@ use jalki_enrich::BindingCache;
 use jalki_evidence::{CompositeSink, EvidenceSink, FileSink, StdoutSink};
 use tracing_subscriber::EnvFilter;
 
+/// jalki#76: glibc arena retention grew the working set to 71% of the pod
+/// limit over 24h of sink-outage churn, and shedding — which governs buffered
+/// evidence, not the heap — could not help. jemalloc actually returns freed
+/// pages. Kept in main.rs so the binary is the thing that owns its allocator;
+/// library consumers of the jalki crates keep their own.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use jalki::enrich::CachedEnricher;
 use jalki::kube_watch;
 use jalki::probes::{

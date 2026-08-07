@@ -95,6 +95,14 @@ pub struct Metrics {
     /// Bytes of backlog currently on disk (jalki #33). 0 means either nothing
     /// buffered or no spool — `/readyz` and the log distinguish them.
     pub spool_bytes: Gauge,
+    /// 1 while memory sits at/above the shed watermark AND shedding the entire
+    /// retry buffer could not bring it back under — the state that preceded
+    /// the 2026-08-07 OOM (jalki#76): working set at 71% of the limit with
+    /// ~20MB buffered. Shedding governs buffered evidence; when the growth is
+    /// the process's own working set, shedding structurally cannot help, and
+    /// that must be a first-class signal rather than something reconstructed
+    /// from three metrics after the kill.
+    pub memory_ceiling_no_shed: Gauge,
 }
 
 impl Default for Metrics {
@@ -192,6 +200,15 @@ impl Metrics {
             spool_bytes.clone(),
         );
 
+        let memory_ceiling_no_shed = Gauge::default();
+        registry.register(
+            "jalki_memory_ceiling_no_shed",
+            "1 while memory is at/above the shed watermark and shedding the \
+             whole retry buffer could not bring it back below it — growth is \
+             the process working set, not buffered evidence (jalki#76)",
+            memory_ceiling_no_shed.clone(),
+        );
+
         let memory_usage_ratio = Gauge::<f64, AtomicU64>::default();
         registry.register(
             "jalki_memory_usage_ratio",
@@ -215,6 +232,7 @@ impl Metrics {
             retry_oldest_age_seconds,
             memory_usage_ratio,
             spool_bytes,
+            memory_ceiling_no_shed,
         }
     }
 

@@ -34,6 +34,15 @@ clap = { workspace = true }
 chrono = { workspace = true }
 ulid = { workspace = true }
 hostname = { workspace = true }
+# Global allocator (jalki#76). glibc's per-thread arenas retained ~24h of
+# alloc/free churn until the working set sat at 71% of the pod limit with only
+# ~20MB actually buffered — self-shedding had nothing to shed and the agent
+# OOMed with every bound intact. Same disease and same fix as ahti (ahti#299):
+# jemalloc's decay returns freed pages instead of hoarding them. The
+# MALLOC_ARENA_MAX knobs in the DaemonSet stay as a fallback for any non-Rust
+# allocation, but with jemalloc as the global allocator they no longer govern
+# the dominant path.
+tikv-jemallocator = "0.6"
 rmpv = { workspace = true }
 kube = { version = "4.0.0", default-features = false, features = ["runtime", "client", "rustls-tls"] }
 # kube's rustls-tls brings rustls without a crypto provider compiled in;

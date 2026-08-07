@@ -593,6 +593,9 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         mut spool,
     } = loop_state;
     let memory_high_watermark = memory_high_watermark();
+    // Transition tracker for "at ceiling, nothing to shed" (jalki#76) — owned
+    // by the sink loop so the WARN fires once per episode, not per tick.
+    let mut ceiling = CeilingState::default();
 
     let mut retry_buffer = RetryBuffer::new(retry_config);
     let mut backoff = RetryBackoff::new(backoff_config);
@@ -726,6 +729,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         &mut retry_buffer,
                         &mut pending_gaps,
                         &metrics_clone,
+                        &mut ceiling,
                     );
                 }
                 sync_spool(&mut spool, &retry_buffer, &metrics_clone);
@@ -770,6 +774,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         &mut retry_buffer,
                         &mut pending_gaps,
                         &metrics_clone,
+                        &mut ceiling,
                     );
                 }
                 sync_spool(&mut spool, &retry_buffer, &metrics_clone);
@@ -904,6 +909,50 @@ fn memory_high_watermark() -> f64 {
         .unwrap_or(DEFAULT_MEMORY_HIGH_WATERMARK)
 }
 
+/// Tracks the state "at the memory ceiling with nothing meaningful to shed",
+/// so it is logged on TRANSITION rather than every sink-loop tick, and
+/// exported continuously as `jalki_memory_ceiling_no_shed`.
+///
+/// This state existed for 3+ hours before the 2026-08-07 OOM (jalki#76) and
+/// was reconstructable only by joining three metrics after the kill: the
+/// working set sat at 71% of the limit while the retry buffer held ~20MB.
+/// Shedding governs buffered evidence; when the growth is the process's own
+/// working set — allocator retention, cache growth — shedding structurally
+/// cannot help. ADR-0010 applies to the agent itself: absence of headroom the
+/// agent can do anything about must be reported, not inferred.
+#[derive(Default)]
+struct CeilingState {
+    active: bool,
+}
+
+impl CeilingState {
+    /// `doomed` is precise, not a heuristic: even shedding the ENTIRE buffer
+    /// (freeing at most `len_bytes`) could not bring the ratio back under the
+    /// watermark. On 2026-08-07: ratio 0.98, buffer 20MB/1Gi ≈ 0.02 →
+    /// 0.96 ≥ 0.8, doomed. A healthy pressure spike with 300MB buffered:
+    /// 0.85 − 0.29 = 0.56 < 0.8 — shedding works, not doomed.
+    fn observe(&mut self, doomed: bool, ratio: f64, pressure: &MemoryPressure, metrics: &Metrics) {
+        metrics.memory_ceiling_no_shed.set(i64::from(doomed));
+        if doomed && !self.active {
+            warn!(
+                memory_ratio = ratio,
+                limit_bytes = pressure.limit_bytes(),
+                "at the memory ceiling with nothing meaningful to shed: the \
+                 growth is the process working set, not buffered evidence, and \
+                 shedding cannot prevent an OOM from here (jalki#76). If this \
+                 persists the limit is undersized for the workload or the \
+                 allocator is retaining churn"
+            );
+        } else if !doomed && self.active {
+            info!(
+                memory_ratio = ratio,
+                "memory ceiling cleared; headroom is back under the agent's control"
+            );
+        }
+        self.active = doomed;
+    }
+}
+
 /// Give back buffer memory before the kernel takes the process.
 ///
 /// An OOM kill loses the entire backlog *and* produces no gap evidence — the
@@ -915,11 +964,20 @@ fn shed_under_memory_pressure(
     retry_buffer: &mut RetryBuffer,
     pending_gaps: &mut PendingGaps,
     metrics: &Metrics,
+    ceiling: &mut CeilingState,
 ) {
     let Some(ratio) = pressure.ratio() else {
         return;
     };
     metrics.memory_usage_ratio.set(ratio);
+
+    // Report the structural state BEFORE the early returns below: the empty-
+    // buffer return on the next line is exactly the silent path the 2026-08-07
+    // OOM took, and it must not stay silent.
+    let buffer_fraction = retry_buffer.len_bytes() as f64 / pressure.limit_bytes() as f64;
+    let doomed = ratio >= high_watermark && (ratio - buffer_fraction) >= high_watermark;
+    ceiling.observe(doomed, ratio, pressure, metrics);
+
     if ratio < high_watermark || retry_buffer.is_empty() {
         return;
     }
@@ -2529,7 +2587,14 @@ mod tests {
         let dir = fake_cgroup("high", 943_718_400, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
 
-        shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut CeilingState::default(),
+        );
 
         assert!(buffer.len_bytes() < before, "it gave memory back");
         assert!(!gaps.is_empty(), "and the loss is reported, not silent");
@@ -2555,7 +2620,14 @@ mod tests {
         let dir = fake_cgroup("low", 314_572_800, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
 
-        shed_under_memory_pressure(&pressure, 0.8, &mut buffer, &mut gaps, &metrics);
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut CeilingState::default(),
+        );
 
         assert_eq!(
             buffer.len_bytes(),
@@ -2567,6 +2639,118 @@ mod tests {
             metrics.memory_usage_ratio.get() > 0.0,
             "but it is still measured"
         );
+    }
+
+    /// The 2026-08-07 OOM state (jalki#76): at the ceiling with a buffer too
+    /// small for shedding to matter. Before this, the function returned
+    /// silently — three hours of a reportable state, reported nowhere.
+    #[test]
+    fn ceiling_with_nothing_to_shed_is_reported() {
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        let mut ceiling = CeilingState::default();
+
+        // 980Mi of 1Gi, empty buffer — the exact silent path from the incident.
+        let dir = fake_cgroup("doomed", 1_027_604_480, "1073741824");
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
+
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut ceiling,
+        );
+
+        assert_eq!(
+            metrics.memory_ceiling_no_shed.get(),
+            1,
+            "the state is exported"
+        );
+        assert!(ceiling.active, "and tracked for transition logging");
+        assert!(
+            gaps.is_empty(),
+            "nothing was shed — there was nothing to shed"
+        );
+    }
+
+    /// Same ratio with a heavy buffer is NOT the doomed state: shedding can
+    /// bring the ratio back under the watermark, and does.
+    #[test]
+    fn ceiling_with_a_real_buffer_is_not_doomed() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        let mut ceiling = CeilingState::default();
+        for _ in 0..20 {
+            buffer.enqueue(EvidenceBatch::new(producer.clone(), one_record()), 0);
+        }
+
+        // 900Mi of a limit chosen so the buffer is a large fraction of it:
+        // shedding everything would land well below the watermark.
+        let limit = (buffer.len_bytes() as u64) * 4;
+        let current = (limit as f64 * 0.9) as u64;
+        let dir = fake_cgroup("shed-works", current, &limit.to_string());
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
+
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut ceiling,
+        );
+
+        assert_eq!(
+            metrics.memory_ceiling_no_shed.get(),
+            0,
+            "shedding can still help here"
+        );
+        assert!(!ceiling.active);
+        assert!(!gaps.is_empty(), "and it did shed");
+    }
+
+    /// The gauge must come back down when pressure clears — a latched 1 would
+    /// be its own false alarm.
+    #[test]
+    fn ceiling_state_clears_on_recovery() {
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        let mut ceiling = CeilingState::default();
+
+        let dir = fake_cgroup("recover-high", 1_027_604_480, "1073741824");
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut ceiling,
+        );
+        assert_eq!(metrics.memory_ceiling_no_shed.get(), 1);
+
+        // Pressure drops (the allocator gave pages back, or the limit grew).
+        std::fs::write(dir.join("memory.current"), "314572800\n").unwrap();
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &metrics,
+            &mut ceiling,
+        );
+        assert_eq!(
+            metrics.memory_ceiling_no_shed.get(),
+            0,
+            "cleared, not latched"
+        );
+        assert!(!ceiling.active);
     }
 
     // ── the backlog outlives the process (jalki #33) ────────────────────────
