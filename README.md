@@ -263,7 +263,16 @@ Captured events are normalized, bound to their pod (`cgroup → container → po
 
 ## Kubernetes
 
-Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF. The deployment authority is false-infra `apps/jalki/` — the manifest set that runs in the live cluster (see `helm/README.md` for why the in-repo chart was retired).
+Deploys as a DaemonSet with `hostPID`, `hostNetwork`, and privileged access for eBPF.
+
+**Start at [`deploy/kubernetes/`](deploy/kubernetes/)** — a reference manifest
+that is a copy of what we run in production, mechanically checked against our
+live spec in CI so it cannot drift into fiction, with a README covering the
+values you must change, the parts you must not remove (each fails looking like
+something else), how to verify evidence is actually flowing, and which metrics
+to alert on — thresholds that have each fired for a real incident. (The
+retired in-repo Helm chart's story is in `helm/README.md`: it agreed with
+reality by hand and by luck, and nothing compared them.)
 
 ---
 
