@@ -78,6 +78,31 @@ curl -s localhost:9090/readyz    # queued_batches=0 ... status=ok
 curl -s localhost:9090/metrics   # Prometheus registry dump
 ```
 
+## What to alert on
+
+jälki exports Prometheus metrics on `:9090/metrics`. Five of them cover every
+failure mode we have seen in production; each threshold below has fired for a
+real incident, not a guess. Alerting on anything less means finding out from
+pod logs, later.
+
+| Alert when | Why |
+| --- | --- |
+| `increase(jalki_ring_buffer_drops_total[15m]) > 0` | Kernel events overwrote the eBPF ring buffer before userspace drained it — the one loss nothing downstream can reconstruct or even describe. Any nonzero value is real. |
+| `jalki_retry_oldest_age_seconds > 300` | Evidence has been undeliverable for 5+ minutes: the sink is down or refusing. Pairs with `/readyz` going NotReady — visible pressure, not a restart. |
+| `jalki_spool_bytes > 0.8 * JALKI_SPOOL_MAX_BYTES` | The on-disk mirror is filling; when it caps, the next stop under continued outage is shedding. You want the warning while there is still budget. |
+| `jalki_binding_cache_hit_ratio < 0.9` for 15m | Kubernetes enrichment is degrading, and unbindable evidence is dropped **at the source** by design. Expect a dip after agent restarts while caches warm (~15 min); sustained low is real. |
+| `jalki_memory_ceiling_no_shed == 1` for 10m | The precise doomed condition (jalki#76): memory is over the shedding watermark AND dropping the entire retry buffer would not get back under it. Shedding cannot save the agent; an OOM kill is coming. This alert is the off-node copy of the state that the OOM it predicts will otherwise destroy. |
+
+Two things deliberately **not** worth alerting on:
+
+- `jalki_unbound_dropped_total_total` with `reason="host_process"` — that is the
+  agent correctly refusing to attribute host-level noise to workloads. We
+  alerted on the metric's name once; the metric's labels are the metric.
+- Raw memory usage. The binary runs jemalloc as its allocator, so the working
+  set stays flat and returns freed pages to the OS; no `MALLOC_*` tuning is
+  needed, and a steady-state plateau is not a leak. The ceiling gauge above is
+  the memory signal that means something.
+
 ## Why this file is trustworthy
 
 A Helm chart used to live in `helm/`. It was retired not because it was broken
