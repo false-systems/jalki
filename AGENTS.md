@@ -151,7 +151,6 @@ surface, MCP surface, or storage behavior, read:
 - `docs/jalki/adr/0003-native-vartio-sink-retire-polku.md` (current architecture — read first)
 - `docs/jalki/README.md`
 - `docs/jalki/product-boundaries.md`
-- `docs/jalki/v0-scope.md`
 - `docs/jalki/ahti-record-mapping.md`
 - `docs/jalki/runtime-evidence-model.md`
 - `docs/jalki/probe-definitions.md`

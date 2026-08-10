@@ -257,11 +257,15 @@ ADR-0003 (native Vartio sink, Polku retired) is the superseding routing decision
 
 - `docs/jalki/README.md` — start here, document map and the "design sentence to preserve"
 - `docs/jalki/product-boundaries.md` — what jälki MUST and MUST NOT do
-- `docs/jalki/v0-scope.md` — the first implementation slice
 - `docs/jalki/ahti-record-mapping.md` — how every concept maps to Ahti's record kinds
 - `docs/jalki/runtime-evidence-model.md` — per-evidence-type definitions
 - `docs/jalki/probe-definitions.md` — probe plan templates as Ahti definition records
 - `docs/jalki/local-agent-state.md` — what stays on the node vs. what reaches Ahti
+
+`docs/jalki/v0-scope.md` no longer exists — it described the dead Ahti-producer
+slice and was removed (`docs/jalki/README.md` §"the implemented slice" records
+this). Several of the May-2026 docs still link to it; those links dangle by
+design, not by accident, and the ADR-0003 slice is the answer they point at.
 
 For architectural changes, write a design doc first (MUST/SHOULD/MAY discipline) and get sign-off before implementing.
 
@@ -271,7 +275,8 @@ For architectural changes, write a design doc first (MUST/SHOULD/MAY discipline)
 jälki     kernel observation (fentry/fexit framework)
 TAPIO     k8s observation
 RAUTA     L7 gateway
-AHTI      causality correlation
+VARTIO    actor attribution — receives jälki's evidence, writes to AHTI
+AHTI      append-first structured datastore
 syva      enforcement
 rauha     container runtime
 ```
