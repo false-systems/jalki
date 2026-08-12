@@ -69,10 +69,11 @@ mod tests {
             gid: 1000,
             cgroup_id: 42,
             ret: 0,
-            _pad1: 0,
+            tid: 1234,
             comm,
             filename,
             argv_hash: [0xabu8; 32],
+            leader_start_boottime_ns: 500_000_000,
         };
         let ptr = &event as *const RawEvent as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<RawEvent>()) }.to_vec()

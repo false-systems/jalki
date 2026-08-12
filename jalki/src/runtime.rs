@@ -551,7 +551,18 @@ fn producer_metadata(cluster: &str) -> ProducerMetadata {
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
-    ProducerMetadata::new(cluster, node_id, kernel_release)
+    let mut producer = ProducerMetadata::new(cluster, node_id, kernel_release);
+    producer.node_identity = std::env::var("JALKI_NODE_IDENTITY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    producer.boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if producer.node_identity.is_none() || producer.boot_id.is_none() {
+        warn!("RuntimeSubjectV1 disabled: JALKI_NODE_IDENTITY or Linux boot_id is unavailable");
+    }
+    producer
 }
 
 /// Inputs for [`run_sink_loop`]. A struct rather than eight positional

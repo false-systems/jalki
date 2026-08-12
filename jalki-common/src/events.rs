@@ -112,16 +112,20 @@ pub struct TcpRetransmitEvent {
 #[derive(Copy, Clone)]
 pub struct ProcessExecEvent {
     pub timestamp_ns: u64,
+    /// Thread-group id in the initial host PID namespace.
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
     pub gid: u32,
     pub cgroup_id: u64,
     pub ret: i32,
-    pub _pad1: u32,
+    /// Task id in the initial host PID namespace.
+    pub tid: u32,
     pub comm: [u8; 16],
     pub filename: [u8; PROCESS_EXEC_FILENAME_LEN],
     pub argv_hash: [u8; 32],
+    /// Thread-group leader `task_struct.start_boottime`, not event time.
+    pub leader_start_boottime_ns: u64,
 }
 
 /// Event emitted by the security_file_open fexit probe.
@@ -256,7 +260,7 @@ mod tests {
     #[test]
     fn process_exec_event_size() {
         // Stable for BPF ring buffer reads.
-        assert_eq!(mem::size_of::<ProcessExecEvent>(), 344);
+        assert_eq!(mem::size_of::<ProcessExecEvent>(), 352);
     }
 
     #[test]

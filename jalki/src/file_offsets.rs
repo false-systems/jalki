@@ -73,10 +73,9 @@ fn resolve() -> Result<(u32, u32), String> {
     Ok((f_path, f_flags))
 }
 
-/// Resolve `task_struct.{real_parent, tgid}` offsets from BTF into the
+/// Resolve process identity offsets from BTF into the
 /// `TASK_OFFSETS` map, so the exec probe can read `current->real_parent->tgid`
-/// for ppid. Unlike `bpf_d_path`, those reads go through `bpf_probe_read_kernel`,
-/// which accepts a runtime offset — so BTF-driven offsets are verifier-safe here.
+/// for ppid and `current->group_leader->start_boottime` for RuntimeSubjectV1.
 ///
 /// Never fatal: if BTF resolution fails the map stays zero and the probe leaves
 /// ppid = 0 (omitted) rather than read a guessed offset.
@@ -104,6 +103,24 @@ pub fn populate_task_offsets(ebpf: &mut Ebpf) -> Result<()> {
             );
         }
     }
+    match resolve_runtime_subject_offsets() {
+        Ok((group_leader, start_boottime)) => {
+            map.set(2, group_leader, 0)
+                .context("set group_leader offset")?;
+            map.set(3, start_boottime, 0)
+                .context("set start_boottime offset")?;
+            info!(
+                group_leader,
+                start_boottime, "resolved task_struct offsets (RuntimeSubjectV1 enabled)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not resolve RuntimeSubjectV1 offsets; process start identity will be omitted"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -119,4 +136,18 @@ fn resolve_task_offsets() -> Result<(u32, u32), String> {
         .field_offset(task_id, "tgid")
         .map_err(|e| format!("resolve task_struct.tgid: {e}"))?;
     Ok((real_parent, tgid))
+}
+
+fn resolve_runtime_subject_offsets() -> Result<(u32, u32), String> {
+    let btf = jalki_codegen::btf::BtfData::from_sys_fs().map_err(|e| format!("load BTF: {e}"))?;
+    let task_id = btf
+        .struct_by_name("task_struct")
+        .ok_or_else(|| "struct task_struct not found in BTF".to_string())?;
+    let group_leader = btf
+        .field_offset(task_id, "group_leader")
+        .map_err(|e| format!("resolve task_struct.group_leader: {e}"))?;
+    let start_boottime = btf
+        .field_offset(task_id, "start_boottime")
+        .map_err(|e| format!("resolve task_struct.start_boottime: {e}"))?;
+    Ok((group_leader, start_boottime))
 }
