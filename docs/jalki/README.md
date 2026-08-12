@@ -10,7 +10,12 @@ This directory contains the design documents for Jälki in the new False Systems
 
 ## What Jälki is
 
-Jälki is a runtime/kernel evidence layer. It runs on every node and produces structured evidence of what the kernel and the container runtime are doing — process exec, file open, network connect, TCP retransmit, scheduler latency, block IO — and delivers that evidence to Vartio's source ingress through its native `jalki-vartio-sink`.
+Jälki is a runtime/kernel evidence layer. It produces structured evidence of what the kernel and the container runtime are doing and delivers it to Vartio's source ingress through its native `jalki-vartio-sink`.
+
+Two limits on that sentence, because both were overstated in the May-2026 pass:
+
+- **Coverage is scoped, not total.** Jälki deploys as a DaemonSet, so it observes the nodes its `nodeSelector` and tolerations admit, and — via `JALKI_NAMESPACES` — only the namespaces it is pointed at. "Runs on every node" is a property of a particular deployment, not of Jälki. Our own `false-infra` deployment is arm64-only and scoped to two namespaces; see [`deploy/kubernetes/README.md`](../../deploy/kubernetes/README.md).
+- **The evidence types are the six built-in probes**, which emit `kernel.process.exec`, `kernel.tcp.connect`, `kernel.tcp.close`, `kernel.tcp.retransmit`, `kernel.file.open`, and `kernel.file.open_attempt`. Scheduler-latency and block-IO evidence were named here before either existed; neither ships. The knowledge base carries `sched` entries as runtime-deployable candidates, and has no block-IO layer at all.
 
 Jälki is to **kernel functions** what an OTel collector is to userspace spans, with one critical difference: Jälki does not own a datastore, a dashboard, an alert engine, or a root-cause interpreter. It produces evidence and delivers it to Vartio (which interprets and writes to Ahti).
 

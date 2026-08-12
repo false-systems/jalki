@@ -333,7 +333,8 @@ cd jalki-sdk-python && .venv/bin/pytest tests/ -m "not daemon"
 jälki     kernel observation (this)
 TAPIO     k8s observation
 RAUTA     L7 gateway
-AHTI      causality correlation
+VARTIO    actor attribution — receives jälki's evidence, writes to AHTI
+AHTI      append-first structured datastore
 syva      enforcement
 rauha     container runtime
 ```
