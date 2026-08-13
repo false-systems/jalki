@@ -12,6 +12,7 @@ pub mod event;
 pub mod evidence;
 pub mod normalize;
 pub mod retry;
+pub mod runtime_subject;
 pub mod sink;
 pub mod spool;
 
@@ -28,6 +29,10 @@ pub use normalize::errno_name;
 pub use retry::{
     gap_for_batch, DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff, RetryBackoffConfig,
     RetryBuffer, RetryBufferConfig,
+};
+pub use runtime_subject::{
+    RuntimeSubjectError, RuntimeSubjectV1, RUNTIME_SUBJECT_CANONICALIZATION_VERSION,
+    RUNTIME_SUBJECT_IDENTITY_METHOD,
 };
 pub use sink::{
     AppendResult, Checkpoint, CompositeSink, EvidenceSink, FileSink, HealthStatus, PipelineClient,

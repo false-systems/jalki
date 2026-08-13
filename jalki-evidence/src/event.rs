@@ -123,6 +123,7 @@ impl FileOpenEvent {
 pub struct ProcessExecEvent {
     pub observed_at_ns: u64,
     pub pid: u32,
+    pub tid: u32,
     pub ppid: u32,
     pub uid: u32,
     pub gid: u32,
@@ -131,6 +132,7 @@ pub struct ProcessExecEvent {
     pub comm: String,
     pub filename: String,
     pub argv_hash: [u8; 32],
+    pub leader_start_boottime_ns: u64,
 }
 
 impl ProcessExecEvent {
@@ -139,6 +141,7 @@ impl ProcessExecEvent {
         Ok(Self {
             observed_at_ns: raw.timestamp_ns,
             pid: raw.pid,
+            tid: raw.tid,
             ppid: raw.ppid,
             uid: raw.uid,
             gid: raw.gid,
@@ -147,6 +150,7 @@ impl ProcessExecEvent {
             comm: raw.comm_str().to_string(),
             filename: raw.filename_str().to_string(),
             argv_hash: raw.argv_hash,
+            leader_start_boottime_ns: raw.leader_start_boottime_ns,
         })
     }
 
@@ -475,19 +479,22 @@ mod tests {
             gid: 1000,
             cgroup_id: 99,
             ret: 0,
-            _pad1: 0,
+            tid: 43,
             comm: comm16("true"),
             filename: filename("/bin/true"),
             argv_hash: [0xabu8; 32],
+            leader_start_boottime_ns: 3_000_000_000,
         };
         let ev = ProcessExecEvent::from_bytes(&raw_bytes(&raw)).unwrap();
         assert_eq!(ev.pid, 42);
+        assert_eq!(ev.tid, 43);
         assert_eq!(ev.ppid, 7);
         assert_eq!(ev.uid, 1000);
         assert_eq!(ev.gid, 1000);
         assert_eq!(ev.cgroup_id, 99);
         assert_eq!(ev.filename, "/bin/true");
         assert_eq!(ev.argv_hash, [0xabu8; 32]);
+        assert_eq!(ev.leader_start_boottime_ns, 3_000_000_000);
         assert!(ev.succeeded());
     }
 

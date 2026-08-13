@@ -62,6 +62,17 @@ The mechanism is recorded on the probe metadata and projected into each occurren
 | `service_account` | string | Enrichment |
 | `clock_source` | string | e.g. `CLOCK_BOOTTIME+wall_offset` |
 | `clock_skew_estimate_ms` | i32 | |
+| `host_tgid` / `host_tid` | u32 | Initial host PID namespace identifiers |
+| `leader_start_boottime_ns` | u64 | Thread-group leader `task_struct.start_boottime`; omitted when BTF cannot resolve it |
+| `runtime_subject_id` | string | Domain-separated SHA-256 of RuntimeSubjectV1; present only with a configured stable node identity and boot ID |
+| `node_identity` / `boot_id` | string | Canonical RuntimeSubjectV1 scope |
+| `runtime_identity_method` | string | `task_start_boottime_btf_v1` |
+
+**RuntimeSubjectV1 migration note:** `ProcessExecEvent` grows from 344 to 352
+bytes, replaces the old padding slot with host TID, and appends leader
+`start_boottime`. The eBPF object and userspace daemon must be upgraded together.
+Set `JALKI_NODE_IDENTITY` to a stable tenant-scoped node anchor (Kubernetes Node
+UID preferred); Jälki does not silently treat the mutable hostname as canonical.
 
 **Plane B occurrence type:** `kernel.process.exec` — **implemented** via `tracepoint:sched/sched_process_exec`. Emitted neutral to Polku→Vartio; `ppid` is omitted when unresolved; argv is carried only as `argv_hash`.
 

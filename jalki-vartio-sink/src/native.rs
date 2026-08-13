@@ -45,8 +45,19 @@ const LABEL_KEYS: &[(&str, &str)] = &[
     ("tcp_state", "tcp_state"),
     ("cluster_id", "cluster_id"),
     ("kernel_release", "kernel_release"),
+    ("runtime_subject_id", "runtime_subject_id"),
+    ("node_identity", "node_identity"),
+    ("boot_id", "boot_id"),
+    ("runtime_identity_method", "runtime_identity_method"),
     ("evidence_level", "evidence_level"),
     ("cause", "cause"),
+];
+
+const RUNTIME_U64_KEYS: &[&str] = &[
+    "host_tgid",
+    "host_tid",
+    "leader_start_boottime_ns",
+    "runtime_canonicalization_version",
 ];
 
 /// Gap counts and window bounds are numeric in Vartio's native payload even
@@ -87,6 +98,11 @@ pub fn native_runtime_item(occ: &Occurrence) -> Map<String, Value> {
     }
     for key in GAP_U64_KEYS {
         if let Some(value) = labels.get(*key).and_then(|v| v.parse::<u64>().ok()) {
+            item.insert((*key).into(), json!(value));
+        }
+    }
+    for key in RUNTIME_U64_KEYS {
+        if let Some(value) = labels.get(*key).and_then(|value| value.parse::<u64>().ok()) {
             item.insert((*key).into(), json!(value));
         }
     }
@@ -187,6 +203,17 @@ mod tests {
             ("k8s_container_id", "containerd://abc"),
             ("k8s_namespace", "workloads"),
             ("cgroup_id", "913488225941"),
+            (
+                "runtime_subject_id",
+                "sha256:cc574f4ae29b49d1ff4a9f0df3c162faa73b2375aa5ae73c0fbf2a15e9516a3f",
+            ),
+            ("node_identity", "k8s-node-uid:8f01"),
+            ("boot_id", "550e8400-e29b-41d4-a716-446655440000"),
+            ("runtime_identity_method", "task_start_boottime_btf_v1"),
+            ("host_tgid", "4217"),
+            ("host_tid", "4217"),
+            ("leader_start_boottime_ns", "657653680687218"),
+            ("runtime_canonicalization_version", "1"),
         ] {
             occ.labels.insert(k.into(), v.into());
         }
@@ -231,6 +258,13 @@ mod tests {
         assert_eq!(m["pod_uid"], "pod-uid-1");
         assert_eq!(m["pod_name"], "runner-1");
         assert_eq!(m["container_id"], "containerd://abc");
+        assert_eq!(m["host_tgid"], 4217u64);
+        assert_eq!(m["leader_start_boottime_ns"], 657653680687218u64);
+        assert_eq!(m["node_identity"], "k8s-node-uid:8f01");
+        assert_eq!(
+            m["runtime_subject_id"],
+            "sha256:cc574f4ae29b49d1ff4a9f0df3c162faa73b2375aa5ae73c0fbf2a15e9516a3f"
+        );
         assert_eq!(m["pid"], 4242);
         assert_eq!(m["comm"], "kubectl");
         assert_eq!(m["protocol"], "tcp");

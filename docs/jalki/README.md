@@ -75,6 +75,7 @@ The boundaries are deliberate:
 | [`product-boundaries.md`](./product-boundaries.md) | The does/does-not contract. Read first when in doubt — but note §2.2/§2.3/§2.5 are amended by ADR-0001. |
 | [`ahti-record-mapping.md`](./ahti-record-mapping.md) | How every Jälki concept maps to one of Ahti's eight record kinds, using Ahti's actual field names. |
 | [`runtime-evidence-model.md`](./runtime-evidence-model.md) | Per-evidence-type definitions: process_exec, file_open, network_connect, tcp_retransmit, etc. Source mechanism, required/optional fields, Ahti binding. |
+| [`vartio-runtime-evidence-v1.md`](./vartio-runtime-evidence-v1.md) | Proposed continuous RuntimeSubject, lifecycle, placement, network, collector-integrity, IntervalReceipt, startup-reconciliation, and pidfd-binding contract required by the next Vartio architecture. |
 | [`probe-definitions.md`](./probe-definitions.md) | How Jälki represents probe plan templates, kernel hook references, and sampling policies as Ahti `definition` / `reference` records. Ahti stores; agents execute. |
 | [`local-agent-state.md`](./local-agent-state.md) | What lives on the agent (BPF maps, ring buffers, caches, retry buffer) vs. what reaches the pipeline. Offline buffering, gap representation, time semantics, enrichment. |
 

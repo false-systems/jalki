@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 use false_protocol::{Occurrence, Severity};
 
+use crate::runtime_subject::{RuntimeSubjectV1, RUNTIME_SUBJECT_IDENTITY_METHOD};
+
 /// Version of jälki's emitted-occurrence schema — the cross-team wire contract
 /// with Vartio. Carried on every occurrence as the `schema_version`
 /// label so a real shape change is a negotiated break, not a silent one. New
@@ -46,6 +48,13 @@ pub struct ProducerMetadata {
     pub cluster: String,
     pub node_id: String,
     pub kernel_release: String,
+    /// Stable node anchor, such as Kubernetes Node UID. A node name is not a
+    /// canonical substitute, so this is absent until explicitly configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity: Option<String>,
+    /// Linux boot UUID read from procfs by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 impl ProducerMetadata {
@@ -63,6 +72,8 @@ impl ProducerMetadata {
             cluster: cluster.into(),
             node_id: node_id.into(),
             kernel_release: kernel_release.into(),
+            node_identity: None,
+            boot_id: None,
         }
     }
 }
@@ -265,6 +276,7 @@ impl EvidenceRecord {
     pub fn into_occurrence_with_metadata(self, producer: &ProducerMetadata) -> Occurrence {
         let mut occ = self.occurrence;
         apply_runtime_binding(&mut occ, self.binding.as_ref());
+        apply_runtime_subject(&mut occ, producer);
         let labels = &mut occ.labels;
         labels.insert("producer".into(), producer.producer.clone());
         labels.insert("producer_version".into(), producer.producer_version.clone());
@@ -301,6 +313,50 @@ impl EvidenceRecord {
             .as_str()
             .starts_with("jalki.agent.")
     }
+}
+
+fn apply_runtime_subject(occ: &mut Occurrence, producer: &ProducerMetadata) {
+    if occ
+        .labels
+        .get("runtime_identity_method")
+        .map(String::as_str)
+        != Some(RUNTIME_SUBJECT_IDENTITY_METHOD)
+    {
+        return;
+    }
+    let Some(node_identity) = producer.node_identity.as_deref() else {
+        return;
+    };
+    let Some(boot_id) = producer.boot_id.as_deref() else {
+        return;
+    };
+    let Some(host_tgid) = occ
+        .labels
+        .get("host_tgid")
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return;
+    };
+    let Some(start) = occ
+        .labels
+        .get("leader_start_boottime_ns")
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Ok(subject) = RuntimeSubjectV1::new(node_identity, boot_id, host_tgid, start) else {
+        return;
+    };
+
+    occ.labels
+        .insert("runtime_subject_id".into(), subject.runtime_subject_id);
+    occ.labels
+        .insert("node_identity".into(), subject.node_identity);
+    occ.labels.insert("boot_id".into(), subject.boot_id);
+    occ.labels.insert(
+        "runtime_canonicalization_version".into(),
+        subject.canonicalization_version.to_string(),
+    );
 }
 
 fn apply_runtime_binding(occ: &mut Occurrence, binding: Option<&RuntimeBinding>) {
@@ -523,7 +579,7 @@ impl EvidenceBatch {
 }
 
 fn producer_metadata_bytes(producer: &ProducerMetadata) -> usize {
-    [
+    let fixed = [
         &producer.producer,
         &producer.producer_version,
         &producer.cluster,
@@ -532,7 +588,10 @@ fn producer_metadata_bytes(producer: &ProducerMetadata) -> usize {
     ]
     .into_iter()
     .map(String::capacity)
-    .sum()
+    .sum::<usize>();
+    fixed
+        .saturating_add(producer.node_identity.as_ref().map_or(0, String::capacity))
+        .saturating_add(producer.boot_id.as_ref().map_or(0, String::capacity))
 }
 
 fn record_metadata_bytes(record: &EvidenceRecord) -> usize {
@@ -620,6 +679,40 @@ mod tests {
         assert_eq!(p.cluster, "prod");
         assert_eq!(p.node_id, "node-1");
         assert_eq!(p.kernel_release, "6.17.0");
+        assert_eq!(p.node_identity, None);
+        assert_eq!(p.boot_id, None);
+    }
+
+    #[test]
+    fn projection_mints_runtime_subject_only_from_the_complete_tuple() {
+        let mut producer = ProducerMetadata::new("prod", "node-1", "6.17.0");
+        producer.node_identity = Some("k8s-node-uid:8f01".into());
+        producer.boot_id = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        let mut complete = record(7);
+        for (key, value) in [
+            ("host_tgid", "4217"),
+            ("host_tid", "4217"),
+            ("leader_start_boottime_ns", "657653680687218"),
+            ("runtime_identity_method", RUNTIME_SUBJECT_IDENTITY_METHOD),
+        ] {
+            complete.occurrence.labels.insert(key.into(), value.into());
+        }
+
+        let occurrence = complete.into_occurrence_with_metadata(&producer);
+        assert_eq!(
+            occurrence
+                .labels
+                .get("runtime_subject_id")
+                .map(String::as_str),
+            Some("sha256:cc574f4ae29b49d1ff4a9f0df3c162faa73b2375aa5ae73c0fbf2a15e9516a3f")
+        );
+        assert_eq!(
+            occurrence.labels.get("node_identity").map(String::as_str),
+            Some("k8s-node-uid:8f01")
+        );
+
+        let incomplete = record(7).into_occurrence_with_metadata(&producer);
+        assert!(!incomplete.labels.contains_key("runtime_subject_id"));
     }
 
     #[test]

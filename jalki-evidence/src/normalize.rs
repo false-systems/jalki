@@ -173,6 +173,18 @@ impl ProcessExecEvent {
         occ.labels
             .insert("cgroup_id".into(), self.cgroup_id.to_string());
         occ.labels.insert("gid".into(), self.gid.to_string());
+        occ.labels.insert("host_tgid".into(), self.pid.to_string());
+        occ.labels.insert("host_tid".into(), self.tid.to_string());
+        if self.leader_start_boottime_ns != 0 {
+            occ.labels.insert(
+                "leader_start_boottime_ns".into(),
+                self.leader_start_boottime_ns.to_string(),
+            );
+            occ.labels.insert(
+                "runtime_identity_method".into(),
+                "task_start_boottime_btf_v1".into(),
+            );
+        }
         occ.labels
             .insert("resource_ref_kind".into(), "executable".into());
         occ.labels
@@ -449,6 +461,7 @@ mod tests {
         ProcessExecEvent {
             observed_at_ns: 4,
             pid: 42,
+            tid: 42,
             ppid: 7,
             uid: 1000,
             gid: 1000,
@@ -457,6 +470,7 @@ mod tests {
             comm: "true".into(),
             filename: "/bin/true".into(),
             argv_hash: [0xabu8; 32],
+            leader_start_boottime_ns: 3_000_000_000,
         }
     }
 
@@ -490,6 +504,13 @@ mod tests {
         assert_eq!(
             occ.labels.get("argv_hash"),
             Some(&format!("sha256:{}", "ab".repeat(32)))
+        );
+        assert_eq!(occ.labels.get("host_tgid").map(String::as_str), Some("42"));
+        assert_eq!(
+            occ.labels
+                .get("leader_start_boottime_ns")
+                .map(String::as_str),
+            Some("3000000000")
         );
         assert_eq!(
             occ.labels.get("resource_ref_kind"),
