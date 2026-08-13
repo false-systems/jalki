@@ -12,8 +12,14 @@ FROM rust:1.97-bookworm AS builder
 # xtask invokes `cargo +nightly` for the eBPF build; rust-src is required for
 # build-std against the bpfel-unknown-none target, and bpf-linker does the
 # final BPF link (installed before COPY so the layer caches).
+# bpf-linker is PINNED: 0.11.0 (released 2026-08-12) requires system LLVM via
+# llvm-config, which this stage does not carry, and the unpinned install broke
+# every Container build within a day of the release — main and all branches at
+# once. Same lesson as the runner-version incident: an unpinned tool in the
+# build path is a time bomb someone else detonates. Bump deliberately, with
+# the LLVM story decided, not by drift.
 RUN rustup toolchain install nightly --component rust-src \
-    && cargo install bpf-linker --locked
+    && cargo install bpf-linker@0.10.4 --locked
 
 WORKDIR /build
 COPY . .
