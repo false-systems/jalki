@@ -45,6 +45,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # One boot-time `get nodes/<own-name>` resolves the Kubernetes Node UID as
+  # the RuntimeSubjectV1 node anchor (jalki#82) — the downward API cannot
+  # expose the UID. Read-only, one object, once per process. Without this
+  # verb the agent logs a warning and runs with RuntimeSubject identity
+  # disabled; nothing else degrades.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

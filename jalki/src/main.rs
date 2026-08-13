@@ -257,6 +257,36 @@ async fn configure_k8s_enrichment(mut runtime: Runtime, cli: &Cli) -> Result<Run
     let client = kube::Client::try_default()
         .await
         .context("failed to create Kubernetes client for jalki pod enrichment")?;
+
+    // RuntimeSubjectV1 node anchor (jalki#82): the contract wants the
+    // Kubernetes Node UID and the downward API cannot provide it, so resolve
+    // it here — one `get nodes/<name>` at boot, cached for the process
+    // lifetime (a running kubelet's Node UID cannot change). An explicit
+    // JALKI_NODE_IDENTITY still wins; any failure (missing `nodes: get` RBAC
+    // included) degrades to the existing disabled-with-a-warning state and
+    // never blocks enrichment or capture.
+    if std::env::var("JALKI_NODE_IDENTITY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        let nodes: kube::Api<k8s_openapi::api::core::v1::Node> = kube::Api::all(client.clone());
+        match nodes.get(&node_name).await {
+            Ok(node) => match node.metadata.uid.filter(|uid| !uid.is_empty()) {
+                Some(uid) => {
+                    let identity = format!("k8s-node-uid:{uid}");
+                    tracing::info!(node = %node_name, %identity,
+                        "resolved RuntimeSubjectV1 node identity from Kubernetes Node UID");
+                    runtime = runtime.with_node_identity(identity);
+                }
+                None => tracing::warn!(node = %node_name,
+                    "Kubernetes Node has no UID; RuntimeSubjectV1 stays disabled"),
+            },
+            Err(err) => tracing::warn!(error = %err, node = %node_name,
+                "could not read Kubernetes Node for identity (missing `nodes: get` RBAC?); RuntimeSubjectV1 stays disabled"),
+        }
+    }
+
     tokio::spawn(async move {
         if let Err(err) = kube_watch::run_pod_binding_watcher(client, node_name, cache).await {
             tracing::error!(error = %err, "Kubernetes pod binding watcher stopped");
