@@ -46,6 +46,11 @@ pub struct Runtime {
     /// evidence. Applies to the evidence-sink path only; the local CLI/IPC
     /// query surface still sees everything.
     namespace_allowlist: Option<HashSet<String>>,
+    /// Stable node anchor for RuntimeSubjectV1, resolved by the caller (e.g.
+    /// the Kubernetes Node UID via the enrichment client, jalki#82). Takes
+    /// precedence over `JALKI_NODE_IDENTITY`; when both are absent,
+    /// RuntimeSubject identity stays disabled per the incomplete-tuple rule.
+    node_identity: Option<String>,
 }
 
 impl Runtime {
@@ -61,7 +66,15 @@ impl Runtime {
             enricher: Arc::new(NoopEnricher),
             sensitive_paths: sensitive_paths::default_sensitive_paths(),
             namespace_allowlist: None,
+            node_identity: None,
         }
+    }
+
+    /// Provide the stable node anchor for RuntimeSubjectV1 (jalki#82). Wins
+    /// over `JALKI_NODE_IDENTITY`.
+    pub fn with_node_identity(mut self, identity: impl Into<String>) -> Self {
+        self.node_identity = Some(identity.into());
+        self
     }
 
     pub fn cluster(mut self, cluster: impl Into<String>) -> Self {
@@ -132,7 +145,7 @@ impl Runtime {
         let btf_data = jalki_codegen::btf::BtfData::from_sys_fs()
             .context("failed to parse BTF for codegen")?;
 
-        let producer = producer_metadata(&self.cluster);
+        let producer = producer_metadata(&self.cluster, self.node_identity.as_deref());
         let sensitive_path_matcher = Arc::new(sensitive_paths::SensitivePathMatcher::new(
             self.sensitive_paths.clone(),
         ));
@@ -543,7 +556,7 @@ impl DaemonHandle {
     }
 }
 
-fn producer_metadata(cluster: &str) -> ProducerMetadata {
+fn producer_metadata(cluster: &str, node_identity: Option<&str>) -> ProducerMetadata {
     let node_id = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -552,8 +565,11 @@ fn producer_metadata(cluster: &str) -> ProducerMetadata {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
     let mut producer = ProducerMetadata::new(cluster, node_id, kernel_release);
-    producer.node_identity = std::env::var("JALKI_NODE_IDENTITY")
-        .ok()
+    // Resolved identity (jalki#82, e.g. Kubernetes Node UID) wins over the
+    // operator-supplied env var; both absent leaves RuntimeSubjectV1 off.
+    producer.node_identity = node_identity
+        .map(str::to_owned)
+        .or_else(|| std::env::var("JALKI_NODE_IDENTITY").ok())
         .filter(|value| !value.is_empty());
     producer.boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
