@@ -41,34 +41,66 @@ pub fn load_and_attach(
 
     let btf = Btf::from_sys_fs().context("failed to load BTF from /sys/kernel/btf/vmlinux")?;
 
-    // Attach each probe based on its metadata.
+    // Attach each probe based on its metadata. PER-PROBE fault tolerance:
+    // a probe that fails to load or attach is skipped with the full error,
+    // never fatal to the daemon. The first external deployment (an amd64 VM,
+    // 2026-08-15) proved why: its kernel's verifier rejected the
+    // security_file_open program over a helper type-signature difference
+    // ("R1 is of type file but path is expected"), and one unverifiable
+    // probe took down all six — on a customer kernel we do not control.
+    // Degrading per-probe is also what the runtime-evidence contract
+    // requires (vartio-runtime-evidence-v1.md §5 collector_integrity:
+    // capability state is a reported fact, not a startup precondition).
+    // Only zero attached probes is fatal — a collector observing nothing
+    // has no reason to run.
     let mut attached = 0;
+    let mut skipped: Vec<&str> = Vec::new();
     for probe in probes {
         let prog_name = probe.program_name();
+        let mut probe_ok = true;
         for attachment in probe.attachments() {
-            match attachment {
+            let result = match attachment {
                 Attachment::Fentry { function } => {
                     attach_fentry(&mut ebpf, prog_name, function, &btf)
-                        .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
                 }
                 Attachment::Fexit { function } => {
                     attach_fexit(&mut ebpf, prog_name, function, &btf)
-                        .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
                 }
                 Attachment::Tracepoint {
                     program,
                     category,
                     name,
-                } => {
-                    attach_tracepoint(&mut ebpf, program, category, name)
-                        .with_context(|| format!("probe '{}' failed to attach", probe.name()))?;
+                } => attach_tracepoint(&mut ebpf, program, category, name),
+            };
+            match result {
+                Ok(()) => attached += 1,
+                Err(e) => {
+                    probe_ok = false;
+                    warn!(
+                        probe = probe.name(),
+                        error = format!("{e:#}"),
+                        "probe failed to load/attach on this kernel; continuing without it — its evidence type will be ABSENT, which downstream must treat as no-coverage, not no-events"
+                    );
                 }
             }
-            attached += 1;
+        }
+        if !probe_ok {
+            skipped.push(probe.name());
         }
     }
 
-    info!(count = attached, "all probes attached");
+    if attached == 0 {
+        anyhow::bail!("no probe could attach on this kernel — refusing to run a collector that observes nothing");
+    }
+    if skipped.is_empty() {
+        info!(count = attached, "all probes attached");
+    } else {
+        warn!(
+            count = attached,
+            skipped = skipped.join(","),
+            "started DEGRADED: some probes are not attached on this kernel"
+        );
+    }
     Ok(ebpf)
 }
 
