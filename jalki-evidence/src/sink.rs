@@ -393,6 +393,17 @@ impl EvidenceSink for FileSink {
                 message: e.to_string(),
             })?;
 
+        // tokio's File buffers internally and its docs are explicit: dropping
+        // without flush may DISCARD buffered data and swallow the error. For
+        // an evidence sink that means acking a batch that never reached the
+        // OS — accepted-but-lost, the one outcome worse than rejection. The
+        // CI flake in file_sink_writes_valid_ndjson (read-after-append seeing
+        // zero lines, twice) was this bug reporting itself, not test noise.
+        file.flush().await.map_err(|e| SinkError::Unavailable {
+            sink: self.path.display().to_string(),
+            message: e.to_string(),
+        })?;
+
         Ok(AppendResult::accepted(self.name(), count))
     }
 
