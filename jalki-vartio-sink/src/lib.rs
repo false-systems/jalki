@@ -182,13 +182,27 @@ impl VartioSink {
     #[allow(clippy::unused_async)]
     pub async fn connect(cfg: VartioSinkConfig) -> Result<Self, SinkError> {
         cfg.validate()?;
-        let channel = Endpoint::try_from(cfg.endpoint.clone())
+        let mut endpoint = Endpoint::try_from(cfg.endpoint.clone())
             .map_err(|e| SinkError::Misconfigured {
                 sink: SINK_NAME.to_string(),
                 message: format!("invalid endpoint {}: {e}", cfg.endpoint),
             })?
-            .timeout(cfg.timeout)
-            .connect_lazy();
+            .timeout(cfg.timeout);
+        // An `https://` endpoint gets TLS with the platform trust store —
+        // required the moment a producer lives outside Vartio's cluster
+        // (first case: the i-tutor VM), where plaintext h2c across the
+        // internet would make the bearer token public. Explicit rather than
+        // feature-implied so an `http://` in-cluster endpoint stays exactly
+        // the plaintext path it always was.
+        if cfg.endpoint.starts_with("https://") {
+            endpoint = endpoint
+                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+                .map_err(|e| SinkError::Misconfigured {
+                    sink: SINK_NAME.to_string(),
+                    message: format!("TLS config for {}: {e}", cfg.endpoint),
+                })?;
+        }
+        let channel = endpoint.connect_lazy();
         Ok(Self {
             client: SourceIngressClient::new(channel),
             cfg,
