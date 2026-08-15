@@ -15,7 +15,11 @@ false-protocol = { workspace = true }
 
 # gRPC stack — pinned to the combination the vendored codegen was generated and
 # tested with (0.14.6 raises MSRV).
-tonic = { version = "=0.14.5", features = ["transport"] }
+# tls-ring: rustls with the ring provider — the daemon already installs ring
+# as the process-default crypto provider (see jalki main.rs). native-roots so
+# an https:// endpoint validates against the platform trust store (Let's
+# Encrypt certs included) with no bundled CA file.
+tonic = { version = "=0.14.5", features = ["transport", "tls-ring", "tls-native-roots"] }
 tonic-prost = "=0.14.5"
 prost = "0.14"
 prost-types = "0.14"
