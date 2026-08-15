@@ -22,7 +22,7 @@ by `CHANGE-ME`. It is **checked against the live spec in CI** — see
 | value | why |
 | --- | --- |
 | `JALKI_CLUSTER` | producer identity on every record |
-| `JALKI_VARTIO_ENDPOINT` | where evidence is delivered |
+| `JALKI_VARTIO_ENDPOINT` | where evidence is delivered. `http://` is for a Vartio in the SAME cluster; a remote Vartio must be `https://` — the sink then does TLS against the platform trust store (public CAs work; a bearer token over cleartext across a network you don't own is a published token) |
 | `JALKI_NAMESPACES` | **scope this deliberately** — unscoped is the whole-node kernel firehose |
 | `jalki-vartio-token` Secret | bearer token for the sink |
 | `nodeSelector` | images are published for arm64 and amd64 |
@@ -61,13 +61,26 @@ to know what is actually armed — faster and more reliable than reading the
 manifest back:
 
 ```
+resolved RuntimeSubjectV1 node identity from Kubernetes Node UID identity=k8s-node-uid:...
 backlog spool armed: buffered evidence survives a restart path=... existing_bytes=0
 self-shedding armed: ... limit_bytes=1073741824 source=Cgroup("/sys/fs/cgroup/...")
 observability server listening on :9090 (/metrics, /healthz, /readyz)
 ```
 
 If you see `backlog spool OFF (set JALKI_SPOOL_PATH)` or `self-shedding OFF`,
-the agent is running without the protection you think you configured.
+the agent is running without the protection you think you configured. If the
+identity line is a warning instead (`RuntimeSubjectV1 disabled`), process
+identity is off — usually the `nodes: get` RBAC in this manifest was removed.
+
+**A `started DEGRADED` warning is honest, not broken.** Kernels differ, and a
+probe the eBPF verifier rejects on YOUR kernel is skipped rather than fatal
+(the daemon refuses to start only when NO probe attaches). The warning names
+the skipped probes; their evidence types are then **absent — which downstream
+must read as no-coverage, never as nothing-happened**. Known case: stock
+Ubuntu-class kernels reject `security_file_open` (jalki#87), so file evidence
+is unavailable there today. There is no metric for the degraded state yet —
+check the startup log line until there is; the first real deployment outside
+our own clusters started exactly this way, by design.
 
 The three HTTP paths answer differently, and that is worth checking once:
 
