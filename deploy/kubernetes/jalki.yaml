@@ -33,8 +33,8 @@ metadata:
 # dropped at the source, so for any pipeline that consumes attributed evidence
 # this is not optional.
 #
-# This is the whole of jälki's Kubernetes API surface: read-only, pods only, no
-# writes, no secrets, no other kinds.
+# This is the whole of jälki's Kubernetes API surface: read-only pods plus one
+# node lookup for the immutable RuntimeSubjectV1 anchor; no writes or secrets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
