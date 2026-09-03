@@ -36,10 +36,13 @@ jobs:
     # `aya` does not build on macOS, so `jalki`, `jalki-codegen` and `jalki-mcp`
     # simply cannot be checked anywhere else.
     #
-    # jälki is a PUBLIC repo, so this follows the same trust boundary as
-    # container.yml: pull_request runs fork-controlled code and must never
-    # reach our self-hosted pool. GitHub-hosted arm64 is free for public repos.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'arc-arm64' }}
+    # GitHub-hosted arm64, free for public repos. This used to split by event
+    # — hosted for fork-controlled pull_request code, the org's self-hosted
+    # pool for reviewed pushes — but the arc pools are being retired with the
+    # false-infra cluster. Everything hosted means no fork code can reach our
+    # infra by construction, rather than by a conditional that has to stay
+    # right.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
