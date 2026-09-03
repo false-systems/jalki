@@ -49,20 +49,17 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            hosted: ubuntu-24.04-arm
-            selfhosted: arc-arm64
+            runner: ubuntu-24.04-arm
           - arch: amd64
-            hosted: ubuntu-24.04
-            selfhosted: arc-amd64
-    # jälki is a PUBLIC repo, so the runner follows the trust boundary of the
-    # triggering event: pull_request runs code that anyone (incl. forks)
-    # controls and must never reach our infra — those builds stay on
-    # GitHub-hosted runners, free for public repos. push to main/tags and
-    # workflow_dispatch only run reviewed code, so they build natively on the
-    # org's self-hosted pools (dind available). The eBPF object
-    # (bpfel-unknown-none) is arch-independent bytecode; the daemon binary is
-    # per-arch, built natively on each pool — no qemu, no cross.
-    runs-on: ${{ github.event_name == 'pull_request' && matrix.hosted || matrix.selfhosted }}
+            runner: ubuntu-24.04
+    # Every build is GitHub-hosted now, on both arches — the arc pools retire
+    # with the false-infra cluster. This drops the event-based split that kept
+    # fork-controlled pull_request code off our infra: with nothing self-hosted
+    # left, that property holds by construction instead of by conditional.
+    # Native per-arch runners are still the point — the eBPF object
+    # (bpfel-unknown-none) is arch-independent bytecode, but the daemon binary
+    # is per-arch and builds natively on each runner. No qemu, no cross.
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -100,7 +97,7 @@ jobs:
     name: Merge manifest (+ publish tags)
     if: ${{ github.event_name != 'pull_request' }}
     needs: build
-    runs-on: arc-arm64
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
