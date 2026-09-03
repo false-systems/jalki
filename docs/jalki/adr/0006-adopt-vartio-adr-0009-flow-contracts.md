@@ -1,6 +1,6 @@
 # ADR 0006 — Adopt vartio ADR-0009 cross-service flow contracts
 
-**Status:** accepted, 2026-07-31. `false-systems/vartio#245` merged at
+**Status:** accepted, 2026-07-31. `false-systems/vartio-ketju#245` merged at
 14:51Z, and the merged text is byte-identical to the draft this was written
 against (`eafcb68`) — checked rather than assumed, because this document said
 to re-check if it was reworded before landing.
