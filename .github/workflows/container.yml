@@ -149,5 +149,23 @@ jobs:
               ;;
           esac
 
+          # Read-back, not a gate. Every `imagetools create` above has already
+          # reported DONE — that is the authoritative publish. GHCR is
+          # read-after-write eventual, so an inspect issued immediately can 404
+          # a manifest that is genuinely there; on the old self-hosted pool the
+          # slower round trip to ghcr.io hid the race, and the first hosted run
+          # surfaced it (run 33800656217: both manifests pushed, the inspect
+          # 404'd, the job went red having published correctly).
+          #
+          # So: retry, and if it still cannot be read, warn. Failing here would
+          # report a publish failure that did not happen, which is worse than a
+          # missing summary — the create is what publishes, this only shows it.
           echo "── published manifests ──"
-          docker buildx imagetools inspect "${IMAGE}:sha-${short}" | head -20
+          for attempt in 1 2 3 4 5; do
+            if docker buildx imagetools inspect "${IMAGE}:sha-${short}"; then
+              exit 0
+            fi
+            echo "::debug::inspect attempt ${attempt} did not resolve ${IMAGE}:sha-${short}; retrying"
+            sleep "$(( attempt * 2 ))"
+          done
+          echo "::warning::published ${IMAGE}:sha-${short} but could not read it back after 5 attempts (GHCR read-after-write); the manifests above were created successfully"
