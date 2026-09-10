@@ -49,7 +49,7 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: arc-arm64
           - arch: amd64
             runner: ubuntu-24.04
     # Every build is GitHub-hosted now, on both arches — the arc pools retire
@@ -97,7 +97,7 @@ jobs:
     name: Merge manifest (+ publish tags)
     if: ${{ github.event_name != 'pull_request' }}
     needs: build
-    runs-on: ubuntu-24.04-arm
+    runs-on: arc-arm64
     steps:
       - uses: actions/checkout@v4
 
