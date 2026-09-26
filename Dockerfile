@@ -64,7 +64,7 @@ COPY --from=bpf-linker /usr/local/cargo/bin/bpf-linker /usr/local/cargo/bin/bpf-
 # install` with no argument installs what that file names, so the image and a
 # laptop use the same nightly. Only this layer reruns when the date moves.
 # --no-self-update: otherwise rustup replaces itself with whatever release is
-# current (1.29.0 in the base became 1.29.1 in a local build on 2026-09-26).
+# current (in a local build on 2026-09-26, 1.29.0 became 1.29.1).
 COPY jalki-ebpf/rust-toolchain.toml /opt/ebpf-toolchain/rust-toolchain.toml
 RUN cd /opt/ebpf-toolchain && rustup toolchain install --no-self-update
 # Only xtask's own dependencies are cooked here (debug, as `cargo run` builds
@@ -72,9 +72,18 @@ RUN cd /opt/ebpf-toolchain && rustup toolchain install --no-self-update
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --locked --recipe-path recipe.json -p xtask
 COPY xtask xtask
+RUN cargo build --locked -p xtask
+# xtask is built against cargo-chef's skeleton, where the workspace version
+# is masked to 0.0.1. jalki-common inherits its version from the root
+# manifest, so the eBPF build (which does not pass --locked) would re-lock it
+# to 0.0.1 in jalki-ebpf/Cargo.lock. The real root manifest goes in after the
+# xtask build and before the eBPF one: a `cargo run --locked` against it
+# fails, because the skeleton's member manifests carry masked versions too.
+# Running the built binary is what `cargo run -p xtask -- build-ebpf` runs.
+COPY Cargo.toml Cargo.toml
 COPY jalki-common jalki-common
 COPY jalki-ebpf jalki-ebpf
-RUN cargo run --locked -p xtask -- build-ebpf --release
+RUN ./target/debug/xtask build-ebpf --release
 
 # ── builder: userspace binaries ────────────────────────────────────────────
 FROM chef AS builder
