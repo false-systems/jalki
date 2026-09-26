@@ -74,6 +74,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build date
+        id: date
+        # org.opencontainers.image.created, which stayed "unknown" before.
+        run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build (+ push per-arch tag on main/tags)
         uses: docker/build-push-action@v6
         with:
@@ -90,8 +95,15 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.date.outputs.build_date }}
+          # Every build reads main's cache; only main writes it. GitHub scopes
+          # caches by ref, so a PR or tag export could only ever be read by
+          # later runs of that same ref. It still cost the export (103 s of a
+          # 4.8 min arm64 job, run 33882620393) and counted toward the repo's
+          # 10 GiB cache cap, where it can evict main's entries. An empty
+          # cache-to exports nothing.
           cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}', matrix.arch) || '' }}
 
   merge:
     name: Merge manifest (+ publish tags)
