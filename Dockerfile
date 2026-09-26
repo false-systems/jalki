@@ -21,8 +21,12 @@
 #   builder     cooks the dependencies from the recipe, then builds the
 #               workspace crates. A code-only change reuses the cooked layer
 #               and recompiles only the workspace crates. The nightly and
-#               bpf-linker are not in its layers, so a CI build that only
-#               needs this stage does not import them from the cache.
+#               bpf-linker are not in its layers.
+#   ebpf-object only the eBPF object, in one small layer. The runtime copies
+#               from here, not from ebpf: a COPY --from=ebpf needs the whole
+#               ebpf filesystem, so a code-only CI build would download the
+#               nightly and the eBPF target dir from the cache just to take
+#               one 20 KB file out of them.
 #   runtime     distroless cc, nonroot.
 #
 # Bases are pinned by digest; Dependabot (.github/dependabot.yml) proposes
@@ -82,13 +86,17 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json \
 COPY . .
 RUN cargo build --release --locked -p jalki -p jalki-mcp -p jalki-sdk-meta
 
+# ── ebpf-object: the eBPF object alone (see the header) ─────────────────────
+FROM scratch AS ebpf-object
+COPY --from=ebpf /build/jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf /jalki-ebpf
+
 # ── runtime: minimal image ─────────────────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 COPY --from=builder /build/target/release/jalki /usr/local/bin/jalki
 COPY --from=builder /build/target/release/jalki-mcp /usr/local/bin/jalki-mcp
 COPY --from=builder /build/target/release/jalki-sdk-codegen /usr/local/bin/jalki-sdk-codegen
-COPY --from=ebpf /build/jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf /usr/local/share/jalki/jalki-ebpf
+COPY --from=ebpf-object /jalki-ebpf /usr/local/share/jalki/jalki-ebpf
 
 # eBPF requires root + CAP_BPF/CAP_PERFMON at runtime; the "nonroot" base is
 # overridden at deploy time via the DaemonSet/Helm securityContext.
