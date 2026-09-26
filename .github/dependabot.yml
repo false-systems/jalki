@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Base images in the Dockerfile are pinned by digest; this proposes the
+  # refreshes (distroless security rebuilds, mostly) as one grouped weekly PR.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: friday
+      time: "03:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 1
+    ignore:
+      # The Rust version is pinned on purpose: 1.97.1, the fix release for
+      # the 1.97.0 x86_64 miscompile (rust-lang/rust#159035). Move the
+      # builder tag deliberately, not by drift; same-tag digest refreshes
+      # stay eligible.
+      - dependency-name: "rust"
+        versions: ["> 1.97.1"]
+    groups:
+      docker-images:
+        patterns: ["*"]

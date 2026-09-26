@@ -69,7 +69,8 @@ kernel fn returns → #[fexit]/#[fentry] eBPF program (jalki-ebpf)
 **Build order matters.** Always build eBPF first. Userspace will compile without it, but the daemon fails at runtime with a missing eBPF object.
 
 ```bash
-# 1. eBPF first — always (requires nightly + Linux)
+# 1. eBPF first — always (requires Linux; rustup installs the dated nightly
+#    pinned in jalki-ebpf/rust-toolchain.toml on first use)
 cargo run -p xtask -- build-ebpf [--release]
 
 # 2. Userspace daemon (requires Linux — aya doesn't compile on macOS)
@@ -133,7 +134,7 @@ cargo test --manifest-path eval/oracle/Cargo.toml  # oracle contract tests
 
 ### jalki-ebpf
 
-- Separate build target: `bpfel-unknown-none`, requires nightly Rust
+- Separate build target: `bpfel-unknown-none`, requires nightly Rust, pinned to a date in `jalki-ebpf/rust-toolchain.toml` (bpf-linker loads that nightly's LLVM, so move the date deliberately)
 - NOT in the workspace Cargo.toml — has its own
 - Build with: `cargo run -p xtask -- build-ebpf [--release]`
 - Nine programs: `fexit/tcp_connect`, `fexit/tcp_close`, `fentry/tcp_retransmit_skb`, `fexit/security_file_open`, `tracepoint/sched_process_exec`, and the four `sys_{enter,exit}_openat{,2}` tracepoints feeding the open-attempt pair

@@ -39,13 +39,16 @@ fn build_ebpf(release: bool) -> Result<()> {
         );
     }
 
+    // No `+toolchain` argument: jalki-ebpf/rust-toolchain.toml names the dated
+    // nightly, and rustup reads it from the working directory. RUSTUP_TOOLCHAIN
+    // has to go, because `cargo run` sets it to the stable toolchain that runs
+    // xtask, and it would win over the file.
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&ebpf_dir)
         .env_remove("RUSTUP_TOOLCHAIN")
         // Disable UB checks — alignment panic intrinsics cause BPF verifier rejection.
         .env("RUSTFLAGS", "-Zub-checks=no")
         .args([
-            "+nightly",
             "build",
             "--target",
             "bpfel-unknown-none",

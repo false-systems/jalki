@@ -1,0 +1,14 @@
+# The eBPF crate needs nightly (build-std=core for bpfel-unknown-none).
+#
+# PINNED to a date. The Dockerfile used to run an unpinned
+# `rustup toolchain install nightly`, so each image got whatever nightly was
+# current when its cached layer was first built, and the arm64 and amd64
+# images could carry different compilers. The nightly also brings the LLVM
+# that bpf-linker 0.10.4 loads at link time, so a nightly bump can break the
+# eBPF link. Move this date on purpose and check the eBPF build when you do.
+#
+# One file for every build: xtask runs cargo in this directory without a
+# `+toolchain`, so rustup picks this up here, in the image and on a laptop.
+[toolchain]
+channel = "nightly-2026-09-25"
+components = ["rust-src"]
