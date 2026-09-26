@@ -6,7 +6,10 @@
 #   docker build -t ghcr.io/false-systems/jalki .
 #
 # Stages:
-#   rust-base   the pinned stable toolchain (1.97.0) every stage starts from.
+#   rust-base   the pinned stable toolchain (1.97.1) every stage starts from.
+#               Not 1.97.0: that release miscompiles on x86_64
+#               (rust-lang/rust#159035, fixed in 1.97.1), and the amd64
+#               binaries this image ships are built with it.
 #   chef        adds cargo-chef.
 #   bpf-linker  compiles bpf-linker, in parallel with chef; only its binary
 #               is used.
@@ -24,7 +27,7 @@
 #
 # Bases are pinned by digest; Dependabot (.github/dependabot.yml) proposes
 # digest refreshes.
-FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS rust-base
+FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS rust-base
 
 # ── chef ───────────────────────────────────────────────────────────────────
 FROM rust-base AS chef

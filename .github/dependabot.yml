@@ -11,11 +11,12 @@ updates:
       timezone: "Europe/Berlin"
     open-pull-requests-limit: 1
     ignore:
-      # The Rust version is pinned on purpose: 1.97.0 across the org. Move
-      # the builder tag with that decision, not by drift; same-tag digest
-      # refreshes stay eligible.
+      # The Rust version is pinned on purpose: 1.97.1, the fix release for
+      # the 1.97.0 x86_64 miscompile (rust-lang/rust#159035). Move the
+      # builder tag deliberately, not by drift; same-tag digest refreshes
+      # stay eligible.
       - dependency-name: "rust"
-        versions: ["> 1.97.0"]
+        versions: ["> 1.97.1"]
     groups:
       docker-images:
         patterns: ["*"]
