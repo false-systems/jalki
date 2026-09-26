@@ -7,17 +7,18 @@
 #
 # Stages:
 #   rust-base   the pinned stable toolchain (1.97.1) every stage starts from.
-#               Not 1.97.0: that release miscompiles on x86_64
-#               (rust-lang/rust#159035, fixed in 1.97.1), and the amd64
-#               binaries this image ships are built with it.
+#               Not 1.97.0: it has a P-critical x86_64 miscompile
+#               (rust-lang/rust#159035) that 1.97.1 was released to fix, and
+#               the amd64 binaries this image ships are built with it.
 #   chef        adds cargo-chef.
 #   bpf-linker  compiles bpf-linker, in parallel with chef; only its binary
 #               is used.
 #   planner     reduces the workspace to recipe.json (manifests + Cargo.lock).
 #   ebpf        the dated nightly from jalki-ebpf/rust-toolchain.toml plus
-#               bpf-linker, then the eBPF object from xtask/, jalki-common/
-#               and jalki-ebpf/ only. A userspace-only change does not rebuild
-#               it, and BuildKit runs it in parallel with the builder.
+#               bpf-linker, then the eBPF object from xtask/, jalki-common/,
+#               jalki-ebpf/ and the root Cargo.toml only. A userspace-only
+#               change does not rebuild it, and BuildKit runs it in parallel
+#               with the builder.
 #   builder     cooks the dependencies from the recipe, then builds the
 #               workspace crates. A code-only change reuses the cooked layer
 #               and recompiles only the workspace crates. The nightly and
