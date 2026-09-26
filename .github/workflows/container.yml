@@ -77,7 +77,12 @@ jobs:
       - name: Build date
         id: date
         # org.opencontainers.image.created, which stayed "unknown" before.
-        run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        # The commit time of the checked-out commit, not the clock: each arch
+        # job runs this step on its own, and the clock would give the two
+        # per-arch images of one commit different dates (a re-run would too).
+        # The commit time is the same in both jobs and on every re-run, the
+        # usual SOURCE_DATE_EPOCH convention.
+        run: echo "build_date=$(TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Build (+ push per-arch tag on main/tags)
         uses: docker/build-push-action@v6
