@@ -7,9 +7,10 @@
 # the Container workflow is path-filtered to Dockerfile/Cargo/jalki-ebpf, so a
 # source-only PR runs nothing (false-systems/vartio#254).
 #
-# Uses the same rust image as the Dockerfile builder so the toolchain matches
-# what ships. The cargo registry and target dir are cached in named volumes, so
-# the first run is slow and later ones are not.
+# Uses the same builder image as the Dockerfile (rust-builder, Rust 1.97.1,
+# with rustfmt and clippy) so the toolchain matches what ships. The cargo
+# registry and target dir are cached in named volumes, so the first run is
+# slow and later ones are not.
 #
 #   scripts/linux-test.sh                  # whole workspace
 #   scripts/linux-test.sh -p jalki         # one crate
@@ -18,7 +19,15 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${JALKI_TEST_IMAGE:-rust:1.97-bookworm}"
+# The default is read from the Dockerfile's chef stage (tag and digest), so a
+# Dependabot digest refresh there moves this script too; Dependabot does not
+# scan shell scripts.
+IMAGE="${JALKI_TEST_IMAGE:-$(sed -n 's/^FROM \(ghcr\.io\/false-systems\/rust-builder:[0-9.]*@sha256:[0-9a-f]*\) AS chef$/\1/p' "$REPO/Dockerfile")}"
+if [ -z "$IMAGE" ]; then
+  echo "error: no 'FROM ghcr.io/false-systems/rust-builder:<version>@sha256:<digest> AS chef'" >&2
+  echo "       line in $REPO/Dockerfile; set JALKI_TEST_IMAGE to choose an image." >&2
+  exit 1
+fi
 
 CMD="${JALKI_CARGO_CMD:-test}"
 

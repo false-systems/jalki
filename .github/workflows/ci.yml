@@ -46,6 +46,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The image builds with the Rust in the Dockerfile's rust-builder tags;
+      # CI and a laptop build with rust-toolchain.toml's channel. The two must
+      # name the same Rust and move in one PR. A Dependabot tag bump, or a
+      # toml edit without the Dockerfile, fails here in seconds, before the
+      # image build (where RUSTUP_AUTO_INSTALL=0 also stops it, minutes later).
+      - name: Builder image matches rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "::error file=rust-toolchain.toml::no channel line found"
+            exit 1
+          fi
+          tags="$(sed -n 's/^FROM ghcr\.io\/false-systems\/rust-builder:\([^@ ]*\)@.*/\1/p' Dockerfile)"
+          if [ -z "$tags" ]; then
+            echo "::error file=Dockerfile::no digest-pinned FROM ghcr.io/false-systems/rust-builder line found"
+            exit 1
+          fi
+          bad=0
+          for tag in $tags; do
+            case "$tag" in
+              "$channel" | "$channel-ebpf") echo "ok: rust-builder:$tag" ;;
+              *)
+                echo "::error file=Dockerfile::FROM rust-builder:$tag does not match rust-toolchain.toml channel $channel; move both in one PR"
+                bad=1
+                ;;
+            esac
+          done
+          exit "$bad"
+
       - name: Toolchain
         run: |
           # GitHub-hosted PR runners include these; the stock ARC image does not.
@@ -58,8 +88,10 @@ jobs:
             export PATH="$HOME/.cargo/bin:$PATH"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
+          # No argument: installs what rust-toolchain.toml names (1.97.1 with
+          # rustfmt and clippy), the same version the image builds with.
+          rustup toolchain install --no-self-update
+          rustc --version
 
       - uses: Swatinem/rust-cache@v2
 

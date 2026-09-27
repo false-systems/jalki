@@ -27,6 +27,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "*/Cargo.toml"
+      - "rust-toolchain.toml"
       - "jalki-ebpf/**"
       - ".github/workflows/container.yml"
   workflow_dispatch:
@@ -109,6 +110,62 @@ jobs:
           # cache-to exports nothing.
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}', matrix.arch) || '' }}
+
+      - name: Smoke-run the binaries in the runtime image (PRs)
+        # The builders are Debian trixie, so the runtime must be trixie too:
+        # a binary linked against a newer glibc than the runtime's does not
+        # start. The Dockerfile pins both sides; this proves the pair, on this
+        # arch, before merge. PR builds are the ones loaded into docker.
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          IMG: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMG" --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/jalki-sdk-codegen "$IMG" --help >/dev/null
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' |
+            docker run --rm -i --entrypoint /usr/local/bin/jalki-mcp "$IMG" |
+            grep -q '"id":1'
+          echo "jalki, jalki-sdk-codegen and jalki-mcp start in the runtime image"
+
+      - name: Boot the daemon on this runner's kernel (PRs)
+        # --help proves the dynamic loader accepts the binaries. This proves
+        # the daemon itself, on this arch: it loads the eBPF object and
+        # attaches probes. It runs the way the DaemonSet runs it: privileged,
+        # as root, hostPID, with the host's debugfs (tracepoints find tracefs
+        # there; without it every tracepoint probe is skipped). A DEGRADED
+        # start (some probes skipped on this kernel) passes, as it does in
+        # production; zero probes attached (the daemon exits), a crash, or no
+        # attach report within 60 s fails. Log lines are cut short: a
+        # verifier rejection logs the whole verifier trace on one line.
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          IMG: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          echo "kernel: $(uname -r)"
+          cid="$(docker run -d --privileged --user 0:0 --pid=host \
+            -v /sys/kernel/debug:/sys/kernel/debug:ro \
+            "$IMG" --sink stdout)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          logs() { docker logs "$cid" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-240; }
+          report='all probes attached|started DEGRADED'
+          for _ in $(seq 60); do
+            if logs | grep -E "$report" >/dev/null; then
+              logs | grep -E 'attached |failed to load/attach|DEGRADED|ERROR' || true
+              echo "the daemon booted and attached probes"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != true ]; then
+              logs | tail -n 50
+              echo "::error::the daemon exited before attaching any probe"
+              exit 1
+            fi
+            sleep 1
+          done
+          logs | tail -n 50
+          echo "::error::no attach report from the daemon within 60 s"
+          exit 1
 
   merge:
     name: Merge manifest (+ publish tags)

@@ -1,0 +1,15 @@
+# The stable toolchain for the workspace, eval/oracle and xtask: CI, a laptop
+# and the image build all use this one version.
+#
+# 1.97.1, not 1.97.0: 1.97.0 has a P-critical x86_64 miscompile
+# (rust-lang/rust#159035) that 1.97.1 was released to fix. It is also the
+# version of the builder image in the Dockerfile
+# (ghcr.io/false-systems/rust-builder:1.97.1), so rustup downloads nothing
+# there. Move this file and the Dockerfile's FROM lines in the same PR.
+#
+# jalki-ebpf/ has its own rust-toolchain.toml (a dated nightly); rustup takes
+# the nearest file, so the eBPF build keeps using that one.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
