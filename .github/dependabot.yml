@@ -17,7 +17,13 @@ updates:
       # together with rust-toolchain.toml, in one deliberate PR, never by
       # drift. Same-tag digest refreshes (the weekly base-images rebuild)
       # stay eligible; this covers both the plain and the -ebpf tag.
-      - dependency-name: "ghcr.io/false-systems/rust-builder"
+      #
+      # Dependabot names a docker dependency WITHOUT its registry: the FROM
+      # ghcr.io/false-systems/rust-builder lines are the dependency
+      # "false-systems/rust-builder", so a "ghcr.io/..." name here matches
+      # nothing and the rule is silently dead. The leading * matches the name
+      # with or without a registry.
+      - dependency-name: "*false-systems/rust-builder"
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
