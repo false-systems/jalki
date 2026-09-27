@@ -11,7 +11,9 @@
 #               a P-critical x86_64 miscompile (rust-lang/rust#159035) that
 #               1.97.1 was released to fix, and the amd64 binaries this image
 #               ships are built with it. rust-toolchain.toml names the same
-#               version, so rustup downloads nothing here.
+#               version, so rustup downloads nothing here. RUSTUP_AUTO_INSTALL=0
+#               (below) makes a mismatch fail the build instead of quietly
+#               downloading the file's version and shipping it under this tag.
 #   planner     reduces the workspace to recipe.json (manifests + Cargo.lock).
 #   ebpf        rust-builder's -ebpf variant: the same stable toolchain plus
 #               the dated nightly (with rust-src) and bpf-linker 0.10.4. Builds
@@ -34,10 +36,19 @@
 # (2.36) is older than trixie's (2.41). Move builder and runtime together.
 #
 # Bases are pinned by tag plus index digest; Dependabot (.github/dependabot.yml)
-# proposes digest refreshes and leaves the Rust version alone.
+# proposes digest refreshes and leaves the Rust version alone. CI (ci.yml)
+# also checks that every rust-builder tag here names rust-toolchain.toml's
+# channel, so a mismatch is caught before the image build starts.
 
 # ── chef ───────────────────────────────────────────────────────────────────
 FROM ghcr.io/false-systems/rust-builder:1.97.1@sha256:e02feeb546fb82e33ea7cdca1da320da6faa2cc4a5e3fb6c0e5f9cb9fd8f42b8 AS chef
+# The guard. rustup auto-installs whatever toolchain a rust-toolchain.toml
+# names, and cargo-chef carries that file into the recipe, so without this a
+# tag/file mismatch builds green: every cargo stage downloads the file's
+# version and the image ships it under the wrong tag. With it, the first cargo
+# call fails with "toolchain '<version>' is not installed". planner and
+# builder inherit it from here.
+ENV RUSTUP_AUTO_INSTALL=0
 WORKDIR /build
 
 # ── planner: the dependency recipe ─────────────────────────────────────────
@@ -55,6 +66,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 # An unpinned tool in the build path is a time bomb someone else detonates.
 # Bump it in base-images deliberately, with the LLVM story decided.
 FROM ghcr.io/false-systems/rust-builder:1.97.1-ebpf@sha256:1713aa3580d66c08e42a7ff1b981ef0ba41f9f161b501cb27c9879a6cdf80e40 AS ebpf
+# The same guard as in chef (this stage does not inherit it). It stops only
+# implicit installs: the explicit `rustup toolchain install` for the eBPF
+# nightly below still downloads a moved nightly, as described there.
+ENV RUSTUP_AUTO_INSTALL=0
 WORKDIR /build
 # The eBPF nightly (with rust-src for build-std against bpfel-unknown-none).
 # The date lives in jalki-ebpf/rust-toolchain.toml, and `rustup toolchain
