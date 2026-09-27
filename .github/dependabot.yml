@@ -1,7 +1,8 @@
 version: 2
 updates:
-  # Base images in the Dockerfile are pinned by digest; this proposes the
-  # refreshes (distroless security rebuilds, mostly) as one grouped weekly PR.
+  # Base images in the Dockerfile are pinned by tag plus digest; this proposes
+  # the digest refreshes (base-images' weekly rebuild, distroless security
+  # rebuilds) as one grouped weekly PR.
   - package-ecosystem: docker
     directory: "/"
     schedule:
@@ -12,11 +13,15 @@ updates:
     open-pull-requests-limit: 1
     ignore:
       # The Rust version is pinned on purpose: 1.97.1, the fix release for
-      # the 1.97.0 x86_64 miscompile (rust-lang/rust#159035). Move the
-      # builder tag deliberately, not by drift; same-tag digest refreshes
-      # stay eligible.
-      - dependency-name: "rust"
-        versions: ["> 1.97.1"]
+      # the 1.97.0 x86_64 miscompile (rust-lang/rust#159035). It moves only
+      # together with rust-toolchain.toml, in one deliberate PR, never by
+      # drift. Same-tag digest refreshes (the weekly base-images rebuild)
+      # stay eligible; this covers both the plain and the -ebpf tag.
+      - dependency-name: "ghcr.io/false-systems/rust-builder"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
     groups:
       docker-images:
         patterns: ["*"]

@@ -27,6 +27,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "*/Cargo.toml"
+      - "rust-toolchain.toml"
       - "jalki-ebpf/**"
       - ".github/workflows/container.yml"
   workflow_dispatch:
@@ -109,6 +110,23 @@ jobs:
           # cache-to exports nothing.
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope={0}', matrix.arch) || '' }}
+
+      - name: Smoke-run the binaries in the runtime image (PRs)
+        # The builders are Debian trixie, so the runtime must be trixie too:
+        # a binary linked against a newer glibc than the runtime's does not
+        # start. The Dockerfile pins both sides; this proves the pair, on this
+        # arch, before merge. PR builds are the ones loaded into docker.
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          IMG: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMG" --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/jalki-sdk-codegen "$IMG" --help >/dev/null
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' |
+            docker run --rm -i --entrypoint /usr/local/bin/jalki-mcp "$IMG" |
+            grep -q '"id":1'
+          echo "jalki, jalki-sdk-codegen and jalki-mcp start in the runtime image"
 
   merge:
     name: Merge manifest (+ publish tags)
