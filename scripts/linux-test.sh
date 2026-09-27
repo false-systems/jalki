@@ -19,7 +19,15 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${JALKI_TEST_IMAGE:-ghcr.io/false-systems/rust-builder:1.97.1@sha256:e02feeb546fb82e33ea7cdca1da320da6faa2cc4a5e3fb6c0e5f9cb9fd8f42b8}"
+# The default is read from the Dockerfile's chef stage (tag and digest), so a
+# Dependabot digest refresh there moves this script too; Dependabot does not
+# scan shell scripts.
+IMAGE="${JALKI_TEST_IMAGE:-$(sed -n 's/^FROM \(ghcr\.io\/false-systems\/rust-builder:[0-9.]*@sha256:[0-9a-f]*\) AS chef$/\1/p' "$REPO/Dockerfile")}"
+if [ -z "$IMAGE" ]; then
+  echo "error: no 'FROM ghcr.io/false-systems/rust-builder:<version>@sha256:<digest> AS chef'" >&2
+  echo "       line in $REPO/Dockerfile; set JALKI_TEST_IMAGE to choose an image." >&2
+  exit 1
+fi
 
 CMD="${JALKI_CARGO_CMD:-test}"
 
