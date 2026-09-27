@@ -7,9 +7,10 @@
 # the Container workflow is path-filtered to Dockerfile/Cargo/jalki-ebpf, so a
 # source-only PR runs nothing (false-systems/vartio#254).
 #
-# Uses the same rust image as the Dockerfile builder so the toolchain matches
-# what ships. The cargo registry and target dir are cached in named volumes, so
-# the first run is slow and later ones are not.
+# Uses the same builder image as the Dockerfile (rust-builder, Rust 1.97.1,
+# with rustfmt and clippy) so the toolchain matches what ships. The cargo
+# registry and target dir are cached in named volumes, so the first run is
+# slow and later ones are not.
 #
 #   scripts/linux-test.sh                  # whole workspace
 #   scripts/linux-test.sh -p jalki         # one crate
@@ -18,7 +19,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${JALKI_TEST_IMAGE:-rust:1.97-bookworm}"
+IMAGE="${JALKI_TEST_IMAGE:-ghcr.io/false-systems/rust-builder:1.97.1@sha256:e02feeb546fb82e33ea7cdca1da320da6faa2cc4a5e3fb6c0e5f9cb9fd8f42b8}"
 
 CMD="${JALKI_CARGO_CMD:-test}"
 

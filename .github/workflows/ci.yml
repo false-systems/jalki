@@ -58,8 +58,10 @@ jobs:
             export PATH="$HOME/.cargo/bin:$PATH"
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
+          # No argument: installs what rust-toolchain.toml names (1.97.1 with
+          # rustfmt and clippy), the same version the image builds with.
+          rustup toolchain install --no-self-update
+          rustc --version
 
       - uses: Swatinem/rust-cache@v2
 
