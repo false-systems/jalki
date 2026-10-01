@@ -330,18 +330,37 @@ fn monotonic_now_ns() -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("monotonic clock overflow"))
 }
 
+/// Userspace half of the sensitive-path gate. The kernel checks only each
+/// pattern's coarse prefix (the bytes before the first wildcard, so
+/// `/home/*/.ssh/` gates on `/home/`); this is where the whole pattern is
+/// applied. Both file types go through it. `kernel.file.open_attempt` used to
+/// skip it and shipped every failed open under `/home/` (jalki#97: 74% of all
+/// events on a CI node).
 fn record_matches_sensitive_paths(
     record: &EvidenceRecord,
     sensitive_path_matcher: &SensitivePathMatcher,
 ) -> bool {
-    if record.occurrence.occurrence_type.as_str() != "kernel.file.open" {
-        return true;
-    }
+    let labels = &record.occurrence.labels;
+    // The label carrying the path differs by type: `kernel.file.open` has the
+    // resolved identity in `resource_ref_id`; `open_attempt` has only what the
+    // caller asked for, unresolved, in `requested_path`.
+    let path_label = match record.occurrence.occurrence_type.as_str() {
+        "kernel.file.open" => "resource_ref_id",
+        "kernel.file.open_attempt" => {
+            // A requested path is caller-controlled and cut at 255 bytes, so
+            // padding (`/home/u/././…/.ssh/id_rsa`) can push the part the
+            // pattern needs past the cut. The kernel's prefix already matched;
+            // the full pattern cannot judge a string it cannot see, so keep it.
+            if labels.get("path_truncated").map(String::as_str) == Some("true") {
+                return true;
+            }
+            "requested_path"
+        }
+        _ => return true,
+    };
 
-    record
-        .occurrence
-        .labels
-        .get("resource_ref_id")
+    labels
+        .get(path_label)
         .is_some_and(|path| sensitive_path_matcher.is_match(path))
 }
 
@@ -367,5 +386,141 @@ mod tests {
 
         assert!(first > 0);
         assert!(second >= first);
+    }
+
+    // ── the userspace half of the sensitive-path gate (jalki#97 fix 2) ──────
+
+    use jalki_evidence::{FileOpenEvent, HookKind, KernelEvent, ProbeMetadata};
+
+    fn probe_meta(id: &str, function: &str) -> ProbeMetadata {
+        ProbeMetadata {
+            probe_id: id.into(),
+            probe_version: "1".into(),
+            probe_family: "file".into(),
+            hook_kind: HookKind::Tracepoint,
+            kernel_function: function.into(),
+        }
+    }
+
+    fn file_event(path: &str, ret: i32, path_truncated: bool) -> FileOpenEvent {
+        FileOpenEvent {
+            observed_at_ns: 1,
+            pid: 7,
+            uid: 1001,
+            cgroup_id: 9,
+            ret,
+            flags: 0,
+            comm: "rustc".into(),
+            path: path.into(),
+            path_truncated,
+        }
+    }
+
+    /// A failed open of `path`, as the file_open_attempt probe emits it.
+    fn open_attempt(path: &str) -> EvidenceRecord {
+        KernelEvent::FileOpenAttempt(file_event(path, -2, false))
+            .normalize(probe_meta("file_open_attempt", "sys_exit_openat"), "prod")
+            .records
+            .remove(0)
+    }
+
+    fn file_open(path: &str) -> EvidenceRecord {
+        KernelEvent::FileOpen(file_event(path, 0, false))
+            .normalize(probe_meta("file_open", "security_file_open"), "prod")
+            .records
+            .remove(0)
+    }
+
+    fn sensitive(record: &EvidenceRecord) -> bool {
+        record_matches_sensitive_paths(record, &SensitivePathMatcher::default_patterns())
+    }
+
+    /// The jalki#97 noise: the kernel gates `/home/*/.ssh/` on its coarse
+    /// prefix `/home/`, so every failed open under a runner's work tree reached
+    /// userspace, and userspace waved `open_attempt` through without the full
+    /// pattern — 74% of all events on the CI node.
+    #[test]
+    fn open_attempt_outside_the_sensitive_patterns_is_dropped() {
+        assert!(!sensitive(&open_attempt(
+            "/home/runner/_work/x/target/libfoo.so"
+        )));
+        assert!(!sensitive(&open_attempt("/home/runner/.cache/sccache/x")));
+    }
+
+    /// Guards against over-correcting: what the patterns name is still kept.
+    #[test]
+    fn open_attempt_inside_the_sensitive_patterns_is_kept() {
+        for path in [
+            "/home/runner/.ssh/id_ed25519",
+            "/root/.ssh/authorized_keys",
+            "/etc/shadow",
+            // The shadow backups (`shadow-`, `shadow.bak`) are the same
+            // credentials; the default pattern is `/etc/shadow*` for that.
+            "/etc/shadow-",
+            "/var/run/secrets/kubernetes.io/serviceaccount/token",
+            // `*` spans `/`, so a dot-dot detour still lands in the pattern.
+            "/home/runner/../runner/.ssh/id_rsa",
+        ] {
+            assert!(sensitive(&open_attempt(path)), "{path} must be kept");
+        }
+    }
+
+    /// Decided, not accidental: the `.ssh` directory itself is outside
+    /// `/home/*/.ssh/` (the trailing `/` means "what is under it"), for failed
+    /// opens exactly as for `kernel.file.open`. An operator who wants directory
+    /// probes adds `/home/*/.ssh` explicitly.
+    #[test]
+    fn open_attempt_of_the_ssh_directory_itself_is_dropped() {
+        assert!(!sensitive(&open_attempt("/home/runner/.ssh")));
+    }
+
+    /// The requested path is caller-controlled and cut at 255 bytes. Padding it
+    /// with `./` pushes `.ssh/` past the cut, so the stored string can never
+    /// match the full pattern even though the kernel's prefix did. A truncated
+    /// attempt is kept: the full pattern cannot judge a string it cannot see.
+    #[test]
+    fn truncated_open_attempt_is_kept() {
+        let mut path = format!("/home/runner/{}.ssh/id_rsa", "./".repeat(121));
+        path.truncate(255);
+        assert!(!path.contains("/.ssh/"), "precondition: the cut hides .ssh");
+        let record = KernelEvent::FileOpenAttempt(file_event(&path, -2, true))
+            .normalize(probe_meta("file_open_attempt", "sys_exit_openat"), "prod")
+            .records
+            .remove(0);
+        assert!(sensitive(&record));
+    }
+
+    #[test]
+    fn open_attempt_without_a_requested_path_is_dropped() {
+        let mut record = open_attempt("/home/runner/.ssh/id_rsa");
+        record.occurrence.labels.remove("requested_path");
+        assert!(!sensitive(&record));
+    }
+
+    /// Regression: `kernel.file.open` keeps matching on its resolved identity,
+    /// and types that are not file evidence are not path-gated at all.
+    #[test]
+    fn file_open_still_matches_on_resource_ref_id() {
+        assert!(sensitive(&file_open("/etc/shadow")));
+        assert!(!sensitive(&file_open("/tmp/not-sensitive")));
+
+        let connect = KernelEvent::TcpConnect(jalki_evidence::TcpConnectEvent {
+            observed_at_ns: 1,
+            pid: 1,
+            tid: 1,
+            src_ip: "10.0.0.1".parse().expect("ip"),
+            dst_ip: "10.0.0.2".parse().expect("ip"),
+            src_port: 1234,
+            dst_port: 443,
+            addr_family: 2,
+            ret: 0,
+            cgroup_id: 1,
+            comm: "curl".into(),
+            netns: 0,
+        })
+        .normalize(probe_meta("tcp_connect", "tcp_connect"), "prod")
+        .records
+        .remove(0);
+        assert!(sensitive(&connect));
     }
 }
