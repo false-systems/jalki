@@ -55,7 +55,7 @@ kernel fn returns → #[fexit]/#[fentry] eBPF program (jalki-ebpf)
   → Probe::decode_event → KernelEvent (typed)                        (jalki-evidence/src/event.rs)
   → KernelEvent::normalize → EvidenceRecord{ Occurrence }            (jalki-evidence/src/normalize.rs)
   → record cloned into in-memory EventStore (for IPC/CLI queries)    (jalki/src/store.rs)
-  → batched over an mpsc channel
+  → reader→sink queue: namespace scope, byte budget, gap on refusal  (jalki/src/sink_queue.rs)
   → Runtime sink loop wraps in EvidenceBatch → EvidenceSink::append_batch  (jalki/src/runtime.rs)
 ```
 

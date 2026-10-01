@@ -15,7 +15,10 @@ use tracing::{info, warn};
 pub const DEFAULT_SENSITIVE_PATHS: &[&str] = &[
     "/var/run/secrets/",
     "/run/secrets/",
-    "/etc/shadow",
+    // `*` so the backups (`shadow-`, `shadow.bak`) count as the credentials
+    // they are. The kernel gate is unchanged: the coarse prefix is still
+    // `/etc/shadow`.
+    "/etc/shadow*",
     "/etc/kubernetes/",
     "/root/.ssh/",
     "/home/*/.ssh/",
@@ -205,6 +208,18 @@ mod tests {
         assert!(matcher.is_match("/home/runner/.ssh/id_rsa"));
         // /proc/*/environ is intentionally not a default (weak coarse-prefix gate).
         assert!(!matcher.is_match("/proc/123/environ"));
+    }
+
+    /// `/etc/shadow*` widens what userspace keeps to the shadow backups without
+    /// widening what the kernel forwards: the coarse prefix is the same bytes.
+    #[test]
+    fn shadow_backups_match_without_widening_the_kernel_gate() {
+        let matcher = SensitivePathMatcher::default_patterns();
+
+        assert!(matcher.is_match("/etc/shadow"));
+        assert!(matcher.is_match("/etc/shadow-"));
+        assert!(!matcher.is_match("/etc/passwd"));
+        assert_eq!(coarse_prefix("/etc/shadow*"), "/etc/shadow");
     }
 
     #[test]

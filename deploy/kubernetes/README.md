@@ -10,7 +10,7 @@ kubectl create secret generic jalki-vartio-token \
 kubectl apply -f deploy/kubernetes/jalki.yaml
 
 # 3. confirm it is actually collecting, not merely running
-kubectl -n jalki logs ds/jalki | grep -iE 'spool|self-shedding|observability'
+kubectl -n jalki logs ds/jalki | grep -iE 'spool|self-shedding|sink queue|observability'
 ```
 
 `jalki.yaml` is the deployment we run, with our site-specific values replaced
@@ -64,6 +64,7 @@ manifest back:
 resolved RuntimeSubjectV1 node identity from Kubernetes Node UID identity=k8s-node-uid:...
 backlog spool armed: buffered evidence survives a restart path=... existing_bytes=0
 self-shedding armed: ... limit_bytes=1073741824 source=Cgroup("/sys/fs/cgroup/...")
+reader→sink queue bounded by estimated resident bytes: ... max_bytes=134217728 pressure_max_bytes=16777216
 observability server listening on :9090 (/metrics, /healthz, /readyz)
 ```
 
@@ -87,16 +88,17 @@ The three HTTP paths answer differently, and that is worth checking once:
 ```bash
 kubectl -n jalki port-forward ds/jalki 9090:9090
 curl -s localhost:9090/healthz   # ok
-curl -s localhost:9090/readyz    # queued_batches=0 ... status=ok
+curl -s localhost:9090/readyz    # queued_batches=0 ... sink_queue_bytes=... status=ok
 curl -s localhost:9090/metrics   # Prometheus registry dump
 ```
 
 ## What to alert on
 
-jälki exports Prometheus metrics on `:9090/metrics`. Five of them cover every
-failure mode we have seen in production; each threshold below has fired for a
-real incident, not a guess. Alerting on anything less means finding out from
-pod logs, later.
+jälki exports Prometheus metrics on `:9090/metrics`. Six of them cover every
+failure mode we have seen in production. Each threshold below comes from a real
+incident, not a guess; all but the newest (`jalki_sink_queue_dropped_total`)
+have also fired in production. Alerting on anything less means finding out
+from pod logs, later.
 
 | Alert when | Why |
 | --- | --- |
@@ -104,7 +106,8 @@ pod logs, later.
 | `jalki_retry_oldest_age_seconds > 300` | Evidence has been undeliverable for 5+ minutes: the sink is down or refusing. Pairs with `/readyz` going NotReady — visible pressure, not a restart. |
 | `jalki_spool_bytes > 0.8 * JALKI_SPOOL_MAX_BYTES` | The on-disk mirror is filling; when it caps, the next stop under continued outage is shedding. You want the warning while there is still budget. |
 | `jalki_binding_cache_hit_ratio < 0.9` for 15m | Kubernetes enrichment is degrading, and unbindable evidence is dropped **at the source** by design. Expect a dip after agent restarts while caches warm (~15 min); sustained low is real. |
-| `jalki_memory_ceiling_no_shed == 1` for 10m | The precise doomed condition (jalki#76): memory is over the shedding watermark AND dropping the entire retry buffer would not get back under it. Shedding cannot save the agent; an OOM kill is coming. This alert is the off-node copy of the state that the OOM it predicts will otherwise destroy. |
+| `jalki_memory_ceiling_no_shed == 1` for 10m | The precise doomed condition (jalki#76): memory is over the shedding watermark AND neither dropping the entire retry buffer nor draining the reader→sink queue to its pressure budget would get back under it. Shedding cannot save the agent; an OOM kill is coming. This alert is the off-node copy of the state that the OOM it predicts will otherwise destroy. |
+| `increase(jalki_sink_queue_dropped_total[10m]) > 0` | In-scope evidence is arriving faster than the sink takes it, and the reader→sink queue is refusing it at `JALKI_QUEUE_MAX_BYTES` (jalki#97). Each refusal is also delivered as `jalki.agent.gap` (`sink_queue_overflow`, or `sink_queue_memory_pressure` while `jalki_sink_queue_memory_pressure == 1`). Before this bound existed, the same burst was an OOM kill. Narrow `JALKI_NAMESPACES` or raise sink throughput. Without `JALKI_NAMESPACES`, unbound records count against the budget too (the sink drops them later; `jalki_unbound_dropped_total_total` shows how many), so read the two together. New with jalki#97: the incident behind it is real (six OOM kills), but this threshold has not fired in production yet. |
 
 Two things deliberately **not** worth alerting on:
 

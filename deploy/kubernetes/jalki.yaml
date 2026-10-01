@@ -162,6 +162,15 @@ spec:
             # the memory limit minus the steady-state baseline.
             - { name: JALKI_RETRY_MAX_BYTES, value: "67108864" }
             - { name: JALKI_RETRY_MAX_RECORDS, value: "120000" }
+            # Reader→sink queue: evidence drained from the ring buffers waiting
+            # for the sink loop. Past this budget new evidence is refused and
+            # reported as jalki.agent.gap (cause=sink_queue_overflow) instead of
+            # growing until the kernel OOM-kills the agent (jalki#97). Unlike
+            # the retry budget above this counts estimated RESIDENT bytes, so
+            # it is close to real RSS. Budget the two together under the limit:
+            # baseline + ~3.5x JALKI_RETRY_MAX_BYTES + this. At 1Gi, more than a
+            # quarter of the limit draws a startup warning.
+            - { name: JALKI_QUEUE_MAX_BYTES, value: "134217728" }
             # How long undeliverable evidence may sit before /readyz reports
             # NotReady. Keep it comfortably above the retry-backoff cap so an
             # ordinary blip cannot flap the probe.

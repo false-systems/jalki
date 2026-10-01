@@ -13,14 +13,14 @@ use jalki_evidence::{
     RetryBackoff, RetryBackoffConfig, RetryBuffer, RetryBufferConfig, SinkError, Spool,
     SpoolConfig,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::Instant as Deadline;
 use tracing::{error, info, warn};
 
 use crate::enrich::{NoopEnricher, RuntimeEnricher};
 use crate::knowledge::KnowledgeBase;
 use crate::loader;
-use crate::metrics::{Metrics, SinkLabel, UnboundDropLabel};
+use crate::metrics::{Metrics, SinkLabel};
 use crate::probe::Probe;
 use crate::probes::generated::GeneratedProbeReader;
 use crate::probes::{
@@ -30,6 +30,7 @@ use crate::probes::{
 use crate::reader::{self, ProbeStats};
 use crate::registry::ProbeRegistry;
 use crate::sensitive_paths;
+use crate::sink_queue::{self, Received, SinkQueueConfig, SinkQueueReceiver, SinkQueueSender};
 use crate::store::EventStore;
 
 /// Builder for configuring and running jälki.
@@ -43,8 +44,9 @@ pub struct Runtime {
     /// When set, only evidence bound to one of these Kubernetes namespaces is
     /// delivered to the sink — the source-side volume control that keeps jälki
     /// from shipping the whole-node firehose. `None` = deliver all (bound)
-    /// evidence. Applies to the evidence-sink path only; the local CLI/IPC
-    /// query surface still sees everything.
+    /// evidence. Enforced where evidence is admitted to the reader→sink queue,
+    /// so out-of-scope evidence never takes queue memory (jalki#97); the local
+    /// CLI/IPC query surface still sees everything.
     namespace_allowlist: Option<HashSet<String>>,
     /// Stable node anchor for RuntimeSubjectV1, resolved by the caller (e.g.
     /// the Kubernetes Node UID via the enrichment client, jalki#82). Takes
@@ -150,8 +152,21 @@ impl Runtime {
             self.sensitive_paths.clone(),
         ));
 
-        // Channel: readers → sink loop.
-        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(8192);
+        // Readers → sink loop, bounded by the bytes it holds (jalki#97). The
+        // namespace scope is applied on the way in.
+        let queue_config = SinkQueueConfig::from_env();
+        info!(
+            max_bytes = queue_config.max_bytes,
+            pressure_max_bytes = queue_config.pressure_max_bytes,
+            "reader→sink queue bounded by estimated resident bytes: past it, new \
+             evidence is refused and reported as jalki.agent.gap \
+             (cause=sink_queue_overflow; tune via JALKI_QUEUE_MAX_BYTES)"
+        );
+        let (tx, rx) = sink_queue::channel(
+            queue_config.clone(),
+            self.namespace_allowlist.clone(),
+            metrics.clone(),
+        );
 
         // Spawn a reader for each probe, register in the registry.
         for probe in &self.probes {
@@ -213,7 +228,7 @@ impl Runtime {
         let metrics_clone = metrics.clone();
         let producer_for_sink = producer.clone();
         let enricher_for_metrics = self.enricher.clone();
-        let namespace_allowlist = self.namespace_allowlist.clone();
+        let namespace_allowlist = &self.namespace_allowlist;
 
         let retry_config = RetryBufferConfig::from_env();
         info!(
@@ -224,7 +239,7 @@ impl Runtime {
             "retry buffer bounded (sheds oldest as gap evidence past these; \
              tune via JALKI_RETRY_MAX_{{RECORDS,BATCHES,AGE_MS,BYTES}})"
         );
-        match &namespace_allowlist {
+        match namespace_allowlist {
             Some(ns) => info!(
                 namespaces = ?ns,
                 "namespace allow-list active: only bound evidence in these \
@@ -275,6 +290,19 @@ impl Runtime {
                  Set JALKI_MEMORY_LIMIT_BYTES (downward API: resources.limits.memory)"
             ),
         }
+        if let Some(p) = &memory_pressure {
+            // The queue's budget is resident memory on top of the baseline and
+            // the retry buffer; a quarter of the limit is already generous.
+            if queue_config.max_bytes as u64 > p.limit_bytes() / 4 {
+                warn!(
+                    queue_max_bytes = queue_config.max_bytes,
+                    limit_bytes = p.limit_bytes(),
+                    "JALKI_QUEUE_MAX_BYTES is over a quarter of this agent's memory \
+                     limit; a full queue plus the steady-state baseline may reach \
+                     the limit before the queue refuses anything"
+                );
+            }
+        }
         let spool = spool_from_env();
         match &spool {
             Some(s) => info!(
@@ -301,7 +329,6 @@ impl Runtime {
             metrics: metrics_clone,
             producer: producer_for_sink,
             enricher: enricher_for_metrics,
-            namespace_allowlist,
             retry_config,
             backoff_config,
             pace_config,
@@ -361,7 +388,7 @@ pub struct DaemonHandle {
     metrics: Arc<Metrics>,
     pub store: Arc<EventStore>,
     pub kb: Arc<KnowledgeBase>,
-    tx: mpsc::Sender<Vec<EvidenceRecord>>,
+    tx: SinkQueueSender,
     pub cluster: String,
     enricher: Arc<dyn RuntimeEnricher>,
     sensitive_path_matcher: Arc<sensitive_paths::SensitivePathMatcher>,
@@ -585,12 +612,12 @@ fn producer_metadata(cluster: &str, node_identity: Option<&str>) -> ProducerMeta
 /// arguments, and separate from `Runtime` so the loop can be driven directly by
 /// tests — the daemon itself cannot be, because loading eBPF needs a kernel.
 pub(crate) struct SinkLoop {
-    pub rx: mpsc::Receiver<Vec<EvidenceRecord>>,
+    /// Already scoped and byte-bounded by the time anything arrives here.
+    pub rx: SinkQueueReceiver,
     pub sink: Box<dyn EvidenceSink>,
     pub metrics: Arc<Metrics>,
     pub producer: ProducerMetadata,
     pub enricher: Arc<dyn RuntimeEnricher>,
-    pub namespace_allowlist: Option<HashSet<String>>,
     pub retry_config: RetryBufferConfig,
     pub backoff_config: RetryBackoffConfig,
     pub pace_config: DrainPaceConfig,
@@ -612,7 +639,6 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         metrics: metrics_clone,
         producer: producer_for_sink,
         enricher: enricher_for_metrics,
-        namespace_allowlist,
         retry_config,
         backoff_config,
         pace_config,
@@ -682,71 +708,102 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
         // prioritise fresh evidence would starve the timer and put us straight
         // back to the traffic-coupled retries this issue is about.
         tokio::select! {
-            maybe_records = rx.recv() => {
-                let Some(mut records) = maybe_records else { break };
-                if records.is_empty() {
-                    continue;
-                }
-
-                record_unbound_drops(&metrics_clone, &records);
-                refresh_binding_cache_metrics(&metrics_clone, enricher_for_metrics.as_ref());
-
-                // Source-side volume control: keep only evidence bound to an
-                // allowed namespace. Out-of-scope namespaces are deliberately
-                // not observed here (a scope, not a loss — no gap evidence).
-                if let Some(allow) = &namespace_allowlist {
-                    let before = records.len();
-                    records.retain(|record| record_in_namespace_scope(record, allow));
-                    let dropped = before - records.len();
-                    if dropped > 0 {
-                        tracing::debug!(dropped, "records filtered by namespace allow-list");
-                    }
-                    if records.is_empty() {
-                        continue;
-                    }
-                }
-
+            received = rx.recv() => {
+                let Some(received) = received else { break };
                 let now_ms = elapsed_ms(retry_clock_start);
                 pending_gaps.extend(retry_buffer.drop_expired(now_ms));
 
-                let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
-                if retry_buffer.is_empty() && pending_gaps.is_empty() {
-                    // Nothing queued, so the sink is presumed working:
-                    // deliver inline and keep the latency.
-                    match sink.append_batch(batch.clone()).await {
-                        Ok(_) => {
-                            backoff.reset();
-                        }
-                        Err(err) if RetryBuffer::should_retry(&err) => {
-                            record_sink_error(&metrics_clone, sink.name());
+                // The queue already counted unbound records and applied the
+                // namespace scope on admission (jalki#97); doing either here
+                // too would count twice.
+                match received {
+                    Received::Records(records) if records.is_empty() => {}
+                    Received::Records(records) => {
+                        refresh_binding_cache_metrics(
+                            &metrics_clone,
+                            enricher_for_metrics.as_ref(),
+                        );
+                        let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
+                        if retry_buffer.is_empty() && pending_gaps.is_empty() {
+                            // Nothing queued, so the sink is presumed working:
+                            // deliver inline and keep the latency.
+                            match sink.append_batch(batch.clone()).await {
+                                Ok(_) => {
+                                    backoff.reset();
+                                }
+                                Err(err) if RetryBuffer::should_retry(&err) => {
+                                    record_sink_error(&metrics_clone, sink.name());
+                                    pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
+                                    warn!(
+                                        sink = sink.name(),
+                                        error = %err,
+                                        queued_batches = retry_buffer.len_batches(),
+                                        queued_records = retry_buffer.len_records(),
+                                        queued_bytes = retry_buffer.len_bytes(),
+                                        "evidence sink append failed; retrying later"
+                                    );
+                                }
+                                Err(err) => {
+                                    record_sink_error(&metrics_clone, sink.name());
+                                    error!(
+                                        sink = sink.name(),
+                                        error = %err,
+                                        "evidence sink append failed permanently; dropping batch"
+                                    );
+                                    pending_gaps
+                                        .merge(gap_for_batch(terminal_gap_cause(&err), &batch));
+                                }
+                            }
+                        } else {
+                            // A backlog exists, so the sink is known to be
+                            // refusing work: queue behind it and let the timer
+                            // decide when to try again. Retrying here is what
+                            // used to hammer a struggling sink once per drain
+                            // cycle, and what tied a quiet node's retries to
+                            // traffic it wasn't receiving (jalki #39).
                             pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
-                            warn!(
-                                sink = sink.name(),
-                                error = %err,
-                                queued_batches = retry_buffer.len_batches(),
-                                queued_records = retry_buffer.len_records(),
-                                queued_bytes = retry_buffer.len_bytes(),
-                                "evidence sink append failed; retrying later"
-                            );
-                        }
-                        Err(err) => {
-                            record_sink_error(&metrics_clone, sink.name());
-                            error!(
-                                sink = sink.name(),
-                                error = %err,
-                                "evidence sink append failed permanently; dropping batch"
-                            );
-                            pending_gaps.merge(gap_for_batch(terminal_gap_cause(&err), &batch));
                         }
                     }
-                } else {
-                    // A backlog exists, so the sink is known to be
-                    // refusing work: queue behind it and let the timer
-                    // decide when to try again. Retrying here is what
-                    // used to hammer a struggling sink once per drain
-                    // cycle, and what tied a quiet node's retries to
-                    // traffic it wasn't receiving (jalki #39).
-                    pending_gaps.extend(retry_buffer.enqueue(batch, now_ms));
+                    Received::Gaps(reports) => {
+                        // Loss reports for evidence the queue refused. They
+                        // stay reports until delivered: as plain records they
+                        // could land in the retry buffer and be shed or
+                        // expired, and the gap for that would name
+                        // `jalki.agent.gap` with a count of 1 instead of what
+                        // was really lost.
+                        if has_backlog(&retry_buffer, &pending_gaps) {
+                            // Backlog mode already; pending gaps go first.
+                            pending_gaps.extend(reports);
+                        } else {
+                            // Inline, as ring-buffer gaps travel. Routing every
+                            // one through pending gaps would switch the loop to
+                            // paced backlog delivery on each overload episode.
+                            let records = reports
+                                .into_iter()
+                                .flat_map(|gap| gap.into_batch(producer_for_sink.clone()).records)
+                                .collect();
+                            let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
+                            if let Err(err) = sink.append_batch(batch.clone()).await {
+                                // Retryable or not, the sink is failing, so
+                                // backlog mode is right; the batch waits there.
+                                record_sink_error(&metrics_clone, sink.name());
+                                warn!(
+                                    sink = sink.name(),
+                                    error = %err,
+                                    "gap evidence delivery failed; retrying later"
+                                );
+                                // Retry this exact batch. No backlog, so
+                                // nothing is in flight. The Vartio sink keys
+                                // idempotency on occurrence ids; a timeout it in
+                                // fact committed, or a partly accepted batch, must
+                                // not come back as new gap records counted twice.
+                                debug_assert!(pending_gaps.in_flight.is_none());
+                                pending_gaps.in_flight = Some(batch);
+                            } else {
+                                backoff.reset();
+                            }
+                        }
+                    }
                 }
 
                 if let Some(pressure) = &memory_pressure {
@@ -755,6 +812,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         memory_high_watermark,
                         &mut retry_buffer,
                         &mut pending_gaps,
+                        &rx,
                         &metrics_clone,
                         &mut ceiling,
                     );
@@ -800,6 +858,7 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                         memory_high_watermark,
                         &mut retry_buffer,
                         &mut pending_gaps,
+                        &rx,
                         &metrics_clone,
                         &mut ceiling,
                     );
@@ -954,8 +1013,9 @@ struct CeilingState {
 
 impl CeilingState {
     /// `doomed` is precise, not a heuristic: even shedding the ENTIRE buffer
-    /// (freeing at most `len_bytes`) could not bring the ratio back under the
-    /// watermark. On 2026-08-07: ratio 0.98, buffer 20MB/1Gi ≈ 0.02 →
+    /// (freeing at most `len_bytes`) and draining the reader→sink queue to its
+    /// pressure budget could not bring the ratio back under the watermark. On
+    /// 2026-08-07: ratio 0.98, buffer 20MB/1Gi ≈ 0.02 →
     /// 0.96 ≥ 0.8, doomed. A healthy pressure spike with 300MB buffered:
     /// 0.85 − 0.29 = 0.56 < 0.8 — shedding works, not doomed.
     fn observe(&mut self, doomed: bool, ratio: f64, pressure: &MemoryPressure, metrics: &Metrics) {
@@ -980,28 +1040,76 @@ impl CeilingState {
     }
 }
 
+/// How far under the watermark memory must fall before the reader→sink queue
+/// leaves pressure mode. Without it, a ratio hovering at the watermark would
+/// flip the queue's budget on every sink-loop iteration.
+const QUEUE_PRESSURE_RELEASE_MARGIN: f64 = 0.05;
+
 /// Give back buffer memory before the kernel takes the process.
 ///
 /// An OOM kill loses the entire backlog *and* produces no gap evidence — the
 /// one loss the pipeline cannot describe afterwards. Shedding deliberately
 /// costs the same records and says so.
+///
+/// Two buffers are the agent's to give back. The retry buffer is shed here.
+/// The reader→sink queue is held to its pressure budget instead (jalki#97):
+/// it stops growing at once and drains to that budget at the sink's pace, and
+/// what it refuses meanwhile is reported as `sink_queue_memory_pressure` gaps.
+/// Nothing already queued is evicted, so delivery order is untouched.
 fn shed_under_memory_pressure(
     pressure: &MemoryPressure,
     high_watermark: f64,
     retry_buffer: &mut RetryBuffer,
     pending_gaps: &mut PendingGaps,
+    queue: &SinkQueueReceiver,
     metrics: &Metrics,
     ceiling: &mut CeilingState,
 ) {
     let Some(ratio) = pressure.ratio() else {
+        // The file went away (a shutdown race); keep the queue as it is.
         return;
     };
     metrics.memory_usage_ratio.set(ratio);
 
+    // Hysteresis: on at the watermark, off only clearly below it.
+    let release_at = high_watermark - QUEUE_PRESSURE_RELEASE_MARGIN.min(high_watermark / 2.0);
+    let pressured = if queue.memory_pressure() {
+        ratio >= release_at
+    } else {
+        ratio >= high_watermark
+    };
+    if queue.set_memory_pressure(pressured) {
+        if pressured {
+            warn!(
+                memory_ratio = ratio,
+                queued_bytes = queue.queued_bytes(),
+                pressure_max_bytes = queue.pressure_max_bytes(),
+                "memory pressure: the reader→sink queue is held to its pressure \
+                 budget; evidence past it is refused and reported as gaps \
+                 (cause=sink_queue_memory_pressure)"
+            );
+        } else {
+            info!(
+                memory_ratio = ratio,
+                "memory pressure cleared; the reader→sink queue has its full budget back"
+            );
+        }
+    }
+
     // Report the structural state BEFORE the early returns below: the empty-
     // buffer return on the next line is exactly the silent path the 2026-08-07
     // OOM took, and it must not stay silent.
-    let buffer_fraction = retry_buffer.len_bytes() as f64 / pressure.limit_bytes() as f64;
+    //
+    // What the agent can free by itself: the whole retry buffer, and whatever
+    // the queue holds above its pressure budget. Units are mixed (the retry
+    // buffer counts an encoded-size estimate, ~0.3x real; the queue counts
+    // resident bytes); the retry term's under-count is pre-existing and only
+    // makes `doomed` more eager.
+    let queue_excess = queue
+        .queued_bytes()
+        .saturating_sub(queue.pressure_max_bytes());
+    let freeable = retry_buffer.len_bytes().saturating_add(queue_excess);
+    let buffer_fraction = freeable as f64 / pressure.limit_bytes() as f64;
     let doomed = ratio >= high_watermark && (ratio - buffer_fraction) >= high_watermark;
     ceiling.observe(doomed, ratio, pressure, metrics);
 
@@ -1187,18 +1295,22 @@ async fn flush_retry_buffer(
     DrainOutcome::Empty
 }
 
+/// Gap reports waiting for delivery: one batch in flight (so a retry resends
+/// the same ids) and the rest merged per cause.
+///
+/// Per cause, not one report: merging across causes collapses them to
+/// `multiple`, and ADR-0006 contract 6 says the causes are different
+/// operational stories. There are only a handful of causes, so this stays
+/// small however long the outage.
 #[derive(Default)]
 struct PendingGaps {
     in_flight: Option<EvidenceBatch>,
-    queued: Option<GapReport>,
+    queued: Vec<GapReport>,
 }
 
 impl PendingGaps {
     fn merge(&mut self, gap: GapReport) {
-        match &mut self.queued {
-            Some(existing) => existing.merge(gap),
-            None => self.queued = Some(gap),
-        }
+        sink_queue::merge_by_cause(&mut self.queued, gap);
     }
 
     fn extend(&mut self, gaps: impl IntoIterator<Item = GapReport>) {
@@ -1208,11 +1320,9 @@ impl PendingGaps {
     }
 
     fn front(&mut self, producer: &ProducerMetadata) -> Option<EvidenceBatch> {
-        if self.in_flight.is_none() {
-            self.in_flight = self
-                .queued
-                .take()
-                .map(|gap| gap.into_batch(producer.clone()));
+        if self.in_flight.is_none() && !self.queued.is_empty() {
+            let gap = self.queued.remove(0);
+            self.in_flight = Some(gap.into_batch(producer.clone()));
         }
         self.in_flight.clone()
     }
@@ -1222,11 +1332,11 @@ impl PendingGaps {
     }
 
     fn is_empty(&self) -> bool {
-        self.in_flight.is_none() && self.queued.is_none()
+        self.in_flight.is_none() && self.queued.is_empty()
     }
 
     fn len(&self) -> usize {
-        usize::from(self.in_flight.is_some()) + usize::from(self.queued.is_some())
+        usize::from(self.in_flight.is_some()) + self.queued.len()
     }
 }
 
@@ -1235,26 +1345,6 @@ fn record_sink_error(metrics: &Metrics, sink: &str) {
         .sink_errors
         .get_or_create(&SinkLabel { sink: sink.into() })
         .inc();
-}
-
-fn record_in_namespace_scope(record: &EvidenceRecord, allow: &HashSet<String>) -> bool {
-    record.occurrence.occurrence_type.as_str() == "jalki.agent.gap"
-        || record
-            .bound_namespace()
-            .is_some_and(|namespace| allow.contains(namespace))
-}
-
-fn record_unbound_drops(metrics: &Metrics, records: &[EvidenceRecord]) {
-    for record in records {
-        if let Some(reason) = record.plane_b_drop_reason() {
-            metrics
-                .unbound_dropped_total
-                .get_or_create(&UnboundDropLabel {
-                    reason: reason.as_str().into(),
-                })
-                .inc();
-        }
-    }
 }
 
 fn refresh_binding_cache_metrics(metrics: &Metrics, enricher: &dyn RuntimeEnricher) {
@@ -1340,9 +1430,13 @@ fn map_kb_fields_to_btf(
 ///
 /// If AHTI sees a gap in events and doesn't know jälki dropped them,
 /// it will misdiagnose. These events close that gap.
+///
+/// Ring-buffer gaps are agent records, so the queue always admits them. A
+/// `jalki.probe.parse_errors` record is not, and is scoped and budgeted like
+/// any other evidence.
 async fn emit_self_observability(
     registry: Arc<ProbeRegistry>,
-    tx: mpsc::Sender<Vec<EvidenceRecord>>,
+    tx: SinkQueueSender,
     producer: &ProducerMetadata,
 ) {
     let mut previous: HashMap<String, (u64, u64, u64)> = HashMap::new();
@@ -1371,14 +1465,13 @@ async fn emit_self_observability(
             if new_drops > 0 {
                 warn!(probe = %probe_name, dropped = new_drops, "ring buffer drops detected");
                 if tx
-                    .send(ring_buffer_gap_records(
+                    .try_send(ring_buffer_gap_records(
                         producer,
                         &occurrence_type,
                         new_drops,
                         previous_poll_at_ns,
                         counter_polled_at_ns,
                     ))
-                    .await
                     .is_err()
                 {
                     return;
@@ -1390,7 +1483,7 @@ async fn emit_self_observability(
                 let occ = Occurrence::new("jalki/self", "jalki.probe.parse_errors")
                     .severity(Severity::Warning)
                     .in_cluster(producer.cluster.clone());
-                if tx.send(vec![self_observability_record(occ)]).await.is_err() {
+                if tx.try_send(vec![self_observability_record(occ)]).is_err() {
                     return;
                 }
             }
@@ -1560,12 +1653,20 @@ async fn handle_observability_request(
             let age = metrics.retry_oldest_age_seconds.get();
             let batches = metrics.retry_queued_batches.get();
             let stalled = age > max_backlog_age_secs as f64;
+            // The reader→sink queue lines are information, not status: a full
+            // queue means evidence is arriving faster than the sink takes it,
+            // which `jalki_sink_queue_dropped_total` alerts on; it is not a
+            // stalled sink.
             let body = format!(
                 "queued_batches={batches}\nqueued_records={}\nqueued_bytes={}\n\
                  oldest_age_seconds={age:.1}\nmax_backlog_age_seconds={max_backlog_age_secs}\n\
+                 sink_queue_bytes={}\nsink_queue_max_bytes={}\nsink_queue_memory_pressure={}\n\
                  status={}\n",
                 metrics.retry_queued_records.get(),
                 metrics.retry_queued_bytes.get(),
+                metrics.sink_queue_bytes.get(),
+                metrics.sink_queue_max_bytes.get(),
+                metrics.sink_queue_memory_pressure.get(),
                 if stalled { "stalled" } else { "ok" },
             );
             let status = if stalled {
@@ -1752,18 +1853,6 @@ mod tests {
         assert_eq!(second, (2, 0, 30));
     }
 
-    #[test]
-    fn namespace_allowlist_never_discards_agent_gaps() {
-        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
-        let record = ring_buffer_gap_records(&producer, "kernel.tcp.connect", 1, 10, 20)
-            .into_iter()
-            .next()
-            .expect("gap record");
-        let allow = HashSet::from(["workloads".to_string()]);
-
-        assert!(record_in_namespace_scope(&record, &allow));
-    }
-
     // ── sink loop retry cadence (jalki #39) ─────────────────────────────────
     //
     // Driven on tokio's paused clock: `advance` fires the retry timer without
@@ -1787,6 +1876,9 @@ mod tests {
         append_cost: Duration,
         attempts: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<String>>>,
+        /// Every record accepted, in delivery order — gap evidence included,
+        /// so tests can read what a delivered gap says.
+        records: Arc<StdMutex<Vec<EvidenceRecord>>>,
     }
 
     #[async_trait::async_trait]
@@ -1814,6 +1906,10 @@ mod tests {
             }
             let n = batch.len();
             self.delivered.lock().unwrap().push(batch.batch_id.clone());
+            self.records
+                .lock()
+                .unwrap()
+                .extend(batch.records.iter().cloned());
             Ok(AppendResult {
                 accepted_count: n,
                 rejected_count: 0,
@@ -1831,24 +1927,55 @@ mod tests {
     }
 
     struct Harness {
-        tx: mpsc::Sender<Vec<EvidenceRecord>>,
+        tx: SinkQueueSender,
         up: Arc<AtomicBool>,
         overloaded: Arc<AtomicBool>,
         attempts: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<String>>>,
+        records: Arc<StdMutex<Vec<EvidenceRecord>>>,
         metrics: Arc<Metrics>,
         handle: tokio::task::JoinHandle<()>,
     }
 
+    /// Everything a test loop can be built with; `new` gives the defaults the
+    /// cadence tests were written against (sink down, no scope, no pressure,
+    /// no spool, the default queue budget).
+    struct LoopOptions {
+        backoff: RetryBackoffConfig,
+        pace: DrainPaceConfig,
+        append_cost: Duration,
+        queue: SinkQueueConfig,
+        scope: Option<HashSet<String>>,
+        retry: RetryBufferConfig,
+        memory_pressure: Option<MemoryPressure>,
+        spool: Option<Spool>,
+    }
+
+    impl LoopOptions {
+        fn new(backoff: RetryBackoffConfig, pace: DrainPaceConfig, append_cost: Duration) -> Self {
+            Self {
+                backoff,
+                pace,
+                append_cost,
+                queue: SinkQueueConfig::default(),
+                scope: None,
+                retry: RetryBufferConfig::default(),
+                memory_pressure: None,
+                spool: None,
+            }
+        }
+    }
+
+    fn unpaced() -> DrainPaceConfig {
+        DrainPaceConfig {
+            max_bytes_per_sec: u64::MAX / 4,
+            max_batches_per_sec: u64::MAX / 4,
+            ..DrainPaceConfig::default()
+        }
+    }
+
     fn spawn_loop(backoff_config: RetryBackoffConfig) -> Harness {
-        spawn_loop_paced(
-            backoff_config,
-            DrainPaceConfig {
-                max_bytes_per_sec: u64::MAX / 4,
-                max_batches_per_sec: u64::MAX / 4,
-                ..DrainPaceConfig::default()
-            },
-        )
+        spawn_loop_paced(backoff_config, unpaced())
     }
 
     fn spawn_loop_paced(
@@ -1863,30 +1990,35 @@ mod tests {
         pace_config: DrainPaceConfig,
         append_cost: Duration,
     ) -> Harness {
-        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(64);
+        spawn_with(LoopOptions::new(backoff_config, pace_config, append_cost))
+    }
+
+    fn spawn_with(options: LoopOptions) -> Harness {
         let up = Arc::new(AtomicBool::new(false));
         let overloaded = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         let delivered = Arc::new(StdMutex::new(Vec::new()));
+        let records = Arc::new(StdMutex::new(Vec::new()));
         let metrics = Arc::new(Metrics::new());
+        let (tx, rx) = sink_queue::channel(options.queue, options.scope, metrics.clone());
         let handle = tokio::spawn(run_sink_loop(SinkLoop {
             rx,
             sink: Box::new(ControlledSink {
                 up: up.clone(),
                 overloaded: overloaded.clone(),
-                append_cost,
+                append_cost: options.append_cost,
                 attempts: attempts.clone(),
                 delivered: delivered.clone(),
+                records: records.clone(),
             }),
             metrics: metrics.clone(),
             producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
             enricher: Arc::new(NoopEnricher),
-            namespace_allowlist: None,
-            retry_config: RetryBufferConfig::default(),
-            backoff_config,
-            pace_config,
-            memory_pressure: None,
-            spool: None,
+            retry_config: options.retry,
+            backoff_config: options.backoff,
+            pace_config: options.pace,
+            memory_pressure: options.memory_pressure,
+            spool: options.spool,
         }));
         Harness {
             tx,
@@ -1894,9 +2026,18 @@ mod tests {
             overloaded,
             attempts,
             delivered,
+            records,
             metrics,
             handle,
         }
+    }
+
+    /// Offer a message the test expects the queue to take.
+    fn push(h: &Harness, records: Vec<EvidenceRecord>) {
+        assert_eq!(
+            h.tx.try_send(records).expect("queue open"),
+            sink_queue::Admission::Admitted
+        );
     }
 
     /// Let the loop consume whatever is queued. On a paused clock nothing else
@@ -1905,7 +2046,7 @@ mod tests {
     /// means "not delivered yet".
     async fn drain(h: &Harness) {
         for _ in 0..2_000 {
-            if h.tx.capacity() == h.tx.max_capacity() {
+            if h.tx.queued_messages() == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1969,7 +2110,7 @@ mod tests {
         });
 
         // One batch against a down sink: attempted inline, then buffered.
-        h.tx.send(one_record()).await.unwrap();
+        push(&h, one_record());
         tokio::time::advance(Duration::from_millis(10)).await;
         let after_first = h.attempts.load(Ordering::SeqCst);
         assert_eq!(after_first, 1, "the inline attempt still happens");
@@ -2010,7 +2151,7 @@ mod tests {
 
         // 200 batches against a down sink, all inside one backoff window.
         for _ in 0..200 {
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
         }
         drain(&h).await;
 
@@ -2048,7 +2189,7 @@ mod tests {
         });
 
         // Climb the ladder against a down sink, then let it drain.
-        h.tx.send(one_record()).await.unwrap();
+        push(&h, one_record());
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
         h.up.store(true, Ordering::SeqCst);
@@ -2063,7 +2204,7 @@ mod tests {
         // Second outage: the first retry must come at ~base, not at the cap the
         // previous outage climbed to.
         h.up.store(false, Ordering::SeqCst);
-        h.tx.send(one_record()).await.unwrap();
+        push(&h, one_record());
         tokio::time::advance(Duration::from_millis(10)).await;
         tokio::task::yield_now().await;
         let before = h.attempts.load(Ordering::SeqCst);
@@ -2252,7 +2393,7 @@ mod tests {
             base_ms: 60_000,
             max_ms: 60_000,
         });
-        h.tx.send(one_record()).await.unwrap();
+        push(&h, one_record());
         drain(&h).await;
 
         assert!(
@@ -2300,7 +2441,7 @@ mod tests {
 
         // Build a backlog against a down sink.
         for _ in 0..60 {
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
         }
         drain(&h).await;
         assert!(
@@ -2352,7 +2493,7 @@ mod tests {
                 },
             );
             for _ in 0..200 {
-                h.tx.send(one_record()).await.unwrap();
+                push(&h, one_record());
             }
             drain(&h).await;
 
@@ -2422,7 +2563,7 @@ mod tests {
         );
 
         for _ in 0..60 {
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
         }
         drain(&h).await;
         h.up.store(true, Ordering::SeqCst);
@@ -2431,18 +2572,18 @@ mod tests {
         tokio::time::advance(Duration::from_millis(100)).await;
         tokio::task::yield_now().await;
         for _ in 0..8 {
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
         }
 
-        let filled = h.tx.capacity();
+        let filled = h.tx.queued_messages();
         let mut waited = Duration::ZERO;
-        while h.tx.capacity() == filled && waited < Duration::from_secs(30) {
+        while h.tx.queued_messages() == filled && waited < Duration::from_secs(30) {
             tokio::time::advance(Duration::from_millis(10)).await;
             tokio::task::yield_now().await;
             waited += Duration::from_millis(10);
         }
         assert!(
-            h.tx.capacity() > filled,
+            h.tx.queued_messages() < filled,
             "the loop never came back for the fresh evidence"
         );
 
@@ -2483,6 +2624,7 @@ mod tests {
             overloaded: Arc::new(AtomicBool::new(false)),
             attempts: Arc::new(AtomicUsize::new(0)),
             delivered: Arc::new(StdMutex::new(Vec::new())),
+            records: Arc::new(StdMutex::new(Vec::new())),
             append_cost: Duration::ZERO,
         };
         let attempts = sink.attempts.clone();
@@ -2540,6 +2682,7 @@ mod tests {
             overloaded: Arc::new(AtomicBool::new(false)),
             attempts: Arc::new(AtomicUsize::new(0)),
             delivered: Arc::new(StdMutex::new(Vec::new())),
+            records: Arc::new(StdMutex::new(Vec::new())),
             append_cost: Duration::ZERO,
         };
         let delivered = sink.delivered.clone();
@@ -2587,6 +2730,11 @@ mod tests {
 
     // ── self-shedding under memory pressure (jalki #33) ─────────────────────
 
+    /// A queue with nothing in it, for the shedding tests about the retry buffer.
+    fn idle_queue() -> (SinkQueueSender, SinkQueueReceiver) {
+        sink_queue::channel(SinkQueueConfig::default(), None, Arc::new(Metrics::new()))
+    }
+
     fn fake_cgroup(name: &str, current: u64, max: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("jalki-rt-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2613,12 +2761,14 @@ mod tests {
         // 900Mi of a 1Gi limit.
         let dir = fake_cgroup("high", 943_718_400, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        let (_queue_tx, queue) = idle_queue();
 
         shed_under_memory_pressure(
             &pressure,
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut CeilingState::default(),
         );
@@ -2646,12 +2796,14 @@ mod tests {
         // trying to deliver; shedding it early would be self-defeating.
         let dir = fake_cgroup("low", 314_572_800, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        let (_queue_tx, queue) = idle_queue();
 
         shed_under_memory_pressure(
             &pressure,
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut CeilingState::default(),
         );
@@ -2681,12 +2833,14 @@ mod tests {
         // 980Mi of 1Gi, empty buffer — the exact silent path from the incident.
         let dir = fake_cgroup("doomed", 1_027_604_480, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        let (_queue_tx, queue) = idle_queue();
 
         shed_under_memory_pressure(
             &pressure,
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut ceiling,
         );
@@ -2722,12 +2876,14 @@ mod tests {
         let current = (limit as f64 * 0.9) as u64;
         let dir = fake_cgroup("shed-works", current, &limit.to_string());
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        let (_queue_tx, queue) = idle_queue();
 
         shed_under_memory_pressure(
             &pressure,
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut ceiling,
         );
@@ -2752,11 +2908,13 @@ mod tests {
 
         let dir = fake_cgroup("recover-high", 1_027_604_480, "1073741824");
         let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        let (_queue_tx, queue) = idle_queue();
         shed_under_memory_pressure(
             &pressure,
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut ceiling,
         );
@@ -2769,6 +2927,7 @@ mod tests {
             0.8,
             &mut buffer,
             &mut gaps,
+            &queue,
             &metrics,
             &mut ceiling,
         );
@@ -2791,50 +2950,19 @@ mod tests {
     }
 
     fn spool_loop(path: &std::path::Path) -> Harness {
-        let (tx, rx) = mpsc::channel::<Vec<EvidenceRecord>>(64);
-        let up = Arc::new(AtomicBool::new(false));
-        let overloaded = Arc::new(AtomicBool::new(false));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let delivered = Arc::new(StdMutex::new(Vec::new()));
-        let metrics = Arc::new(Metrics::new());
-        let handle = tokio::spawn(run_sink_loop(SinkLoop {
-            rx,
-            sink: Box::new(ControlledSink {
-                up: up.clone(),
-                overloaded: overloaded.clone(),
-                attempts: attempts.clone(),
-                delivered: delivered.clone(),
-                append_cost: Duration::ZERO,
-            }),
-            metrics: metrics.clone(),
-            producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
-            enricher: Arc::new(NoopEnricher),
-            namespace_allowlist: None,
-            retry_config: RetryBufferConfig::default(),
-            backoff_config: RetryBackoffConfig {
+        let mut options = LoopOptions::new(
+            RetryBackoffConfig {
                 base_ms: 10,
                 max_ms: 10,
             },
-            pace_config: DrainPaceConfig {
-                max_bytes_per_sec: u64::MAX / 4,
-                max_batches_per_sec: u64::MAX / 4,
-                ..DrainPaceConfig::default()
-            },
-            memory_pressure: None,
-            spool: Spool::open(SpoolConfig {
-                path: path.to_path_buf(),
-                max_bytes: 16 * 1024 * 1024,
-            }),
-        }));
-        Harness {
-            tx,
-            up,
-            overloaded,
-            attempts,
-            delivered,
-            metrics,
-            handle,
-        }
+            unpaced(),
+            Duration::ZERO,
+        );
+        options.spool = Spool::open(SpoolConfig {
+            path: path.to_path_buf(),
+            max_bytes: 16 * 1024 * 1024,
+        });
+        spawn_with(options)
     }
 
     /// #33's outstanding acceptance criterion since it was filed: restart
@@ -2849,7 +2977,7 @@ mod tests {
         {
             let h = spool_loop(&path);
             for _ in 0..6 {
-                h.tx.send(one_record()).await.unwrap();
+                push(&h, one_record());
             }
             drain(&h).await;
             assert!(
@@ -2868,7 +2996,7 @@ mod tests {
         {
             let h = spool_loop(&path);
             h.up.store(true, Ordering::SeqCst);
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
             advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
 
             assert_eq!(
@@ -2894,7 +3022,7 @@ mod tests {
         let h = spool_loop(&path);
         h.up.store(true, Ordering::SeqCst);
         for _ in 0..5 {
-            h.tx.send(one_record()).await.unwrap();
+            push(&h, one_record());
         }
         advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
 
@@ -2904,6 +3032,504 @@ mod tests {
             0,
             "a healthy sink leaves no disk residue to replay"
         );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    // ── the reader→sink queue in the loop (jalki#97) ────────────────────────
+
+    use sink_queue::Admission;
+
+    fn queue_unit() -> usize {
+        jalki_evidence::resident_bytes(&one_record())
+    }
+
+    fn delivered_gaps(h: &Harness) -> Vec<HashMap<String, String>> {
+        h.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.occurrence.occurrence_type.as_str() == "jalki.agent.gap")
+            .map(|r| r.occurrence.labels.clone())
+            .collect()
+    }
+
+    fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> &'a str {
+        labels.get(key).map(String::as_str).unwrap_or("")
+    }
+
+    /// The issue's test. A sink that takes 75 ms per append against a burst of
+    /// 5,000 messages: before jalki#97 every one was accepted and held (the
+    /// OOM); now the queue holds its budget, refuses the rest, and the refusal
+    /// arrives as gap evidence after what was accepted.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_sink_cannot_grow_the_queue_past_its_budget() {
+        let budget = 21 * queue_unit();
+        let mut options = LoopOptions::new(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            unpaced(),
+            Duration::from_millis(75),
+        );
+        options.queue = SinkQueueConfig {
+            max_bytes: budget,
+            pressure_max_bytes: budget,
+        };
+        let h = spawn_with(options);
+        h.up.store(true, Ordering::SeqCst);
+
+        // No yield between offers, so the loop cannot run: this is the queue
+        // alone against the burst. (A queue that blocked would hang here — the
+        // test runtime has one thread.)
+        let (mut admitted, mut refused) = (0, 0);
+        for _ in 0..5_000 {
+            match h.tx.try_send(one_record()).expect("queue open") {
+                Admission::Admitted => admitted += 1,
+                Admission::Refused => refused += 1,
+                Admission::OutOfScope => panic!("no scope is configured"),
+            }
+        }
+        assert_eq!((admitted, refused), (21, 4_979));
+        assert!(h.tx.queued_bytes() <= budget);
+        assert_eq!(
+            h.metrics.sink_queue_bytes.get(),
+            h.tx.queued_bytes() as i64,
+            "the gauge is live while the loop has not run at all"
+        );
+
+        advance_draining(&h, Duration::from_secs(30), Duration::from_millis(100)).await;
+
+        let records = h.records.lock().unwrap().clone();
+        let evidence = records
+            .iter()
+            .filter(|r| r.occurrence.occurrence_type.as_str() == "kernel.tcp.connect")
+            .count();
+        assert_eq!(evidence, 21, "everything admitted is delivered");
+        let gaps = delivered_gaps(&h);
+        assert_eq!(gaps.len(), 1, "one gap for the whole burst: {gaps:?}");
+        assert_eq!(label(&gaps[0], "cause"), "sink_queue_overflow");
+        assert_eq!(label(&gaps[0], "dropped_records"), "4979");
+        assert_eq!(
+            label(&gaps[0], "affected_probes"),
+            "[\"kernel.tcp.connect\"]"
+        );
+        assert_eq!(
+            records
+                .last()
+                .map(|r| r.occurrence.occurrence_type.as_str()),
+            Some("jalki.agent.gap"),
+            "behind what was queued before it"
+        );
+        assert_eq!(h.metrics.sink_queue_bytes.get(), 0);
+        assert_eq!(h.tx.queued_messages(), 0);
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// The queue's gap must survive the paths that already lose evidence.
+    /// Sent on as plain records it would sit in the retry buffer, be shed
+    /// there, and come out as a gap *about a gap* (`jalki.agent.gap`, count 1)
+    /// with the real count gone. Kept as a report, it is delivered intact, and
+    /// under its own cause rather than merged into `multiple`.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_gap_keeps_its_count_through_a_failing_sink() {
+        let mut options = LoopOptions::new(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            unpaced(),
+            Duration::ZERO,
+        );
+        options.queue = SinkQueueConfig {
+            max_bytes: 10 * queue_unit(),
+            pressure_max_bytes: 10 * queue_unit(),
+        };
+        // Small enough that everything that follows overflows it.
+        options.retry = RetryBufferConfig {
+            max_records: 2,
+            max_batches: 8,
+            max_age_ms: 600_000,
+            max_bytes: usize::MAX,
+        };
+        let h = spawn_with(options);
+
+        let refused = (0..50)
+            .filter(|_| h.tx.try_send(one_record()).expect("queue open") == Admission::Refused)
+            .count();
+        assert_eq!(refused, 40);
+        drain(&h).await;
+        // More evidence behind the gap, through the overflowing retry buffer.
+        for _ in 0..3 {
+            push(&h, one_record());
+        }
+        drain(&h).await;
+
+        h.up.store(true, Ordering::SeqCst);
+        advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
+
+        let gaps = delivered_gaps(&h);
+        assert!(
+            gaps.iter()
+                .any(|g| label(g, "cause") == "sink_queue_overflow"
+                    && label(g, "dropped_records") == "40"
+                    && label(g, "affected_probes") == "[\"kernel.tcp.connect\"]"),
+            "the queue's gap arrives with its count: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .all(|g| !label(g, "affected_probes").contains("jalki.agent.gap")),
+            "no gap about a gap: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| label(g, "cause") == "retry_buffer_overflow"),
+            "and the retry buffer's own loss is reported apart: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().all(|g| label(g, "cause") != "multiple"),
+            "{gaps:?}"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// Unbound records are counted where they are admitted. Counting them in
+    /// the loop as well (where it used to happen) would count each twice.
+    #[tokio::test(start_paused = true)]
+    async fn unbound_records_are_counted_once() {
+        let h = spawn_loop(RetryBackoffConfig::default());
+        h.up.store(true, Ordering::SeqCst);
+
+        push(&h, one_record());
+        drain(&h).await;
+
+        assert_eq!(h.records.lock().unwrap().len(), 1, "delivered");
+        let text = h.metrics.encode();
+        assert!(
+            text.contains("jalki_unbound_dropped_total_total{reason=\"unknown\"} 1\n"),
+            "{text}"
+        );
+
+        drop(h.tx);
+        let _ = h.handle.await;
+    }
+
+    /// Before jalki#97 shedding saw only the retry buffer, so with the growth
+    /// sitting in the queue it reported "nothing meaningful to shed" (the log
+    /// line before each of the six deaths). The queue's excess over its
+    /// pressure budget is memory the agent gives back by itself, and pressure
+    /// mode is what gives it back.
+    #[test]
+    fn queue_bytes_count_toward_what_shedding_can_free() {
+        let unit = queue_unit();
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        let mut ceiling = CeilingState::default();
+        let (tx, queue) = sink_queue::channel(
+            SinkQueueConfig {
+                max_bytes: 40 * unit,
+                pressure_max_bytes: 4 * unit,
+            },
+            None,
+            Arc::new(Metrics::new()),
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                tx.try_send(one_record()).expect("open"),
+                Admission::Admitted
+            );
+        }
+
+        // The queue holds a quarter of the limit, and memory sits at 0.9:
+        // draining the queue to its pressure budget brings it under 0.8.
+        let limit = tx.queued_bytes() as u64 * 4;
+        let dir = fake_cgroup(
+            "queue-freeable",
+            (limit as f64 * 0.9) as u64,
+            &limit.to_string(),
+        );
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &queue,
+            &metrics,
+            &mut ceiling,
+        );
+
+        assert_eq!(
+            metrics.memory_ceiling_no_shed.get(),
+            0,
+            "the queue is memory the agent can give back"
+        );
+        assert!(queue.memory_pressure());
+        assert_eq!(
+            tx.try_send(one_record()).expect("open"),
+            Admission::Refused,
+            "and pressure mode is what gives it back"
+        );
+
+        std::fs::write(dir.join("memory.current"), format!("{}\n", limit / 2)).unwrap();
+        shed_under_memory_pressure(
+            &pressure,
+            0.8,
+            &mut buffer,
+            &mut gaps,
+            &queue,
+            &metrics,
+            &mut ceiling,
+        );
+        assert!(!queue.memory_pressure());
+        assert_eq!(
+            tx.try_send(one_record()).expect("open"),
+            Admission::Admitted
+        );
+    }
+
+    /// On at the watermark, off only clearly below it: a ratio hovering at the
+    /// watermark must not flip the queue's budget every iteration.
+    #[test]
+    fn queue_pressure_releases_only_clearly_below_the_watermark() {
+        let metrics = Metrics::new();
+        let mut buffer = RetryBuffer::new(RetryBufferConfig::default());
+        let mut gaps = PendingGaps::default();
+        let mut ceiling = CeilingState::default();
+        let (_tx, queue) = idle_queue();
+        let limit: u64 = 1 << 30;
+        let dir = fake_cgroup("queue-hysteresis", 0, &limit.to_string());
+        let pressure = MemoryPressure::at(&dir, None).expect("detected");
+
+        let mut at = |ratio: f64| {
+            std::fs::write(
+                dir.join("memory.current"),
+                format!("{}\n", (limit as f64 * ratio) as u64),
+            )
+            .unwrap();
+            shed_under_memory_pressure(
+                &pressure,
+                0.8,
+                &mut buffer,
+                &mut gaps,
+                &queue,
+                &metrics,
+                &mut ceiling,
+            );
+            queue.memory_pressure()
+        };
+
+        assert!(!at(0.79), "below the watermark");
+        assert!(at(0.81), "at it");
+        assert!(at(0.78), "still on just under it");
+        assert!(!at(0.74), "off once clearly below");
+        assert!(!at(0.79), "and on again only at the watermark");
+    }
+
+    #[test]
+    fn pending_gaps_keep_causes_apart() {
+        let producer = ProducerMetadata::new("test", "node-1", "6.17.0");
+        let gap = |cause: &str, n: usize| GapReport {
+            cause: cause.into(),
+            affected_probes: vec!["kernel.tcp.connect".into()],
+            dropped_records: n,
+            gap_start_ns: 10,
+            gap_end_ns: 20,
+            dropped_reliability: 0,
+            dropped_attribution: n,
+        };
+        let mut pending = PendingGaps::default();
+        pending.merge(gap("retry_buffer_overflow", 2));
+        pending.merge(gap("sink_queue_overflow", 40));
+        pending.merge(gap("retry_buffer_overflow", 3));
+        assert_eq!(pending.len(), 2);
+
+        let mut delivered = Vec::new();
+        while let Some(batch) = pending.front(&producer) {
+            let labels = &batch.records[0].occurrence.labels;
+            delivered.push((
+                label(labels, "cause").to_string(),
+                label(labels, "dropped_records").to_string(),
+            ));
+            pending.pop_front();
+        }
+        assert_eq!(
+            delivered,
+            vec![
+                ("retry_buffer_overflow".to_string(), "5".to_string()),
+                ("sink_queue_overflow".to_string(), "40".to_string()),
+            ]
+        );
+    }
+
+    /// The queue is shown on /readyz for whoever is looking, but a full queue
+    /// is not a stalled sink and does not make the agent NotReady.
+    #[tokio::test]
+    async fn readyz_reports_the_sink_queue_without_failing_on_it() {
+        let metrics = Arc::new(Metrics::new());
+        metrics.sink_queue_bytes.set(1_000);
+        metrics.sink_queue_max_bytes.set(1_000);
+        metrics.sink_queue_memory_pressure.set(1);
+
+        let (status, body) = probe_request(&metrics, "/readyz", 60).await;
+        assert!(status.contains("200"), "{status}");
+        assert!(body.contains("sink_queue_bytes=1000\n"), "{body}");
+        assert!(body.contains("sink_queue_max_bytes=1000\n"), "{body}");
+        assert!(body.contains("sink_queue_memory_pressure=1\n"), "{body}");
+    }
+
+    /// A gap batch the sink committed but reported as timed out is
+    /// retried with the same occurrence ids, so the idempotency key dedupes it
+    /// instead of Vartio counting the loss twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_queue_gap_keeps_its_occurrence_ids() {
+        struct CommitThenTimeoutOnGap {
+            seen: Arc<StdMutex<Vec<EvidenceRecord>>>,
+            failed_once: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl EvidenceSink for CommitThenTimeoutOnGap {
+            fn name(&self) -> &str {
+                "commit-then-timeout"
+            }
+            async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .extend(batch.records.iter().cloned());
+                let is_gap = batch
+                    .records
+                    .iter()
+                    .any(|r| r.occurrence.occurrence_type.as_str() == "jalki.agent.gap");
+                if is_gap && !self.failed_once.swap(true, Ordering::SeqCst) {
+                    return Err(SinkError::Timeout {
+                        sink: "commit-then-timeout".into(),
+                        message: "committed, reply lost".into(),
+                    });
+                }
+                Ok(AppendResult {
+                    accepted_count: batch.len(),
+                    rejected_count: 0,
+                    sink_name: "commit-then-timeout".into(),
+                    watermark: None,
+                    warnings: Vec::new(),
+                })
+            }
+            async fn health(&self) -> HealthStatus {
+                HealthStatus::Healthy
+            }
+        }
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let metrics = Arc::new(Metrics::new());
+        let (tx, rx) = sink_queue::channel(
+            SinkQueueConfig {
+                max_bytes: queue_unit(),
+                pressure_max_bytes: queue_unit(),
+            },
+            None,
+            metrics.clone(),
+        );
+        let handle = tokio::spawn(run_sink_loop(SinkLoop {
+            rx,
+            sink: Box::new(CommitThenTimeoutOnGap {
+                seen: seen.clone(),
+                failed_once: AtomicBool::new(false),
+            }),
+            metrics,
+            producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
+            enricher: Arc::new(NoopEnricher),
+            retry_config: RetryBufferConfig::default(),
+            backoff_config: RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            pace_config: unpaced(),
+            memory_pressure: None,
+            spool: None,
+        }));
+        assert_eq!(tx.try_send(one_record()).unwrap(), Admission::Admitted);
+        assert_eq!(tx.try_send(one_record()).unwrap(), Admission::Refused);
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        let ids: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.occurrence.occurrence_type.as_str() == "jalki.agent.gap")
+            .map(|r| r.occurrence.id.to_string())
+            .collect();
+        assert_eq!(ids.len(), 2, "attempted inline, then retried: {ids:?}");
+        assert_eq!(
+            ids[0], ids[1],
+            "the retry must resend the same occurrence id"
+        );
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// A queue gap whose inline delivery fails is kept, not dropped:
+    /// it waits in the pending gaps and is delivered once the sink recovers.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_gap_survives_a_failed_inline_append() {
+        let mut options = LoopOptions::new(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            unpaced(),
+            Duration::from_millis(75),
+        );
+        options.queue = SinkQueueConfig {
+            max_bytes: queue_unit(),
+            pressure_max_bytes: queue_unit(),
+        };
+        let h = spawn_with(options);
+        h.up.store(true, Ordering::SeqCst);
+
+        push(&h, one_record());
+        assert_eq!(
+            h.tx.try_send(one_record()).expect("queue open"),
+            Admission::Refused
+        );
+
+        // Let the record's inline append succeed, then fail the gap's.
+        let mut waited = Duration::ZERO;
+        while h.records.lock().unwrap().is_empty() && waited < Duration::from_secs(5) {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            waited += Duration::from_millis(1);
+        }
+        assert_eq!(
+            h.records.lock().unwrap().len(),
+            1,
+            "record delivered inline"
+        );
+        h.up.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            delivered_gaps(&h).is_empty(),
+            "precondition: the inline gap append failed"
+        );
+        assert!(h.attempts.load(Ordering::SeqCst) >= 2);
+
+        h.up.store(true, Ordering::SeqCst);
+        advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
+        let gaps = delivered_gaps(&h);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(label(&gaps[0], "cause"), "sink_queue_overflow");
+        assert_eq!(label(&gaps[0], "dropped_records"), "1");
 
         drop(h.tx);
         let _ = h.handle.await;

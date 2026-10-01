@@ -307,7 +307,9 @@ impl EvidenceRecord {
         Some(occ)
     }
 
-    fn is_agent_record(&self) -> bool {
+    /// The agent's own records (`jalki.agent.*`, e.g. gap evidence): never
+    /// namespace-scoped and never dropped for lacking a binding.
+    pub fn is_agent_record(&self) -> bool {
         self.occurrence
             .occurrence_type
             .as_str()
