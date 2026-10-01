@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
-use jalki_evidence::EvidenceRecord;
+use jalki_evidence::{EvidenceRecord, NormalizedEvidence};
+use prometheus_client::metrics::counter::Counter;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -206,6 +207,14 @@ fn drain_loop(
     let drop_metric_label = ProbeLabel {
         probe: probe_name.to_string(),
     };
+    let intake = RecordIntake::new(
+        probe_name,
+        stats.clone(),
+        &metrics,
+        store,
+        enricher,
+        sensitive_path_matcher,
+    );
 
     loop {
         // Checked before draining, so a detach cannot be delayed by a busy ring
@@ -237,22 +246,7 @@ fn drain_loop(
             let raw = item.as_ref();
 
             match probe.to_evidence(raw, cluster) {
-                Ok(evidence) => {
-                    for record in evidence.records {
-                        if !record_matches_sensitive_paths(&record, sensitive_path_matcher.as_ref())
-                        {
-                            stats.events_sampled_out.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        let record = bind_record(record, enricher.as_ref());
-                        // The local debug store keeps the lean occurrence shape used by
-                        // IPC stream/watch. Durable sinks project D6 metadata later via
-                        // EvidenceBatch::into_occurrences().
-                        store.push(probe_name, record.occurrence.clone());
-                        stats.events_emitted.fetch_add(1, Ordering::Relaxed);
-                        records.push(record);
-                    }
-                }
+                Ok(evidence) => intake.admit(evidence, &mut records),
                 Err(e) => {
                     stats.parse_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(probe = probe_name, error = %e, "failed to parse event");
@@ -295,6 +289,76 @@ fn drain_loop(
             // No events available — sleep briefly before polling again.
             // TODO: wire up epoll via ring_buf fd for zero-latency wakeup.
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// What the reader does with one decoded event: the sensitive-path gate,
+/// runtime binding, the local store and the per-probe counters.
+///
+/// Split out of `drain_loop`, which needs a live ring buffer, so tests drive
+/// the same code the daemon runs.
+pub(crate) struct RecordIntake {
+    probe_name: String,
+    stats: Arc<ProbeStats>,
+    /// This probe's `jalki_events_total` series, taken once: it exists (at 0)
+    /// from attach, so `rate()` works from the first scrape, and the hot path
+    /// is one atomic add rather than a family lookup per event.
+    events_total: Counter,
+    store: Arc<EventStore>,
+    enricher: Arc<dyn RuntimeEnricher>,
+    sensitive_path_matcher: Arc<SensitivePathMatcher>,
+}
+
+impl RecordIntake {
+    pub(crate) fn new(
+        probe_name: &str,
+        stats: Arc<ProbeStats>,
+        metrics: &Metrics,
+        store: Arc<EventStore>,
+        enricher: Arc<dyn RuntimeEnricher>,
+        sensitive_path_matcher: Arc<SensitivePathMatcher>,
+    ) -> Self {
+        let events_total = metrics
+            .events_total
+            .get_or_create(&ProbeLabel {
+                probe: probe_name.to_string(),
+            })
+            .clone();
+        Self {
+            probe_name: probe_name.to_string(),
+            stats,
+            events_total,
+            store,
+            enricher,
+            sensitive_path_matcher,
+        }
+    }
+
+    /// Gate, bind, store and count `evidence`, appending what passes to `out`.
+    pub(crate) fn admit(&self, evidence: NormalizedEvidence, out: &mut Vec<EvidenceRecord>) {
+        let mut emitted = 0u64;
+        for record in evidence.records {
+            if !record_matches_sensitive_paths(&record, self.sensitive_path_matcher.as_ref()) {
+                self.stats
+                    .events_sampled_out
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let record = bind_record(record, self.enricher.as_ref());
+            // The local debug store keeps the lean occurrence shape used by
+            // IPC stream/watch. Durable sinks project D6 metadata later via
+            // EvidenceBatch::into_occurrences().
+            self.store.push(&self.probe_name, record.occurrence.clone());
+            emitted += 1;
+            out.push(record);
+        }
+        if emitted > 0 {
+            // Same point, same number: the metric and `jalki status` agree.
+            self.stats
+                .events_emitted
+                .fetch_add(emitted, Ordering::Relaxed);
+            self.events_total.inc_by(emitted);
         }
     }
 }
@@ -495,6 +559,94 @@ mod tests {
         let mut record = open_attempt("/home/runner/.ssh/id_rsa");
         record.occurrence.labels.remove("requested_path");
         assert!(!sensitive(&record));
+    }
+
+    // ── jalki_events_total{probe} (jalki#97 fix 4) ──────────────────────────
+
+    fn tcp_connect_evidence() -> NormalizedEvidence {
+        KernelEvent::TcpConnect(jalki_evidence::TcpConnectEvent {
+            observed_at_ns: 1,
+            pid: 1,
+            tid: 1,
+            src_ip: "10.0.0.1".parse().expect("ip"),
+            dst_ip: "10.0.0.2".parse().expect("ip"),
+            src_port: 1234,
+            dst_port: 443,
+            addr_family: 2,
+            ret: 0,
+            cgroup_id: 1,
+            comm: "curl".into(),
+            netns: 0,
+        })
+        .normalize(probe_meta("tcp_connect", "tcp_connect"), "prod")
+    }
+
+    fn intake(probe: &str, metrics: &Metrics) -> (RecordIntake, Arc<ProbeStats>, Arc<EventStore>) {
+        let stats = Arc::new(ProbeStats::new());
+        let store = Arc::new(EventStore::new(16));
+        let intake = RecordIntake::new(
+            probe,
+            stats.clone(),
+            metrics,
+            store.clone(),
+            Arc::new(crate::enrich::NoopEnricher),
+            Arc::new(SensitivePathMatcher::default_patterns()),
+        );
+        (intake, stats, store)
+    }
+
+    fn stored(store: &EventStore, probe: &str) -> usize {
+        store
+            .query(probe, &crate::store::EventFilter::default())
+            .len()
+    }
+
+    /// Before jalki#97 the series was registered and never incremented, so a
+    /// node drowning in failed opens could only be diagnosed with
+    /// `kubectl exec … jalki status`.
+    #[test]
+    fn admitted_records_count_as_events_per_probe() {
+        let metrics = Metrics::new();
+        let (intake, stats, store) = intake("tcp_connect", &metrics);
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            intake.admit(tcp_connect_evidence(), &mut out);
+        }
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(stats.events_emitted.load(Ordering::Relaxed), 3);
+        assert_eq!(stored(&store, "tcp_connect"), 3);
+        let text = metrics.encode();
+        assert!(
+            text.contains("jalki_events_total{probe=\"tcp_connect\"} 3"),
+            "{text}"
+        );
+    }
+
+    /// What the path gate refuses is not an event: not stored, not counted,
+    /// not sent on. (`events_sampled_out` counts it — a pre-existing misnomer.)
+    #[test]
+    fn path_filtered_records_are_not_events() {
+        let metrics = Metrics::new();
+        let (intake, stats, store) = intake("file_open_attempt", &metrics);
+        let attempt = |path: &str| NormalizedEvidence::single(open_attempt(path));
+        let mut out = Vec::new();
+
+        intake.admit(attempt("/home/runner/_work/x/target/libfoo.so"), &mut out);
+        assert!(out.is_empty());
+        assert_eq!(stats.events_emitted.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.events_sampled_out.load(Ordering::Relaxed), 1);
+        assert_eq!(stored(&store, "file_open_attempt"), 0);
+        assert!(metrics
+            .encode()
+            .contains("jalki_events_total{probe=\"file_open_attempt\"} 0"));
+
+        intake.admit(attempt("/home/runner/.ssh/id_rsa"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(stored(&store, "file_open_attempt"), 1);
+        assert!(metrics
+            .encode()
+            .contains("jalki_events_total{probe=\"file_open_attempt\"} 1"));
     }
 
     /// Regression: `kernel.file.open` keeps matching on its resolved identity,

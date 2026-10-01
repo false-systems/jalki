@@ -115,10 +115,16 @@ impl Metrics {
     pub fn new() -> Self {
         let mut registry = Registry::default();
 
+        // Registered without the `_total` suffix: prometheus-client appends
+        // it to every counter, so this is scraped as `jalki_events_total`.
+        // (Registered as `jalki_events_total` it was `_total_total`, and never
+        // had a sample — nothing incremented it before jalki#97.)
         let events_total = Family::<ProbeLabel, Counter>::default();
         registry.register(
-            "jalki_events_total",
-            "Total events emitted per probe",
+            "jalki_events",
+            "Records captured per probe: past the sensitive-path gate and into \
+             the local store, before the namespace scope (the count `jalki \
+             status` shows as events_total)",
             events_total.clone(),
         );
 
@@ -241,5 +247,31 @@ impl Metrics {
         let mut buf = String::new();
         let _ = encode(&mut buf, &self.registry);
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// prometheus-client appends `_total` to every counter it exposes, so a
+    /// counter registered as `jalki_events_total` is scraped as
+    /// `jalki_events_total_total` — not the name the docs and the alerts use.
+    #[test]
+    fn events_total_is_exposed_under_its_documented_name() {
+        let metrics = Metrics::new();
+        metrics
+            .events_total
+            .get_or_create(&ProbeLabel {
+                probe: "tcp_connect".into(),
+            })
+            .inc_by(3);
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("jalki_events_total{probe=\"tcp_connect\"} 3"),
+            "{text}"
+        );
+        assert!(!text.contains("jalki_events_total_total"), "{text}");
     }
 }
