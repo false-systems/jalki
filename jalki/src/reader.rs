@@ -329,6 +329,12 @@ impl RecordIntake {
                 probe: probe_name.to_string(),
             })
             .clone();
+        // Present at 0 from attach as well, so `increase()` sees a probe's
+        // first refusal episode instead of taking it as the series' starting
+        // value.
+        drop(metrics.sink_queue_dropped.get_or_create(&ProbeLabel {
+            probe: probe_name.to_string(),
+        }));
         Self {
             probe_name: probe_name.to_string(),
             stats,
@@ -603,6 +609,16 @@ mod tests {
         store
             .query(probe, &crate::store::EventFilter::default())
             .len()
+    }
+
+    /// The refusal counter exists at 0 from attach, like `events_total`.
+    #[test]
+    fn sink_queue_dropped_exists_at_zero_from_attach() {
+        let metrics = Metrics::new();
+        let _ = intake("tcp_connect", &metrics);
+        assert!(metrics
+            .encode()
+            .contains("jalki_sink_queue_dropped_total{probe=\"tcp_connect\"} 0"));
     }
 
     /// Before jalki#97 the series was registered and never incremented, so a
