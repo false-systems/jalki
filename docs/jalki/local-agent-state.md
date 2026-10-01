@@ -18,6 +18,7 @@ Permitted local state (with declared bounds and eviction policy):
 | BPF maps (HashMap, LRU, percpu arrays) | Per-probe kernel state (e.g. PID_FILTER, in-flight syscall tracking) | Per-map max entries declared at load |
 | Metadata enrichment caches | Cgroup → container, container → pod mappings | Bounded LRU; size declared per agent profile |
 | Retry buffer | Batches that failed to append to the pipeline sink | See §5 |
+| Reader→sink queue | Evidence drained from the ring buffers, waiting for the sink loop (jalki#97). The namespace scope is applied on the way in, so out-of-scope evidence never takes this memory | `JALKI_QUEUE_MAX_BYTES` of estimated resident bytes (default 128 MiB; under memory pressure `max_bytes / 8`, at least 4 MiB). Refuse-newest, never evicts. Gauge `jalki_sink_queue_bytes`. Refusals are counted in `jalki_sink_queue_dropped_total{probe}` and emitted as `jalki.agent.gap` (`sink_queue_overflow`, or `sink_queue_memory_pressure`). A message of only reliability evidence may use three quarters of the budget, so it is refused before attribution evidence (ADR-0006 contract 5, kept at admission rather than by eviction) |
 | In-flight assembly buffers | Multi-fragment events (e.g. argv across pages) | Per-event TTL; expire and emit a `jalki.agent.gap` if unresolved |
 | Capability snapshot draft | Built during agent startup before being emitted as lifecycle/capability evidence | Discarded once sent or superseded |
 | Local debug artifacts pending upload | tar / pcap / verifier logs to be promoted by downstream tooling if configured | Per-agent disk quota; oldest-first eviction with a `jalki.agent.lifecycle` note |
@@ -165,14 +166,17 @@ Whichever bound is hit first triggers the loss policy. Expiry uses a **monotonic
 A `jalki.agent.gap` occurrence (see [`runtime-evidence-model.md`](./runtime-evidence-model.md) §2.11) is the only honest way to express "Jälki was not watching this window". The agent **MUST** emit one when:
 
 - The retry buffer overflowed and records were dropped.
+- The reader→sink queue refused records because it was at its budget (`sink_queue_overflow`) or at its smaller budget under memory pressure (`sink_queue_memory_pressure`).
 - A BPF ring buffer overflowed and the kernel dropped events.
 - A probe was unloaded and reattached during the window (e.g. agent restart).
 - The agent's clock jumped during an outage (per §4.4).
 - A sampling policy intentionally dropped events the policy declares as needing gap markers.
 
+Gap records do not arrive in evidence order. A queue gap, for example, is delivered behind the evidence that was queued when its first refusal happened, but it also counts the refusals that came after. Consumers **MUST** place a gap by `gap_start_ns` / `gap_end_ns`, not by arrival order.
+
 ### 5.4 Backpressure visibility
 
-BPF ring-buffer drops (`jalki_ring_buffer_drops`), sink errors (`jalki_sink_errors`), and unbound drops (`jalki_unbound_dropped_total`) are exported (§7). Operators **SHOULD** alert on sustained sink errors as a signal that the pipeline is intermittently unreachable. (A retry-buffer fill-ratio gauge is planned.)
+BPF ring-buffer drops (`jalki_ring_buffer_drops`), reader→sink queue refusals (`jalki_sink_queue_dropped_total`), sink errors (`jalki_sink_errors`), and unbound drops (`jalki_unbound_dropped_total`) are exported (§7). Operators **SHOULD** alert on sustained sink errors as a signal that the pipeline is intermittently unreachable. (A retry-buffer fill-ratio gauge is planned.)
 
 ## 6. Enrichment locality — **implemented**
 
@@ -203,12 +207,16 @@ Unresolved fields are **omitted, not zero-filled** (e.g. `ppid` is `None` when u
 
 Local Prometheus metrics on `:9090` (not Ahti records). **Implemented:**
 
-- `jalki_events_total{...}` — events captured per probe
+- `jalki_events_total{probe}` — records captured per probe: past the sensitive-path gate and into the local store, before the namespace scope (the same count `jalki status` shows as `events_total`). Incremented since jalki#97; before that it was registered, never incremented, and exposed as `jalki_events_total_total`
 - `jalki_ring_buffer_drops{probe}` — kernel ring-buffer overflow
 - `jalki_attach_errors{probe}` — probe attach failures
 - `jalki_sink_errors{sink}` — pipeline append failures
 - `jalki_unbound_dropped_total{reason}` — Plane-B records dropped for missing/weak binding
 - `jalki_binding_cache_entries` / `jalki_binding_cache_hit_ratio` — enrichment cache health
+- `jalki_sink_queue_bytes` / `jalki_sink_queue_messages` — what waits in the reader→sink queue (estimated resident bytes; messages include a pending gap marker)
+- `jalki_sink_queue_max_bytes` — the configured budget (`JALKI_QUEUE_MAX_BYTES`)
+- `jalki_sink_queue_memory_pressure` — 1 while memory pressure holds the queue to its smaller budget
+- `jalki_sink_queue_dropped_total{probe}` — records the queue refused; each refusal is also a `jalki.agent.gap`
 
 Planned: retry-buffer fill ratio, clock-skew gauge, append-latency histogram. Operators consume these for ops; they do **not** replace the pipeline as the durable evidence path.
 

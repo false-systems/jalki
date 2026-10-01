@@ -264,7 +264,7 @@ emitted by this v0 probe.
 
 **Plane B occurrence type:** `kernel.file.open` — **implemented**. Emitted only for configured sensitive-path patterns. Jälki applies a coarse in-kernel prefix gate before the ring buffer and a precise userspace pattern match before emission. Truncated paths are labeled with `path_truncated=true`.
 
-**Companion — `kernel.file.open_attempt` (implemented):** because `security_file_open` only witnesses successful + LSM-denied opens (see `coverage=lsm_gated`), **failed** opens (DAC/`ENOENT`/etc.) of watched **absolute** paths are captured separately via `sys_enter`/`sys_exit` on `openat`/`openat2`: the requested path is stashed at enter (bounded LRU in-flight map) and emitted on a negative return. It carries `requested_path` / `errno` / `result=failed` / `path_resolution=unresolved` — **not** `resource_ref_id` (that string is *requested*, not a resolved file identity). Relative paths are a documented no-match in v0.1.
+**Companion — `kernel.file.open_attempt` (implemented):** because `security_file_open` only witnesses successful + LSM-denied opens (see `coverage=lsm_gated`), **failed** opens (DAC/`ENOENT`/etc.) of watched **absolute** paths are captured separately via `sys_enter`/`sys_exit` on `openat`/`openat2`: the requested path is stashed at enter (bounded LRU in-flight map) and emitted on a negative return. It carries `requested_path` / `errno` / `result=failed` / `path_resolution=unresolved` — **not** `resource_ref_id` (that string is *requested*, not a resolved file identity). Relative paths are a documented no-match in v0.1. The same two gates apply: the in-kernel coarse prefix, then the full pattern on `requested_path` (before jalki#97 the userspace half was skipped for failed opens, so a default `/home/*/.ssh/` let every failed open under `/home/` through). A truncated requested path (`path_truncated=true`) is kept: the string is caller-controlled and cut at 255 bytes, so the part the pattern needs can be pushed past the cut.
 
 **Scope guard:** the default agent profile **MUST NOT** capture every open. The agent profile **MUST** declare which path patterns are captured. Blanket capture is operationally infeasible and is forbidden by default — see [`local-agent-state.md`](./local-agent-state.md) §sampling.
 
@@ -299,9 +299,9 @@ Scheduler latency / runqueue delay. Source mechanism candidate: `tracepoint:sche
 | Field | Type | Notes |
 |---|---|---|
 | `node_id` | string | |
-| `gap_start_ns` | u64 | Start of the affected monotonic kernel-time window |
+| `gap_start_ns` | u64 | Start of the affected monotonic kernel-time window. Authoritative: gap records do not arrive in evidence order. 0 with `gap_end_ns` 0 means no kernel time is known (only unstamped self-observability records were lost) |
 | `gap_end_ns` | u64 | End of the affected monotonic kernel-time window |
-| `cause` | string | Stable machine-readable cause, including `"ringbuffer_overflow"`, retry-buffer causes, and terminal sink causes such as `"sink_rejected"` |
+| `cause` | string | Stable machine-readable cause, including `"ringbuffer_overflow"`, retry-buffer causes, the reader→sink queue's `"sink_queue_overflow"` and `"sink_queue_memory_pressure"`, and terminal sink causes such as `"sink_rejected"` |
 | `affected_probes` | string[] | `occurrence_type` values affected |
 | `dropped_records` | u64 | Total records known to be lost |
 | `dropped_attribution` | u64 | Lost attribution-class records |

@@ -91,6 +91,12 @@ Delivery order is untouched and remains strictly FIFO; only the *shed* choice
 is class-aware. Reordering delivery would make a drain unreconstructible
 downstream.
 
+The reader→sink queue (jalki#97) is a second bounded buffer and keeps the same
+order without evicting anything: it is enforced at admission. A message of only
+reliability evidence may fill three quarters of the queue's budget, so under
+overload it is refused first and the last quarter stays for attribution
+evidence. What the queue accepted is delivered FIFO.
+
 **Known divergence risk.** This mapping is a second copy of Vartio's
 `@attribution_types` / `@reliability_types`. The producer must own it —
 contract 5 says so, and the shed happens here long before anything reaches
@@ -105,7 +111,12 @@ attribution so a new probe is kept rather than silently shed.
 Every shed emits a `jalki.agent.gap` occurrence carrying cause, per-class
 counts, and the covered time range. Causes are distinguished rather than
 collapsed: `retry_buffer_overflow`, `retry_buffer_expired`, and
-`memory_pressure` are different operational stories.
+`memory_pressure` are different operational stories. So are the reader→sink
+queue's two (jalki#97): `sink_queue_overflow` (fresh evidence refused at the
+queue's budget) and `sink_queue_memory_pressure` (refused at its smaller budget
+under memory pressure). Neither is the retry buffer's `memory_pressure`, which
+gave up old evidence that had been accepted. Pending gap reports are kept per
+cause until delivered, so they are not merged into `multiple`.
 
 Gap occurrences cross the native Vartio sink without a pod/container binding:
 they describe producer coverage for a node, not one workload. The sink
