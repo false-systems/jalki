@@ -95,9 +95,10 @@ curl -s localhost:9090/metrics   # Prometheus registry dump
 ## What to alert on
 
 jälki exports Prometheus metrics on `:9090/metrics`. Six of them cover every
-failure mode we have seen in production; each threshold below has fired for a
-real incident, not a guess. Alerting on anything less means finding out from
-pod logs, later.
+failure mode we have seen in production. Each threshold below comes from a real
+incident, not a guess; all but the newest (`jalki_sink_queue_dropped_total`)
+have also fired in production. Alerting on anything less means finding out
+from pod logs, later.
 
 | Alert when | Why |
 | --- | --- |
