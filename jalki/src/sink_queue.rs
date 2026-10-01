@@ -993,6 +993,41 @@ mod tests {
         assert_eq!(SinkQueueConfig::from_env_value(Some("0")).max_bytes, 0);
     }
 
+    /// A reader message mixes pods; the scope keeps the in-scope records of a
+    /// message and drops the rest, record by record.
+    #[test]
+    fn scope_filters_a_mixed_message_record_by_record() {
+        let (tx, mut rx, _) = queue(DEFAULT_QUEUE_MAX_BYTES, Some(&["workloads"]));
+        let mut mixed = connect_in("workloads");
+        mixed.extend(connect_in("other"));
+        mixed.extend(connect_in("workloads"));
+
+        assert_eq!(send(&tx, mixed), Admission::Admitted);
+        let kept = match drain_now(&mut rx).pop() {
+            Some(Received::Records(records)) => records,
+            other => panic!("expected records, got {other:?}"),
+        };
+        assert_eq!(kept.len(), 2);
+        assert!(kept
+            .iter()
+            .all(|r| r.bound_namespace() == Some("workloads")));
+    }
+
+    /// A refusal is counted and reported per record, not per message.
+    #[test]
+    fn a_refused_message_counts_every_record() {
+        let (tx, mut rx, metrics) = queue(unit(), None);
+        assert_eq!(send(&tx, connect()), Admission::Admitted);
+        let three: Vec<_> = (0..3u64).flat_map(|i| connect_at(2_000 + i)).collect();
+        assert_eq!(send(&tx, three), Admission::Refused);
+
+        assert_eq!(dropped(&metrics, "tcp_connect"), 3);
+        let gaps = gaps(&drain_now(&mut rx));
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].dropped_records, 3);
+        assert_eq!((gaps[0].gap_start_ns, gaps[0].gap_end_ns), (2_000, 2_002));
+    }
+
     /// The refusal bookkeeping under real contention: six reader threads
     /// against a draining receiver. Every refused record must come out as gap
     /// evidence exactly once, and the counters must return to zero.
