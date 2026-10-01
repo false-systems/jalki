@@ -779,21 +779,26 @@ pub(crate) async fn run_sink_loop(loop_state: SinkLoop) {
                             // one through pending gaps would switch the loop to
                             // paced backlog delivery on each overload episode.
                             let records = reports
-                                .iter()
-                                .cloned()
+                                .into_iter()
                                 .flat_map(|gap| gap.into_batch(producer_for_sink.clone()).records)
                                 .collect();
                             let batch = EvidenceBatch::new(producer_for_sink.clone(), records);
-                            if let Err(err) = sink.append_batch(batch).await {
+                            if let Err(err) = sink.append_batch(batch.clone()).await {
                                 // Retryable or not, the sink is failing, so
-                                // backlog mode is right; the reports wait there.
+                                // backlog mode is right; the batch waits there.
                                 record_sink_error(&metrics_clone, sink.name());
                                 warn!(
                                     sink = sink.name(),
                                     error = %err,
                                     "gap evidence delivery failed; retrying later"
                                 );
-                                pending_gaps.extend(reports);
+                                // Retry this exact batch. No backlog, so
+                                // nothing is in flight. The Vartio sink keys
+                                // idempotency on occurrence ids; a timeout it in
+                                // fact committed, or a partly accepted batch, must
+                                // not come back as new gap records counted twice.
+                                debug_assert!(pending_gaps.in_flight.is_none());
+                                pending_gaps.in_flight = Some(batch);
                             } else {
                                 backoff.reset();
                             }
@@ -3378,5 +3383,155 @@ mod tests {
         assert!(body.contains("sink_queue_bytes=1000\n"), "{body}");
         assert!(body.contains("sink_queue_max_bytes=1000\n"), "{body}");
         assert!(body.contains("sink_queue_memory_pressure=1\n"), "{body}");
+    }
+
+    /// A gap batch the sink committed but reported as timed out is
+    /// retried with the same occurrence ids, so the idempotency key dedupes it
+    /// instead of Vartio counting the loss twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_queue_gap_keeps_its_occurrence_ids() {
+        struct CommitThenTimeoutOnGap {
+            seen: Arc<StdMutex<Vec<EvidenceRecord>>>,
+            failed_once: AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl EvidenceSink for CommitThenTimeoutOnGap {
+            fn name(&self) -> &str {
+                "commit-then-timeout"
+            }
+            async fn append_batch(&self, batch: EvidenceBatch) -> Result<AppendResult, SinkError> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .extend(batch.records.iter().cloned());
+                let is_gap = batch
+                    .records
+                    .iter()
+                    .any(|r| r.occurrence.occurrence_type.as_str() == "jalki.agent.gap");
+                if is_gap && !self.failed_once.swap(true, Ordering::SeqCst) {
+                    return Err(SinkError::Timeout {
+                        sink: "commit-then-timeout".into(),
+                        message: "committed, reply lost".into(),
+                    });
+                }
+                Ok(AppendResult {
+                    accepted_count: batch.len(),
+                    rejected_count: 0,
+                    sink_name: "commit-then-timeout".into(),
+                    watermark: None,
+                    warnings: Vec::new(),
+                })
+            }
+            async fn health(&self) -> HealthStatus {
+                HealthStatus::Healthy
+            }
+        }
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let metrics = Arc::new(Metrics::new());
+        let (tx, rx) = sink_queue::channel(
+            SinkQueueConfig {
+                max_bytes: queue_unit(),
+                pressure_max_bytes: queue_unit(),
+            },
+            None,
+            metrics.clone(),
+        );
+        let handle = tokio::spawn(run_sink_loop(SinkLoop {
+            rx,
+            sink: Box::new(CommitThenTimeoutOnGap {
+                seen: seen.clone(),
+                failed_once: AtomicBool::new(false),
+            }),
+            metrics,
+            producer: ProducerMetadata::new("test", "node-1", "6.17.0"),
+            enricher: Arc::new(NoopEnricher),
+            retry_config: RetryBufferConfig::default(),
+            backoff_config: RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            pace_config: unpaced(),
+            memory_pressure: None,
+            spool: None,
+        }));
+        assert_eq!(tx.try_send(one_record()).unwrap(), Admission::Admitted);
+        assert_eq!(tx.try_send(one_record()).unwrap(), Admission::Refused);
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        let ids: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.occurrence.occurrence_type.as_str() == "jalki.agent.gap")
+            .map(|r| r.occurrence.id.to_string())
+            .collect();
+        assert_eq!(ids.len(), 2, "attempted inline, then retried: {ids:?}");
+        assert_eq!(
+            ids[0], ids[1],
+            "the retry must resend the same occurrence id"
+        );
+        drop(tx);
+        let _ = handle.await;
+    }
+
+    /// A queue gap whose inline delivery fails is kept, not dropped:
+    /// it waits in the pending gaps and is delivered once the sink recovers.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_gap_survives_a_failed_inline_append() {
+        let mut options = LoopOptions::new(
+            RetryBackoffConfig {
+                base_ms: 10,
+                max_ms: 10,
+            },
+            unpaced(),
+            Duration::from_millis(75),
+        );
+        options.queue = SinkQueueConfig {
+            max_bytes: queue_unit(),
+            pressure_max_bytes: queue_unit(),
+        };
+        let h = spawn_with(options);
+        h.up.store(true, Ordering::SeqCst);
+
+        push(&h, one_record());
+        assert_eq!(
+            h.tx.try_send(one_record()).expect("queue open"),
+            Admission::Refused
+        );
+
+        // Let the record's inline append succeed, then fail the gap's.
+        let mut waited = Duration::ZERO;
+        while h.records.lock().unwrap().is_empty() && waited < Duration::from_secs(5) {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            waited += Duration::from_millis(1);
+        }
+        assert_eq!(
+            h.records.lock().unwrap().len(),
+            1,
+            "record delivered inline"
+        );
+        h.up.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            delivered_gaps(&h).is_empty(),
+            "precondition: the inline gap append failed"
+        );
+        assert!(h.attempts.load(Ordering::SeqCst) >= 2);
+
+        h.up.store(true, Ordering::SeqCst);
+        advance_draining(&h, Duration::from_secs(5), Duration::from_millis(100)).await;
+        let gaps = delivered_gaps(&h);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(label(&gaps[0], "cause"), "sink_queue_overflow");
+        assert_eq!(label(&gaps[0], "dropped_records"), "1");
+
+        drop(h.tx);
+        let _ = h.handle.await;
     }
 }
