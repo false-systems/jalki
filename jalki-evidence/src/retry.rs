@@ -403,13 +403,26 @@ impl GapReport {
         self.dropped_attribution = self
             .dropped_attribution
             .saturating_add(other.dropped_attribution);
-        self.gap_start_ns = self.gap_start_ns.min(other.gap_start_ns);
-        self.gap_end_ns = self.gap_end_ns.max(other.gap_end_ns);
+        // A 0..0 window means "no kernel time known" (only unstamped
+        // records were lost), not "from boot": it must not widen a real one.
+        if !other.has_window() {
+            // Nothing to add.
+        } else if !self.has_window() {
+            self.gap_start_ns = other.gap_start_ns;
+            self.gap_end_ns = other.gap_end_ns;
+        } else {
+            self.gap_start_ns = self.gap_start_ns.min(other.gap_start_ns);
+            self.gap_end_ns = self.gap_end_ns.max(other.gap_end_ns);
+        }
         for occurrence_type in other.affected_probes {
             if !self.affected_probes.contains(&occurrence_type) {
                 self.affected_probes.push(occurrence_type);
             }
         }
+    }
+
+    fn has_window(&self) -> bool {
+        self.gap_start_ns != 0 || self.gap_end_ns != 0
     }
 
     pub fn into_batch(self, producer: ProducerMetadata) -> EvidenceBatch {
@@ -659,20 +672,43 @@ impl RetryBuffer {
 /// drops, and a second copy there is precisely how the per-class counts would
 /// go stale (it already had one).
 pub fn gap_for_batch(cause: &str, batch: &EvidenceBatch) -> GapReport {
+    // The batch's own window, as before; the counting is shared.
+    GapReport {
+        gap_start_ns: batch.observed_at_min,
+        gap_end_ns: batch.observed_at_max,
+        ..gap_for_records(cause, &batch.records)
+    }
+}
+
+/// Gap report for records lost before they were ever batched: refused at the
+/// reader→sink queue (jalki#97). The one copy of the per-class counting;
+/// [`gap_for_batch`] delegates here.
+///
+/// The window is the records' observed-time span. Records stamped 0 (the
+/// agent's self-observability records carry no kernel time) are left out of
+/// it, so one of them cannot stretch the window back to boot; when every
+/// record is unstamped the window is 0..0.
+pub fn gap_for_records(cause: &str, records: &[EvidenceRecord]) -> GapReport {
     let mut reliability = 0;
     let mut attribution = 0;
-    for record in &batch.records {
+    let mut window: Option<(u64, u64)> = None;
+    for record in records {
         match record.evidence_class() {
             EvidenceClass::Reliability => reliability += 1,
             EvidenceClass::Attribution => attribution += 1,
         }
+        let at = record.observed_at_ns;
+        if at != 0 {
+            window = Some(window.map_or((at, at), |(lo, hi)| (lo.min(at), hi.max(at))));
+        }
     }
+    let (gap_start_ns, gap_end_ns) = window.unwrap_or((0, 0));
     GapReport {
         cause: cause.into(),
-        affected_probes: affected_probes(batch),
-        dropped_records: batch.len(),
-        gap_start_ns: batch.observed_at_min,
-        gap_end_ns: batch.observed_at_max,
+        affected_probes: affected_probes(records),
+        dropped_records: records.len(),
+        gap_start_ns,
+        gap_end_ns,
         dropped_reliability: reliability,
         dropped_attribution: attribution,
     }
@@ -684,7 +720,7 @@ fn gap_for_shed(cause: &str, class: EvidenceClass, batch: &EvidenceBatch) -> Gap
     let n = batch.len();
     GapReport {
         cause: cause.into(),
-        affected_probes: affected_probes(batch),
+        affected_probes: affected_probes(&batch.records),
         dropped_records: n,
         gap_start_ns: batch.observed_at_min,
         gap_end_ns: batch.observed_at_max,
@@ -699,9 +735,9 @@ fn gap_for_shed(cause: &str, class: EvidenceClass, batch: &EvidenceBatch) -> Gap
     }
 }
 
-fn affected_probes(batch: &EvidenceBatch) -> Vec<String> {
+fn affected_probes(records: &[EvidenceRecord]) -> Vec<String> {
     let mut occurrence_types = Vec::new();
-    for record in &batch.records {
+    for record in records {
         let occurrence_type = record.occurrence.occurrence_type.as_str().to_string();
         if !occurrence_types.contains(&occurrence_type) {
             occurrence_types.push(occurrence_type);
@@ -782,6 +818,68 @@ mod tests {
 
     fn batch(times: &[u64]) -> EvidenceBatch {
         EvidenceBatch::new(producer(), times.iter().copied().map(record).collect())
+    }
+
+    /// One copy of the per-class counting: a batch's gap and its records' gap
+    /// are the same report.
+    #[test]
+    fn gap_for_records_matches_gap_for_batch() {
+        let mut close = record(30);
+        close.occurrence = Occurrence::new("jalki/test", "kernel.tcp.close");
+        let records = vec![record(10), close, record(20)];
+        let batch = EvidenceBatch::new(producer(), records.clone());
+
+        let from_records = gap_for_records("sink_queue_overflow", &records);
+        assert_eq!(from_records, gap_for_batch("sink_queue_overflow", &batch),);
+        assert_eq!(from_records.dropped_records, 3);
+        assert_eq!(from_records.dropped_reliability, 1);
+        assert_eq!(from_records.dropped_attribution, 2);
+        assert_eq!(
+            from_records.affected_probes,
+            vec!["kernel.test".to_string(), "kernel.tcp.close".to_string()]
+        );
+        assert_eq!(
+            (from_records.gap_start_ns, from_records.gap_end_ns),
+            (10, 30)
+        );
+    }
+
+    /// Self-observability records carry no kernel time (observed_at_ns 0); one
+    /// of them must not stretch a gap's window back to boot.
+    #[test]
+    fn gap_for_records_window_skips_unstamped_records() {
+        let gap = gap_for_records(
+            "sink_queue_overflow",
+            &[record(0), record(500), record(700)],
+        );
+        assert_eq!((gap.gap_start_ns, gap.gap_end_ns), (500, 700));
+        assert_eq!(gap.dropped_records, 3, "but it is still counted");
+
+        let unstamped = gap_for_records("sink_queue_overflow", &[record(0)]);
+        assert_eq!((unstamped.gap_start_ns, unstamped.gap_end_ns), (0, 0));
+    }
+
+    /// Merging the report for an unstamped record keeps the real window, in
+    /// either order.
+    #[test]
+    fn merging_an_unstamped_report_keeps_the_window() {
+        let stamped = || gap_for_records("sink_queue_overflow", &[record(500), record(700)]);
+        let unstamped = || gap_for_records("sink_queue_overflow", &[record(0)]);
+
+        let mut into_stamped = stamped();
+        into_stamped.merge(unstamped());
+        assert_eq!(
+            (into_stamped.gap_start_ns, into_stamped.gap_end_ns),
+            (500, 700)
+        );
+        assert_eq!(into_stamped.dropped_records, 3);
+
+        let mut into_unstamped = unstamped();
+        into_unstamped.merge(stamped());
+        assert_eq!(
+            (into_unstamped.gap_start_ns, into_unstamped.gap_end_ns),
+            (500, 700)
+        );
     }
 
     #[test]

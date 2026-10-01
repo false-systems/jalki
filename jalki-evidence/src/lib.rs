@@ -11,6 +11,7 @@ pub mod cgroup;
 pub mod event;
 pub mod evidence;
 pub mod normalize;
+pub mod resident;
 pub mod retry;
 pub mod runtime_subject;
 pub mod sink;
@@ -26,9 +27,10 @@ pub use evidence::{
     ProbeMetadata, ProducerMetadata, RuntimeBinding, UnboundReason,
 };
 pub use normalize::errno_name;
+pub use resident::resident_bytes;
 pub use retry::{
-    gap_for_batch, DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff, RetryBackoffConfig,
-    RetryBuffer, RetryBufferConfig,
+    gap_for_batch, gap_for_records, DrainPaceConfig, DrainPacer, GapReport, Pace, RetryBackoff,
+    RetryBackoffConfig, RetryBuffer, RetryBufferConfig,
 };
 pub use runtime_subject::{
     RuntimeSubjectError, RuntimeSubjectV1, RUNTIME_SUBJECT_CANONICALIZATION_VERSION,
