@@ -12,6 +12,7 @@ pub mod reader;
 pub mod registry;
 pub mod runtime;
 pub mod sensitive_paths;
+pub mod sink_queue;
 pub mod store;
 
 pub mod probes {

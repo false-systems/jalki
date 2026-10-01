@@ -6,8 +6,6 @@ use anyhow::{Context, Result};
 use aya::programs::{FEntry, FExit, TracePoint};
 use aya::{Btf, Ebpf};
 use chrono::{DateTime, Utc};
-use jalki_evidence::EvidenceRecord;
-use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::enrich::RuntimeEnricher;
@@ -15,6 +13,7 @@ use crate::metrics::Metrics;
 use crate::probe::{Attachment, Probe};
 use crate::reader::{self, ProbeStats, ReaderStop};
 use crate::sensitive_paths::SensitivePathMatcher;
+use crate::sink_queue::SinkQueueSender;
 use crate::store::EventStore;
 
 /// Unique identifier for an attached probe instance.
@@ -97,7 +96,7 @@ impl ProbeRegistry {
         ebpf: &mut Ebpf,
         btf: &Btf,
         cluster: &str,
-        tx: mpsc::Sender<Vec<EvidenceRecord>>,
+        tx: SinkQueueSender,
         metrics: Arc<Metrics>,
         store: &Arc<EventStore>,
         enricher: Arc<dyn RuntimeEnricher>,

@@ -103,6 +103,21 @@ pub struct Metrics {
     /// that must be a first-class signal rather than something reconstructed
     /// from three metrics after the kill.
     pub memory_ceiling_no_shed: Gauge,
+    /// The reader→sink queue (jalki#97): estimated resident bytes and
+    /// messages waiting for the sink loop. Updated by the queue itself, so
+    /// they stay live while the loop is parked inside a slow append.
+    pub sink_queue_bytes: Gauge,
+    pub sink_queue_messages: Gauge,
+    /// The configured budget (`JALKI_QUEUE_MAX_BYTES`), so a fill ratio needs
+    /// no knowledge of the environment.
+    pub sink_queue_max_bytes: Gauge,
+    /// 1 while memory pressure holds the queue to its smaller pressure budget
+    /// (`max_bytes / 8`, at least 4 MiB): refusals then happen far below
+    /// `sink_queue_max_bytes`, and this says why.
+    pub sink_queue_memory_pressure: Gauge,
+    /// Records the queue refused, per probe. Each refusal is also reported as
+    /// `jalki.agent.gap` evidence; this is the off-node copy to alert on.
+    pub sink_queue_dropped: Family<ProbeLabel, Counter>,
 }
 
 impl Default for Metrics {
@@ -209,9 +224,10 @@ impl Metrics {
         let memory_ceiling_no_shed = Gauge::default();
         registry.register(
             "jalki_memory_ceiling_no_shed",
-            "1 while memory is at/above the shed watermark and shedding the \
-             whole retry buffer could not bring it back below it — growth is \
-             the process working set, not buffered evidence (jalki#76)",
+            "1 while memory is at/above the shed watermark and neither shedding \
+             the whole retry buffer nor draining the reader→sink queue to its \
+             pressure budget could bring it back below it — growth is the \
+             process working set, not buffered evidence (jalki#76)",
             memory_ceiling_no_shed.clone(),
         );
 
@@ -221,6 +237,47 @@ impl Metrics {
             "Fraction of the pod memory limit in use; 0 when the cgroup limit \
              could not be resolved",
             memory_usage_ratio.clone(),
+        );
+
+        let sink_queue_bytes = Gauge::default();
+        registry.register(
+            "jalki_sink_queue_bytes",
+            "Estimated resident bytes of evidence waiting in the reader→sink \
+             queue (bounded by JALKI_QUEUE_MAX_BYTES)",
+            sink_queue_bytes.clone(),
+        );
+
+        let sink_queue_messages = Gauge::default();
+        registry.register(
+            "jalki_sink_queue_messages",
+            "Messages waiting in the reader→sink queue, including a pending gap \
+             marker",
+            sink_queue_messages.clone(),
+        );
+
+        let sink_queue_max_bytes = Gauge::default();
+        registry.register(
+            "jalki_sink_queue_max_bytes",
+            "Configured budget of the reader→sink queue (JALKI_QUEUE_MAX_BYTES)",
+            sink_queue_max_bytes.clone(),
+        );
+
+        let sink_queue_memory_pressure = Gauge::default();
+        registry.register(
+            "jalki_sink_queue_memory_pressure",
+            "1 while memory pressure holds the reader→sink queue to its smaller \
+             pressure budget (max_bytes / 8, at least 4 MiB)",
+            sink_queue_memory_pressure.clone(),
+        );
+
+        // Exposed as `jalki_sink_queue_dropped_total` (the client appends the
+        // suffix).
+        let sink_queue_dropped = Family::<ProbeLabel, Counter>::default();
+        registry.register(
+            "jalki_sink_queue_dropped",
+            "Records the reader→sink queue refused because it was full, per \
+             probe; each refusal is also reported as jalki.agent.gap evidence",
+            sink_queue_dropped.clone(),
         );
 
         Self {
@@ -239,6 +296,11 @@ impl Metrics {
             memory_usage_ratio,
             spool_bytes,
             memory_ceiling_no_shed,
+            sink_queue_bytes,
+            sink_queue_messages,
+            sink_queue_max_bytes,
+            sink_queue_memory_pressure,
+            sink_queue_dropped,
         }
     }
 

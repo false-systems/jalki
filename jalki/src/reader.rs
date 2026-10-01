@@ -6,13 +6,13 @@ use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
 use jalki_evidence::{EvidenceRecord, NormalizedEvidence};
 use prometheus_client::metrics::counter::Counter;
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::enrich::{bind_record, RuntimeEnricher};
 use crate::metrics::{Metrics, ProbeLabel};
 use crate::probe::Probe;
 use crate::sensitive_paths::SensitivePathMatcher;
+use crate::sink_queue::SinkQueueSender;
 use crate::store::EventStore;
 
 const MAX_DRAIN_ITEMS: usize = 1024;
@@ -87,7 +87,9 @@ impl ProbeStats {
 /// Drain a ring buffer and convert events to evidence records.
 ///
 /// Runs as a blocking task (ring buffer polling is synchronous in aya).
-/// Sends one batch per ring-buffer drain cycle through an mpsc channel.
+/// Offers one message per ring-buffer drain cycle to the sink queue, which
+/// never blocks: a full queue refuses it as reported loss (jalki#97), so a
+/// slow sink no longer backs the kernel ring buffer up behind this thread.
 // Reader setup is genuinely one cohesive bundle (probe, cluster, channel,
 // stats, store, enricher, matcher). Threading it through a params struct —
 // the shape `SinkLoop` uses in runtime.rs — would read better, but it is a
@@ -98,7 +100,7 @@ pub fn spawn_reader(
     ebpf: &mut Ebpf,
     probe: Arc<dyn Probe>,
     cluster: String,
-    tx: mpsc::Sender<Vec<EvidenceRecord>>,
+    tx: SinkQueueSender,
     stats: Arc<ProbeStats>,
     metrics: Arc<Metrics>,
     store: Arc<EventStore>,
@@ -184,7 +186,7 @@ fn drain_loop(
     drop_counts: PerCpuArray<MapData, u64>,
     probe: Arc<dyn Probe>,
     cluster: &str,
-    tx: mpsc::Sender<Vec<EvidenceRecord>>,
+    tx: SinkQueueSender,
     stats: Arc<ProbeStats>,
     metrics: Arc<Metrics>,
     probe_name: &str,
@@ -280,8 +282,10 @@ fn drain_loop(
             last_drop_poll = std::time::Instant::now();
         }
 
-        if !records.is_empty() && tx.blocking_send(records).is_err() {
-            debug!(probe = probe_name, "sink channel closed, stopping reader");
+        // Refused and out-of-scope messages are already accounted for by the
+        // queue; only a closed queue (the sink loop is gone) stops the reader.
+        if !records.is_empty() && tx.try_send(records).is_err() {
+            debug!(probe = probe_name, "sink queue closed, stopping reader");
             return;
         }
 
