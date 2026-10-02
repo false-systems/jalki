@@ -41,7 +41,7 @@
 # channel, so a mismatch is caught before the image build starts.
 
 # ── chef ───────────────────────────────────────────────────────────────────
-FROM ghcr.io/false-systems/rust-builder:1.97.1@sha256:e02feeb546fb82e33ea7cdca1da320da6faa2cc4a5e3fb6c0e5f9cb9fd8f42b8 AS chef
+FROM ghcr.io/false-systems/rust-builder:1.97.1@sha256:4bda3366fd9c4bf9a1bb71971ec7e4362d9fb3a75aaa3cf68f815f95657c6d71 AS chef
 # The guard. rustup auto-installs whatever toolchain a rust-toolchain.toml
 # names, and cargo-chef carries that file into the recipe, so without this a
 # tag/file mismatch builds green: every cargo stage downloads the file's
@@ -65,7 +65,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Container build within a day of the release — main and all branches at once.
 # An unpinned tool in the build path is a time bomb someone else detonates.
 # Bump it in base-images deliberately, with the LLVM story decided.
-FROM ghcr.io/false-systems/rust-builder:1.97.1-ebpf@sha256:1713aa3580d66c08e42a7ff1b981ef0ba41f9f161b501cb27c9879a6cdf80e40 AS ebpf
+FROM ghcr.io/false-systems/rust-builder:1.97.1-ebpf@sha256:05822130b5588e49b1d9417a137440264ce27de717f47deb87d811dc0d5a3481 AS ebpf
 # The same guard as in chef (this stage does not inherit it). It stops only
 # implicit installs: the explicit `rustup toolchain install` for the eBPF
 # nightly below still downloads a moved nightly, as described there.
@@ -114,7 +114,7 @@ FROM scratch AS ebpf-object
 COPY --from=ebpf /build/jalki-ebpf/target/bpfel-unknown-none/release/jalki-ebpf /jalki-ebpf
 
 # ── runtime: minimal image ─────────────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
 
 COPY --from=builder /build/target/release/jalki /usr/local/bin/jalki
 COPY --from=builder /build/target/release/jalki-mcp /usr/local/bin/jalki-mcp
